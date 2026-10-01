@@ -77,6 +77,9 @@ def parse_tracks(data):
             if child_header < 20 or child_size < child_header or child_end > end:
                 raise ValueError(f"Invalid boma lengths at offset {child}")
             metadata_types[kind] += 1
+            # Observed numeric metadata layout in the supplied 1.7.0.146 sample.
+            if kind == 1 and child_header == 20 and child_size == 384:
+                track["duration_ms"] = u32(data, child + 176)
             if kind in (2, 3, 4):
                 body = child + child_header
                 if body + 16 > child_end or u32(data, body) != 1:
