@@ -1,0 +1,8 @@
+__pycache__/
+.venv/
+browser.json
+oauth.json
+data/
+*.musicdb
+*.itdb
+*.musiclibrary/
