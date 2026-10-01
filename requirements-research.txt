@@ -1,0 +1,2 @@
+cryptography
+ytmusicapi==1.12.3
