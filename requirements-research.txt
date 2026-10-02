@@ -1,2 +1,3 @@
 cryptography
 ytmusicapi==1.12.3
+capstone==5.0.6

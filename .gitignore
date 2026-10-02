@@ -6,3 +6,4 @@ data/
 *.musicdb
 *.itdb
 *.musiclibrary/
+*.app/
