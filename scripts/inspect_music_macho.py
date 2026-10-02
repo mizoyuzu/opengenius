@@ -135,8 +135,8 @@ class MachO:
                 if end >= 0:
                     return self.data[off:end].decode(errors="replace")
 
-    def scan(self, needles, call_target=None):
-        targets = {}
+    def scan(self, needles, call_target=None, addresses=None):
+        targets = {a: hex(a) for a in (addresses or [])}
         for sec in self.sections:
             if sec["name"] != "__cstring":
                 continue
@@ -148,7 +148,8 @@ class MachO:
                     pos += len(needle)
         calls, refs = [], []
         raw = self.blob(self.text["offset"], self.text["size"])
-        # ADRP + ADD/LDR within eight instructions: candidates, not data-flow proof.
+        # Adjacent ADRP + ADD only. A wider window needs register-liveness
+        # analysis; otherwise overwritten registers produce false references.
         for i in range(0, len(raw) - 3, 4):
             w = struct.unpack_from("<I", raw, i)[0]
             pc = self.text["address"] + i
@@ -162,7 +163,7 @@ class MachO:
             if not any(page == a & ~4095 for a in targets):
                 continue
             rd = w & 31
-            for j in range(i + 4, min(i + 36, len(raw) - 3), 4):
+            for j in range(i + 4, min(i + 8, len(raw) - 3), 4):
                 a = struct.unpack_from("<I", raw, j)[0]
                 if ((a >> 5) & 31) != rd:
                     continue
@@ -207,12 +208,13 @@ def main():
     parser.add_argument("--strings", nargs="+", default=["geniusKeyHeader", "geniusSeed", "Genius.itdb"])
     parser.add_argument("--symbol", default="sqlite3_key")
     parser.add_argument("--call-target", type=lambda x: int(x, 0))
+    parser.add_argument("--address", nargs="+", type=lambda x: int(x, 0), default=[])
     args = parser.parse_args()
     obj = MachO(args.executable)
     if args.function is not None:
         obj.disassemble(args.function)
     else:
-        result = obj.scan(args.strings, args.call_target)
+        result = obj.scan(args.strings, args.call_target, args.address)
         result["calls"] = [c for c in result["calls"] if (c["target"] == hex(args.call_target) if args.call_target is not None else args.symbol in c["symbol"])]
         result.update(sha256=hashlib.sha256(obj.data).hexdigest(), uuid=obj.uuid,
                       size=len(obj.data), function_count=len(obj.functions))
