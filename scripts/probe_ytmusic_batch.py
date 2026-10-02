@@ -7,6 +7,7 @@ from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 import time
 
@@ -69,6 +70,34 @@ def verify_account(client):
     return True
 
 
+def create_paced_session(interval, request_budget):
+    # Keep requests optional for local-only planning.
+    import requests
+
+    class PacedSession(requests.Session):
+        def __init__(self):
+            super().__init__()
+            self.last_start, self.count = None, 0
+
+        def request(self, *positional, **kwargs):
+            if self.count >= request_budget:
+                raise RuntimeError('Request budget exhausted')
+            if self.last_start is not None:
+                time.sleep(max(0, interval - (time.monotonic() - self.last_start)))
+            self.last_start = time.monotonic()
+            self.count += 1
+            kwargs['timeout'] = 25
+            # Redirect sends bypass Session.request(), including its pacing/budget.
+            kwargs['allow_redirects'] = False
+            response = super().request(*positional, **kwargs)
+            if 300 <= response.status_code < 400:
+                raise requests.HTTPError('Unexpected redirect response', response=response)
+            response.raise_for_status()  # No retries, including auth/rate-limit failures.
+            return response
+
+    return PacedSession()
+
+
 class CachedClient:
     def __init__(self, client, directory):
         self.client, self.directory = client, directory
@@ -120,6 +149,7 @@ def main():
     parser.add_argument('--auth', type=Path, default=Path('../browser.json'))
     parser.add_argument('--output', type=Path, required=True, help='Experiment directory; reuse to resume cached requests')
     parser.add_argument('--plan-only', action='store_true', help='Select local seeds without network access')
+    parser.add_argument('--language', choices=('ja', 'en'), default='en')
     parser.add_argument('--seeds', type=int, default=10)
     parser.add_argument('--interval', type=float, default=5, help='Minimum seconds between HTTP request starts')
     parser.add_argument('--request-budget', type=int, default=45)
@@ -127,8 +157,9 @@ def main():
     output = args.output.resolve()
     if output.is_relative_to(args.bundle.resolve()) or output == args.auth.resolve():
         parser.error('output must be outside the library and auth file')
-    if not 1 <= args.seeds <= 20 or args.interval < 2 or not 1 <= args.request_budget <= 100:
-        parser.error('seeds: 1..20; interval: >=2; request-budget: 1..100')
+    if (not 1 <= args.seeds <= 20 or not math.isfinite(args.interval)
+            or args.interval < 2 or not 1 <= args.request_budget <= 100):
+        parser.error('seeds: 1..20; interval: finite and >=2; request-budget: 1..100')
     output.mkdir(parents=True, exist_ok=True)
     cache = output / 'requests'
     cache.mkdir(exist_ok=True)
@@ -141,7 +172,7 @@ def main():
         tracks, _ = parse_tracks(decode_musicdb((args.bundle / 'Library.musicdb').read_bytes()))
         seeds = select_seeds(tracks, args.seeds)
         manifest = {'library_sha256': hashlib.sha256((args.bundle / 'Library.musicdb').read_bytes()).hexdigest(),
-                    'seeds': seeds, 'selection': 'distinct_exact_artist_and_album_labels'}
+                    'language': args.language, 'seeds': seeds, 'selection': 'distinct_exact_artist_and_album_labels'}
         manifest_path = output / 'seeds.json'
         if manifest_path.exists():
             if json.loads(manifest_path.read_text()) != manifest:
@@ -153,28 +184,10 @@ def main():
             report['selected_seed_count'] = len(seeds)
             print(json.dumps({'status': 'planned', 'seeds': len(seeds), 'http_requests': 0}))
             return 0
-        import requests
         from ytmusicapi import YTMusic
 
-        class PacedSession(requests.Session):
-            def __init__(self):
-                super().__init__()
-                self.last_start, self.count = None, 0
-
-            def request(self, *positional, **kwargs):
-                if self.count >= args.request_budget:
-                    raise RuntimeError('Request budget exhausted')
-                if self.last_start is not None:
-                    time.sleep(max(0, args.interval - (time.monotonic() - self.last_start)))
-                self.last_start = time.monotonic()
-                self.count += 1
-                kwargs['timeout'] = 25
-                response = super().request(*positional, **kwargs)
-                response.raise_for_status()  # No retries, including auth/rate-limit failures.
-                return response
-
-        session = PacedSession()
-        client = YTMusic(str(args.auth), requests_session=session, language='en', location='JP')
+        session = create_paced_session(args.interval, args.request_budget)
+        client = YTMusic(str(args.auth), requests_session=session, language=args.language, location='JP')
         report['account_authentication_verified'] = verify_account(client)
         print('Authenticated account response confirmed; no account identity stored.', flush=True)
         cached = CachedClient(client, cache)
