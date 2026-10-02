@@ -45,6 +45,45 @@ class MusicCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Unsupported trap'):
             core.run(0x100364D04)
 
+    def test_distance_tracks_selection_age_and_relaxes_to_floor(self):
+        core = self.core([17, 34])
+        library = core.run(0x100364D04, core.callbacks, 0, 0)
+        criterion = core.alloc(0x38)
+        core.write(criterion, 'QQ', 0x101F21E18, library)
+        core.write(criterion + 0x10, 'I', 1)  # Select metadata index 1.
+        core.write(criterion + 0x18, '4Q', 2, 6, 0, 1)
+        state = core.run(0x100366F40, criterion, 0)
+
+        def track(group):
+            metadata = core.alloc(32, struct.pack('<4Q', 29, group, 11, 12))
+            result = core.alloc(0x40)
+            core.write(result + 0x10, 'QQ', metadata, 4)
+            return result
+
+        a, b, unseen = track(100), track(200), track(300)
+        core.run(0x10036715C, criterion, state, a)
+        core.run(0x10036715C, criterion, state, b)
+        table, = core.read(state + 0x30, 'Q')
+        node_a = core.run(0x100368C04, table, 100)
+        node_b = core.run(0x100368C04, table, 200)
+        self.assertEqual(core.read(node_a + 0x18, 'I'), (2,))
+        self.assertEqual(core.read(node_b + 0x18, 'I'), (1,))
+        self.assertEqual(core.run(0x1003670BC, criterion, library, state, a), 1)
+        self.assertEqual(core.run(0x1003670BC, criterion, library, state, unseen), 0)
+        thresholds = [core.read(state + 0x28, 'Q')[0]]
+        for _ in range(5):
+            core.run(0x100367128, criterion, state)
+            thresholds.append(core.read(state + 0x28, 'Q')[0])
+        self.assertEqual(thresholds, [6, 5, 4, 3, 2, 2])
+        self.assertEqual(core.run(0x1003670BC, criterion, library, state, a), 0)
+        core.run(0x10036715C, criterion, state, a)
+        self.assertEqual(core.read(node_a + 0x18, 'I'), (1,))
+        self.assertEqual(core.read(node_b + 0x18, 'I'), (2,))
+        core.write(criterion + 0x28, 'Q', 6)
+        core.run(0x100367580, criterion, state)
+        self.assertEqual(core.read(state + 0x28, 'Q'), (9,))  # base 6 + fixed random 3
+        self.assertEqual(core.calls['_random'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()
