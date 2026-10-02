@@ -124,3 +124,5 @@ browser認証設定を使った検索成功だけでは、ログイン状態の�
 [Music.appの静的解析とGenius DBの復号成功](docs/research/2026-10-02-static-decryption.md)
 
 [Genius IDの対応と関係リストの再暗号化実験](docs/research/2026-10-02-compatibility.md)
+
+[configの選曲フィルターと関係データの利用側](docs/research/2026-10-02-config-consumer.md)
