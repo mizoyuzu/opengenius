@@ -7,7 +7,9 @@ Apple Music／iTunes側への読み込みも検証対象。
 
 現時点でLibrary.musicdbの読み取りと、提供されたMusic.appの特定ビルドを
 使ったGenius.itdbのオフライン復号に成功している。
-Apple形式のrank生成、互換DB書き込み、純正iPod上での動作は未検証。
+既存Genius IDの曲との対応付けと、既存の関係リストだけを変更した
+暗号化DBの生成にも対応している。Music.app／純正iPodによる受け入れ、
+新しい曲のGenius化、Apple形式のrank生成は未検証。
 
 ## Genius DBのオフライン復号
 
@@ -56,6 +58,36 @@ Genius.itdbの形式候補は復号や互換性の検証結果ではない。
 個人用の出力を保存する場合はGit対象外の`data/`を使う。
 このプローブは提供された形式で検証済み。他のアプリ・バージョンでは未検証。
 
+## 既存曲の関係リストを変更する実験
+
+まず復号したDBとライブラリのGenius IDを照合する。
+タイトルはデフォルトでは出力しない。
+
+```sh
+python3 scripts/inspect_genius.py '/mnt/temp-hdd/Geniused Music Library/Music Library.musiclibrary' \
+  --database data/genius-decrypted.itdb --output data/genius-inspection-new.json
+python3 scripts/rewrite_genius.py '/mnt/temp-hdd/Geniused Music Library/Music Library.musiclibrary' \
+  --executable /home/mizoyuzu/Music.app/Contents/MacOS/Music \
+  --export-relations data/genius-relations-new.json
+```
+
+JSONの`ordered_genius_ids`を編集して、別ファイルに暗号化DBを生成する。
+対象は元DBのmetadataに存在するIDに限る。新規IDの割り当てや
+Library.musicdbの変更は行わない。JSONの元DBハッシュも照合する。
+
+```sh
+python3 scripts/rewrite_genius.py '/mnt/temp-hdd/Geniused Music Library/Music Library.musiclibrary' \
+  --executable /home/mizoyuzu/Music.app/Contents/MacOS/Music \
+  --relations data/genius-relations-new.json --output data/genius-experiment-new.itdb
+```
+
+指定したsimilarities以外の論理レコードを保持し、再暗号化後の復号、
+SQLite整合性、全テーブルの論理レコード一致を検証する。
+検証結果は出力の隣に`.report.json`として保存する。
+出力は実験用で、Music.app／iPodでの動作保証はまだない。
+将来の読み込み実験には元ライブラリのコピーと対応する鍵ヘッダーが必要。
+元のライブラリへの置き換えはこのツールでは行わない。
+
 ## YTMusicの少数seed実験
 
 検索結果を確認してvideo IDを明示的に選択し、radioとRelatedを採取する。
@@ -90,3 +122,5 @@ browser認証設定を使った検索成功だけでは、ログイン状態の�
 [曲ID候補・補助設定の構造とYTMusic取得実験](docs/research/2026-10-01-followup.md)
 
 [Music.appの静的解析とGenius DBの復号成功](docs/research/2026-10-02-static-decryption.md)
+
+[Genius IDの対応と関係リストの再暗号化実験](docs/research/2026-10-02-compatibility.md)
