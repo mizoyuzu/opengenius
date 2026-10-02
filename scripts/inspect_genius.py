@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 
 from decrypt_genius import validate_database
-from genius_format import parse_metadata, parse_similarities, unsigned_id
+from genius_format import CONFIG_FILTER_NAMES, parse_config, parse_metadata, parse_similarities, unsigned_id
 from inspect_music_library import decode_musicdb, parse_tracks
 
 
@@ -50,8 +50,26 @@ def inspect(bundle, database, include_titles=False):
                 row["local_titles"] = [t.get("title") for t in local]
             rows.append(row)
         fingerprints = {unsigned_id(r[0]) for r in connection.execute("SELECT item_id FROM genius_fingerprint")}
-        configs = [dict(id=i, version=v, default_num_results=default, min_num_results=minimum, data_bytes=len(data))
-                   for i, v, default, minimum, data in connection.execute("SELECT * FROM genius_config ORDER BY id")]
+        configs = []
+        for i, v, default, minimum, data in connection.execute("SELECT * FROM genius_config ORDER BY id"):
+            config = dict(id=i, version=v, default_num_results=default, min_num_results=minimum, data_bytes=len(data))
+            if v == 2:
+                parsed = parse_config(data)
+                filters = []
+                for item in parsed["filters"]:
+                    if item["type"] != 2:
+                        filters.append(dict(item, role=CONFIG_FILTER_NAMES[item["type"]]))
+                        continue
+                    entries = item["records"]
+                    graph = {key: set(values) for key, values in entries}
+                    filters.append(dict(type=2, role="compatible_genre", metadata_index=item["metadata_index"],
+                                        records=len(entries), total_list_entries=sum(len(values) for _, values in entries),
+                                        keys_with_self=sum(key in values for key, values in entries),
+                                        unknown_target_ids=len({x for _, values in entries for x in values} - set(graph)),
+                                        asymmetric_entries=sum(key not in graph.get(x, set()) for key, values in entries for x in values)))
+                config.update(filters=filters, flags=parsed["flags"], result_words=parsed["result_words"],
+                              parameter_meanings="partially_known", ipod_profile_verified=False)
+            configs.append(config)
         return dict(schema_version=1, database_sha256=hashlib.sha256(clear).hexdigest(), table_counts=counts,
                     library_tracks=len(tracks), unsupported_track_header_profiles=unknown_profiles,
                     tracks_with_stored_genius_id=sum(len(v) for v in by_genius.values()),
