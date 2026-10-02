@@ -186,3 +186,21 @@ JSON形式と確認した制約は下記の調査記録に記載している。
 [Music選曲コアの限定実行と関係リストの比較](docs/research/2026-10-02-core-emulation.md)
 
 [metadataの再選択間隔とLibrary側の新規ID保存](docs/research/2026-10-02-new-track-ids.md)
+
+## 認証ありYTMusicの少数曲取得
+
+アーティスト・アルバムが重ならない10曲のローカル種曲一覧を作る:
+
+```sh
+python3 scripts/probe_ytmusic_batch.py '/mnt/temp-hdd/Geniused Music Library/Music Library.musiclibrary' \
+  --output data/ytmusic/coverage-01 --plan-only
+```
+
+認証確認後に検索と推薦取得を進める場合は`--plan-only`を外す。
+既定では`../browser.json`を使い、HTTP呼び出しを5秒以上空け、最大45回で停止する。
+エラー時は自動再試行しない。同じ出力ディレクトリは成功済みの応答を再利用する。
+別の時点の推薦を観測する場合は新しいディレクトリを指定する。
+検索の一致は未確認の対応候補として扱い、互換DBへの書き込みは行わない。
+
+現在の認証JSONではアカウント情報を確認できず、新規取得は検索前に停止した。
+[取得方針・キャッシュ・認証確認の記録](docs/research/2026-10-02-ytmusic-source.md)
