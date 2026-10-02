@@ -207,3 +207,26 @@ python3 scripts/probe_ytmusic_batch.py '/mnt/temp-hdd/Geniused Music Library/Mus
 `--auth`で認証JSON、`--language en|ja`で応答言語を指定できる。
 言語は種曲マニフェストにも保存し、異なる言語のキャッシュ混用を拒否する。
 [取得方針・キャッシュ・認証確認の記録](docs/research/2026-10-02-ytmusic-source.md)
+
+## 表示タグを変えないメタデータ対応表
+
+Libraryのハッシュとpersistent IDを軸に、別名をGit管理外のJSONで持てる。
+和英併記から作った曲名候補は無効の状態で保存し、確認した項目だけ有効にする。
+アーティスト別名を使っても、録音の同一性は未確認の候補として扱う。
+
+```sh
+python3 scripts/music_identity_map.py '/mnt/temp-hdd/Final Target Apple Music Library/Music 1/Music Library.musiclibrary' \
+  --create --artist-evidence data/final-library-identity-audit.json \
+  --output data/final-library-identity-map-new.json
+
+python3 scripts/music_identity_map.py '/mnt/temp-hdd/Final Target Apple Music Library/Music 1/Music Library.musiclibrary' \
+  --identity-map data/final-library-identity-map-new.json \
+  --observations data/ytmusic/tsubasa-authenticated-03.json \
+  --output data/final-library-matched-relations-new.json
+```
+
+`--artist-evidence`を省略すると、アーティスト別名を空にした対応表を作る。
+ネットワークは使わず、入力と既存出力の上書きを拒否する。
+現時点では一括取得スクリプトへの組み込み、複数クレジットの分解、
+確認済みvideo IDの直接登録は含まない。
+[対応表の形式・初版の結果](docs/research/2026-10-02-identity-map.md)
