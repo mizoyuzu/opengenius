@@ -68,6 +68,10 @@ def parse_tracks(data):
             raise ValueError(f"Invalid itma lengths at offset {offset}")
         pid = struct.unpack_from("<Q", data, offset + 16)[0]
         track = {"persistent_id": f"{pid:016X}"}
+        # Observed header profile: 6 nonzero IDs match the Genius tables 1:1.
+        # Zero means no stored Genius ID; it does not establish eligibility.
+        if header_size == 376:
+            track["genius_id"] = f"{u32(data, offset + 0xCC):016X}"
         child = offset + header_size
         for _ in range(child_count):
             if child + 20 > end or data[child:child + 4] != b"boma":
