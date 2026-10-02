@@ -115,6 +115,37 @@ browser認証設定を使った検索成功だけでは、ログイン状態の�
 
 検証: `python3 -m unittest discover -s tests`（研究用依存関係が必要）。
 
+## Music選曲コアの限定実行
+
+提供されたMusic実行ファイル内の選曲コアをUnicornで実行し、
+元DBと書き換えた暗号化DBの候補列を比較できる。
+DB取得、曲の存在確認、履歴、時刻、乱数はPythonの実験用callbackで供給する。
+再生／スキップ履歴と時刻は0、乱数seedは0に固定している。
+Music.app全体やiPodを起動するものではなく、実環境の選曲結果とは区別する。
+
+```sh
+python3 scripts/emulate_genius.py '/mnt/temp-hdd/Geniused Music Library/Music Library.musiclibrary' \
+  --executable /home/mizoyuzu/Music.app/Contents/MacOS/Music \
+  --experiment data/genius-experiment-reversed-02.itdb \
+  --output data/genius-emulation-new.json
+```
+
+元のconfigでは6曲ともseed自身だけが返った。
+対照実験の`--profile relations-only`では、メモリ上のconfigに既存の
+重複回避フィルターだけを残し、全6曲で関係リストの変更が選曲結果に反映された。
+`--profile without-distance`と`--profile without-compatible-genre`でも
+フィルターの影響を調べられる。これらは実験用の設定で、DBファイルには書き込まない。
+未知の外部関数やシステムコール、実行上限超過はエラーとして停止する。
+
+提供バイナリを使う追加の統合テスト:
+
+```sh
+OPENGENIUS_MUSIC_EXECUTABLE=/home/mizoyuzu/Music.app/Contents/MacOS/Music \
+  python3 -m unittest discover -s tests
+```
+
+この環境変数を指定しない通常のテストでは、バイナリが必要な3件をスキップする。
+
 ## 調査記録
 
 [初期調査と参照資料](docs/research/2026-10-01-genius.md)
@@ -126,3 +157,5 @@ browser認証設定を使った検索成功だけでは、ログイン状態の�
 [Genius IDの対応と関係リストの再暗号化実験](docs/research/2026-10-02-compatibility.md)
 
 [configの選曲フィルターと関係データの利用側](docs/research/2026-10-02-config-consumer.md)
+
+[Music選曲コアの限定実行と関係リストの比較](docs/research/2026-10-02-core-emulation.md)

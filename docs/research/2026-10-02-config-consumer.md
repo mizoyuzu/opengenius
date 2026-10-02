@@ -12,8 +12,8 @@
 
 ## configを読む処理
 
-0x1003a048cは`genius_config.data`を取得し、ポインターとversionを出力引数に、
-BLOBのバイト長を戻り値に返す。
+0x1003a048cは`genius_config.data`を取得し、BLOBポインターを戻り値に、
+バイト長とversionを出力引数に返す。
 0x1003a12a0だけを見るとCFData作成と解放が見えるが、解釈を担当するのは
 後段の0x100364d04と各型のパーサだった。
 
