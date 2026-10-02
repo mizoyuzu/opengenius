@@ -144,7 +144,32 @@ OPENGENIUS_MUSIC_EXECUTABLE=/home/mizoyuzu/Music.app/Contents/MacOS/Music \
   python3 -m unittest discover -s tests
 ```
 
-この環境変数を指定しない通常のテストでは、バイナリが必要な3件をスキップする。
+この環境変数を指定しない通常のテストでは、バイナリが必要な4件をスキップする。
+
+## 新しいIDとmetadataの実験
+
+元のconfigを保ち、合成したmetadata IDの同一性だけを変えて選曲を比較できる。
+このプローブはmetadataをエミュレーター内で作り、DBには書き込まない。
+
+```sh
+python3 scripts/probe_genius_metadata.py '/mnt/temp-hdd/Geniused Music Library/Music Library.musiclibrary' \
+  --executable /home/mizoyuzu/Music.app/Contents/MacOS/Music \
+  --output data/genius-metadata-probe-new.json
+```
+
+`rewrite_music_ids.py`は、未対応の曲に新しいGenius IDを付けたLibrary.musicdbの
+実験用コピーを生成する。指定JSONの元Libraryハッシュと曲PIDを検証し、
+既存IDの置き換えやID衝突は拒否する。
+
+```sh
+python3 scripts/rewrite_music_ids.py '/mnt/temp-hdd/Geniused Music Library/Music Library.musiclibrary' \
+  --assignments data/library-genius-id-assignments.json \
+  --output data/Library-genius-id-new.musicdb
+```
+
+これはLibrary側のID保存だけの実験で、対応するGenius DBの新規metadata／関係行を
+作成する機能はまだ含まない。コピーを単体でGenius対応済みとは扱わない。
+JSON形式と確認した制約は下記の調査記録に記載している。
 
 ## 調査記録
 
@@ -159,3 +184,5 @@ OPENGENIUS_MUSIC_EXECUTABLE=/home/mizoyuzu/Music.app/Contents/MacOS/Music \
 [configの選曲フィルターと関係データの利用側](docs/research/2026-10-02-config-consumer.md)
 
 [Music選曲コアの限定実行と関係リストの比較](docs/research/2026-10-02-core-emulation.md)
+
+[metadataの再選択間隔とLibrary側の新規ID保存](docs/research/2026-10-02-new-track-ids.md)
