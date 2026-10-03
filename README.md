@@ -260,3 +260,51 @@ python3 scripts/music_identity_map.py \
 7曲分の表記を確認して11トラックの別名を追加した結果、保存済み推薦の
 対応候補は31から38 video IDになった。録音同一性は未確認のまま。
 [オフラインの表記レビュー・結果・制約](docs/research/2026-10-03-offline-alias-review.md)
+
+## 複数クレジットと保存済み検索の再利用
+
+`artist_credit_sets`は全文ラベルと構成員を明示する。
+ローカルかリモートで宣言したクレジットは全構成員の一致を要求し、
+名前中のスラッシュや括弧を機械的に分割しない。
+観測ごとの根拠を保持し、アルバム一致などからメタデータ上の優先候補を示す。
+優先候補があっても録音同一性は未確認で、他の候補も残す。
+
+```sh
+python3 scripts/replay_ytmusic_search.py data/ytmusic/coverage-01/requests \
+  --output data/ytmusic/search-replay-new.json
+
+python3 scripts/music_identity_map.py --track-snapshot data/final-library-tracks.json \
+  --identity-map data/final-library-identity-map-v03.json \
+  --observations data/ytmusic/search-replay-new.json \
+  --review-proposed --output data/final-library-search-new.json
+
+python3 scripts/probe_ytmusic_batch.py --track-snapshot data/final-library-tracks.json \
+  --identity-map data/final-library-identity-map-v03.json \
+  --plan-only --output data/ytmusic/final-library-plan-new
+```
+
+検索結果は`search_candidate`として曲の同定に使う。推薦関係はradio/relatedから作る。
+保存済み検索の再照合では63 video IDに候補があり、54に優先候補が出た。
+保存済み推薦側では38 video IDに候補があり、28に優先候補が出た。
+[検討した制約と複数クレジット・アルバムの扱い](docs/research/2026-10-03-credit-and-album.md)
+
+## YTMusic候補をMusicの選曲コアに渡す
+
+HDDなしで、候補照合から実際のARM64選曲コアまでを試せる。
+使用するのは保存済み曲一覧・対応表・radio/related観測・復号済みGenius DBのconfigと、
+提供済みMusicバイナリ。IDとmetadataはメモリ内の実験用で、DBファイルに保存しない。
+
+```sh
+python3 scripts/emulate_ytmusic_candidates.py \
+  --track-snapshot data/final-library-tracks.json \
+  --identity-map data/final-library-identity-map-v03.json \
+  --observations data/ytmusic/tsubasa-authenticated-03.json \
+  --genius-reference data/genius-decrypted.itdb \
+  --executable /home/mizoyuzu/Music.app/Contents/MacOS/Music \
+  --output data/ytmusic-core-experiment-new.json
+```
+
+ジャンルだけを外した条件と、重複回避だけを残した条件を比較する。
+「ツバサグラビティ」＋28候補から両条件で25曲を生成できた。
+検索結果は関係情報として拒否し、録音同一性・Music.app／iPod受け入れは未確認とする。
+[選曲コアへの接続・生成結果・制約](docs/research/2026-10-03-ytmusic-core-bridge.md)
