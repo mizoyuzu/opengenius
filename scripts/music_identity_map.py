@@ -3,8 +3,10 @@
 Aliases aid candidate generation; they never establish recording identity.
 """
 import argparse
+import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 
@@ -19,6 +21,57 @@ def proposed_title_alias(title):
         return {'value': prefix, 'enabled': False,
                 'status': 'needs_review', 'reason': 'possible_translation_suffix'}
     return None
+
+
+def load_library(bundle=None, track_snapshot=None):
+    if (bundle is None) == (track_snapshot is None):
+        raise ValueError('Specify exactly one Library bundle or track snapshot')
+    if bundle is not None:
+        data = (bundle / 'Library.musicdb').read_bytes()
+        tracks, _ = parse_tracks(decode_musicdb(data))
+        return tracks, hashlib.sha256(data).hexdigest(), {'kind': 'library_binary', 'original_library_hash_verified_this_run': True}
+    data = track_snapshot.read_bytes()
+    document = json.loads(data)
+    library_hash = document.get('source_sha256')
+    if not isinstance(library_hash, str) or not re.fullmatch('[0-9a-f]{64}', library_hash):
+        raise ValueError('Snapshot needs its original Library SHA-256')
+    tracks = document.get('tracks')
+    if not isinstance(tracks, list) or not tracks:
+        raise ValueError('Snapshot needs local tracks')
+    seen = set()
+    for track in tracks:
+        if not isinstance(track, dict):
+            raise ValueError('Invalid snapshot track')
+        pid = track.get('persistent_id')
+        if not isinstance(pid, str) or not re.fullmatch('[0-9A-F]{16}', pid) or pid in seen:
+            raise ValueError('Invalid or duplicate snapshot persistent ID')
+        seen.add(pid)
+        for field in ('title', 'artist', 'album'):
+            if field in track and not isinstance(track[field], str):
+                raise ValueError('Invalid snapshot text metadata')
+        duration = track.get('duration_ms')
+        if duration is not None and (type(duration) is not int or duration < 0):
+            raise ValueError('Invalid snapshot duration')
+    return tracks, library_hash, {'kind': 'track_snapshot',
+                                 'snapshot_sha256': hashlib.sha256(data).hexdigest(),
+                                 'original_library_hash_verified_this_run': False}
+
+
+def version_signature(title):
+    """Conservative guard for common versions; does not prove equivalence."""
+    title = normalize(title).replace('_', ' ')
+    markers = {
+        'instrumental': r'off[ _-]?vocal|\binstrument(?:al)?\b|カラオケ|からおけ',
+        'game_size': r'game[ _-]?size',
+        'tv_size': r'tv[ _-]?size',
+        'live': r'\blive\b|ライブ',
+        'remix': r'\bremix\b|\brmx\b|リミックス',
+        'piano': r'\bpiano\b|ピアノ',
+        'orchestral': r'\borchestr(?:al|a)\b|オーケストラ',
+    }
+    flags = {name for name, pattern in markers.items() if re.search(pattern, title)}
+    flags.update('year:' + year for year in re.findall(r'(?<!\d)((?:19|20)\d{2})(?!\d)', title))
+    return flags
 
 
 def build_map(tracks, library_hash, artist_evidence=()):
@@ -43,6 +96,44 @@ def build_map(tracks, library_hash, artist_evidence=()):
             'recording_links': [], 'identity_status': 'unverified'}
 
 
+def apply_title_review(document, decisions, tracks, library_hash):
+    """Apply explicit spelling decisions; no recording identity is confirmed."""
+    IdentityMap(document, tracks, library_hash)
+    if decisions.get('schema_version') != 1 or decisions.get('library_sha256') != library_hash:
+        raise ValueError('Review decisions do not match this Library')
+    result = copy.deepcopy(document)
+    by_pid = {track['persistent_id']: track for track in tracks}
+    rows = {row['persistent_id']: row for row in result['track_title_aliases']}
+    seen = set()
+    for decision in decisions['decisions']:
+        pid = decision['persistent_id']
+        if pid not in by_pid or decision['original_title'] != by_pid[pid].get('title'):
+            raise ValueError('Unknown or stale title review')
+        value = decision['alias']
+        if not isinstance(value, str) or not normalize(value) or not isinstance(decision.get('reason'), str) or not decision['reason'].strip():
+            raise ValueError('Title review needs an alias and reason')
+        key = (pid, normalize(value))
+        if key in seen:
+            raise ValueError('Duplicate title review')
+        seen.add(key)
+        if version_signature(value) != version_signature(decision['original_title']):
+            raise ValueError('Title alias changes recognized version markers')
+        row = rows.get(pid)
+        if row is None:
+            row = {'persistent_id': pid, 'original_title': decision['original_title'], 'aliases': []}
+            result['track_title_aliases'].append(row)
+            rows[pid] = row
+        alias = next((a for a in row['aliases'] if normalize(a['value']) == normalize(value)), None)
+        if alias is None:
+            alias = {'value': value}
+            row['aliases'].append(alias)
+        alias.update(enabled=True, status='reviewed_spelling_alias', reason=decision['reason'],
+                     evidence=decision.get('evidence', {}))
+    result['identity_status'] = 'unverified'
+    IdentityMap(result, tracks, library_hash)
+    return result
+
+
 class IdentityMap:
     def __init__(self, document, tracks, library_hash):
         if document.get('schema_version') != 1 or document.get('library_sha256') != library_hash:
@@ -64,17 +155,21 @@ class IdentityMap:
                     raise ValueError('Overlapping artist alias groups')
                 self.artist_names[name] = index
         self.titles = {}
+        self.proposed_titles = {}
         for row in document.get('track_title_aliases', []):
             pid = row['persistent_id']
             if pid not in by_pid or row['original_title'] != by_pid[pid].get('title') or pid in self.titles:
                 raise ValueError('Unknown, stale, or duplicate track title alias')
-            aliases = []
+            aliases, pending = [], []
             for alias in row['aliases']:
                 if not isinstance(alias['value'], str) or not normalize(alias['value']):
                     raise ValueError('Invalid title alias')
                 if alias.get('enabled'):
                     aliases.append(normalize(alias['value']))
+                else:
+                    pending.append(normalize(alias['value']))
             self.titles[pid] = aliases
+            self.proposed_titles[pid] = pending
         # Recording links are reserved for a later explicit verification workflow.
         if document.get('recording_links'):
             raise ValueError('Recording links are not yet supported')
@@ -85,7 +180,7 @@ class IdentityMap:
             return ('alias_group', self.artist_names[normalized])
         return ('literal', normalized)
 
-    def match(self, remote):
+    def match(self, remote, include_proposed=False):
         title = normalize(remote.get('title') or '')
         artists = {self.artist_key(a.get('name') or '') for a in (remote.get('artists') or []) if a.get('name')}
         duration = remote.get('duration_seconds')
@@ -97,11 +192,26 @@ class IdentityMap:
                     duration = duration * 60 + int(part)
         if not title or not artists:
             return []
+        if duration is not None and (type(duration) not in (int, float) or not math.isfinite(duration) or duration < 0):
+            return []
+        remote_proposal = proposed_title_alias(remote.get('title') or '') if include_proposed else None
+        remote_titles = {title}
+        if remote_proposal:
+            remote_titles.add(normalize(remote_proposal['value']))
         candidates = []
         for local in self.tracks:
             pid = local['persistent_id']
             exact_title = title == normalize(local.get('title') or '')
-            if not exact_title and title not in self.titles.get(pid, []):
+            active_title = exact_title or title in self.titles.get(pid, [])
+            pending_title = False
+            if not active_title:
+                possible_local = {normalize(local.get('title') or ''), *self.titles.get(pid, [])}
+                if include_proposed:
+                    possible_local.update(self.proposed_titles.get(pid, []))
+                    pending_title = bool(possible_local & remote_titles)
+                if not pending_title:
+                    continue
+            if not exact_title and version_signature(local.get('title') or '') != version_signature(remote.get('title') or ''):
                 continue
             if self.artist_key(local.get('artist') or '') not in artists:
                 continue
@@ -114,7 +224,9 @@ class IdentityMap:
                 normalize(a.get('name') or '') for a in remote.get('artists') or []}
             remote_album = (remote.get('album') or {}).get('name')
             candidates.append({'persistent_id': pid,
-                               'title_match': 'exact' if exact_title else 'explicit_alias',
+                               'local_metadata': {key: local.get(key) for key in ('title', 'artist', 'album', 'duration_ms')},
+                               'title_match': 'exact' if exact_title else ('proposed_alias' if pending_title else 'explicit_alias'),
+                               'alias_review_status': 'needs_review' if pending_title else 'active_metadata_candidate',
                                'artist_match': 'exact' if exact_artist else 'explicit_alias',
                                'duration_difference_seconds': round(delta, 3),
                                'album_match': (normalize(remote_album) == normalize(local.get('album') or '')) if remote_album else None,
@@ -124,55 +236,74 @@ class IdentityMap:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('bundle', type=Path)
+    parser.add_argument('bundle', type=Path, nargs='?')
+    parser.add_argument('--track-snapshot', type=Path, help='Saved metadata; no access to original HDD')
+    parser.add_argument('--review-proposed', action='store_true', help='Report pending title aliases separately; never activate them')
     parser.add_argument('--output', required=True, type=Path)
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument('--create', action='store_true')
     action.add_argument('--identity-map', type=Path)
     parser.add_argument('--artist-evidence', type=Path)
     parser.add_argument('--observations', type=Path)
+    parser.add_argument('--review-decisions', type=Path, help='Explicit spelling decisions; write a new map')
     args = parser.parse_args()
     output = args.output.resolve()
-    if output.is_relative_to(args.bundle.resolve()) or output.exists():
+    if (args.bundle is None) == (args.track_snapshot is None):
+        parser.error('Specify either bundle or --track-snapshot')
+    if (args.bundle and output.is_relative_to(args.bundle.resolve())) or output.exists():
         parser.error('output must be new and outside the input library')
-    data = (args.bundle / 'Library.musicdb').read_bytes()
-    library_hash = hashlib.sha256(data).hexdigest()
-    tracks, _ = parse_tracks(decode_musicdb(data))
+    tracks, library_hash, provenance = load_library(args.bundle, args.track_snapshot)
     if args.create:
-        if args.observations:
-            parser.error('--observations requires --identity-map')
+        if args.observations or args.review_proposed or args.review_decisions:
+            parser.error('Observation/review options require --identity-map')
         evidence = json.loads(args.artist_evidence.read_text())['artist_alias_proposals'] if args.artist_evidence else []
         report = build_map(tracks, library_hash, evidence)
         IdentityMap(report, tracks, library_hash)  # Validate generated aliases before saving.
         summary = {'artist_groups': len(report['artist_alias_groups']),
                    'title_aliases_pending_review': len(report['track_title_aliases'])}
     else:
-        if not args.observations or args.artist_evidence:
-            parser.error('--identity-map requires --observations and no --artist-evidence')
+        if args.artist_evidence or bool(args.observations) == bool(args.review_decisions):
+            parser.error('--identity-map requires exactly one of --observations or --review-decisions')
+        if args.review_decisions and args.review_proposed:
+            parser.error('--review-proposed requires --observations')
         document = json.loads(args.identity_map.read_text())
-        matcher = IdentityMap(document, tracks, library_hash)
-        snapshot = json.loads(args.observations.read_text())
-        rows = []
-        for observation in snapshot['observations']:
-            remote = observation['track']
-            rows.append({'source': observation['source'], 'relation': observation['relation'],
-                         'video_id': remote['video_id'], 'is_seed': observation['is_seed'],
-                         'section': observation.get('section'),
-                         'position': observation['position'], 'observed_at': observation['observed_at'],
-                         'exact_candidates': local_candidates(remote, tracks),
-                         'alias_candidates': matcher.match(remote),
-                         'identity_status': 'unverified', 'genius_rank': None})
-        report = {'schema_version': 1, 'library_sha256': library_hash,
-                  'identity_map_sha256': hashlib.sha256(args.identity_map.read_bytes()).hexdigest(),
-                  'observation_file_sha256': hashlib.sha256(args.observations.read_bytes()).hexdigest(),
-                  'source_session_id': snapshot.get('session_id'), 'observations': rows}
-        nonseed = [row for row in rows if not row['is_seed']]
-        summary = {'nonseed_exact_video_ids': len({r['video_id'] for r in nonseed if r['exact_candidates']}),
-                   'nonseed_alias_video_ids': len({r['video_id'] for r in nonseed if r['alias_candidates']}),
-                   'nonseed_union_video_ids': len({r['video_id'] for r in nonseed if r['exact_candidates'] or r['alias_candidates']}),
-                   'new_alias_video_ids': len({r['video_id'] for r in nonseed if r['alias_candidates']} - {r['video_id'] for r in nonseed if r['exact_candidates']}),
-                   'verified_recordings': 0}
-    if not args.create:
+        if args.review_decisions:
+            decisions = json.loads(args.review_decisions.read_text())
+            if decisions.get('identity_map_sha256') != hashlib.sha256(args.identity_map.read_bytes()).hexdigest():
+                raise ValueError('Review decisions target a different map revision')
+            report = apply_title_review(document, decisions, tracks, library_hash)
+            report['review_input_sha256'] = hashlib.sha256(args.review_decisions.read_bytes()).hexdigest()
+            summary = {'applied_title_decisions': len(decisions['decisions']), 'verified_recordings': 0}
+        else:
+            matcher = IdentityMap(document, tracks, library_hash)
+            snapshot = json.loads(args.observations.read_text())
+            rows = []
+            for observation in snapshot['observations']:
+                remote = observation['track']
+                rows.append({'source': observation['source'], 'relation': observation['relation'],
+                             'video_id': remote['video_id'], 'is_seed': observation['is_seed'],
+                             'remote_track': remote,
+                             'section': observation.get('section'),
+                             'position': observation['position'], 'observed_at': observation['observed_at'],
+                             'exact_candidates': local_candidates(remote, tracks),
+                             'alias_candidates': matcher.match(remote),
+                             'proposed_alias_candidates': [candidate for candidate in matcher.match(remote, include_proposed=True)
+                                                           if candidate['alias_review_status'] == 'needs_review'] if args.review_proposed else [],
+                             'identity_status': 'unverified', 'genius_rank': None})
+            report = {'schema_version': 1, 'library_sha256': library_hash,
+                      'identity_map_sha256': hashlib.sha256(args.identity_map.read_bytes()).hexdigest(),
+                      'observation_file_sha256': hashlib.sha256(args.observations.read_bytes()).hexdigest(),
+                      'source_session_id': snapshot.get('session_id'), 'observations': rows}
+            nonseed = [row for row in rows if not row['is_seed']]
+            summary = {'nonseed_exact_video_ids': len({r['video_id'] for r in nonseed if r['exact_candidates']}),
+                       'nonseed_alias_video_ids': len({r['video_id'] for r in nonseed if r['alias_candidates']}),
+                       'nonseed_union_video_ids': len({r['video_id'] for r in nonseed if r['exact_candidates'] or r['alias_candidates']}),
+                       'new_alias_video_ids': len({r['video_id'] for r in nonseed if r['alias_candidates']} - {r['video_id'] for r in nonseed if r['exact_candidates']}),
+                       'pending_review_video_ids': len({r['video_id'] for r in nonseed if r['proposed_alias_candidates']}),
+                       'new_pending_review_video_ids': len({r['video_id'] for r in nonseed if r['proposed_alias_candidates']} - {r['video_id'] for r in nonseed if r['exact_candidates'] or r['alias_candidates']}),
+                       'verified_recordings': 0}
+    report['library_input'] = provenance
+    if not args.create and not args.review_decisions:
         report['summary'] = summary
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open('x', encoding='utf-8') as handle:
