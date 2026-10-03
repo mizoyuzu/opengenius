@@ -377,3 +377,25 @@ Nightly再ログイン後、20起点の取得と既存1起点を合わせた評�
 最新の全曲一覧はローカル`data/ytmusic/batch-evaluation-v06.md`、
 再照合対応表は`data/final-library-identity-map-v04.json`。
 [追加取得と21起点の比較結果](docs/research/2026-10-03-large-dataset.md)
+
+本番Library全体から比較枠を明示して選ぶ場合は`--seed-plan`を使う。
+計画は`schema_version: 1`、`source_library_sha256`、
+`seeds: [{persistent_id, series, sample_kind}]`の形式。件数は`--seeds`と一致させる。
+曲名・artist・長さを計画から上書きせず、現在の曲一覧を参照する。
+`--seed-observations`とは同時に使えない。
+
+```sh
+python3 scripts/probe_ytmusic_batch.py \
+  --track-snapshot data/final-library-tracks.json \
+  --identity-map data/final-library-identity-map-v04.json \
+  --seed-plan data/final-library-diverse-seed-plan-v01.json \
+  --seeds 20 --language en --plan-only \
+  --output data/ytmusic/diverse-new
+```
+
+検索を伴う取得は現行SDKの棚見出し処理に合わせて`--language en`を使う。
+任意related欄の解析失敗は明示してradioを保持し、HTTP・認証エラーは停止する。
+複数の検索動画からalbum名が一意に一致する候補をmetadata上で優先できるが、録音同一性は未確認。
+今回の20起点は8取得・12保留。8起点の通常条件と比較条件の曲一覧は
+`data/ytmusic/diverse-library-results-v01.md`に保存した。
+[分散20起点の結果と残る偏り](docs/research/2026-10-03-diverse-library-seeds.md)
