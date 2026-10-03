@@ -418,3 +418,8 @@ python3 scripts/music_clusters.py \
 `--cluster-tag`を繰り返す場合は全タグに一致する曲を選ぶ。
 BGM向け比較条件は`--profile artist-album-minimum-one`で明示指定する。
 [作品分類と8設定の実測結果](docs/research/2026-10-03-user-clusters.md)
+
+分類と推薦はローカル画面でも確認できる。
+`serve_music_review.py`で曲一覧を開き、アルバム一括タグ付けと曲ごとの種類訂正、
+新規設定ファイルへの保存、保存済み関係からの推薦再生成を行う。
+[起動方法・保存場所・検証範囲](docs/research/2026-10-03-music-review-ui.md)
