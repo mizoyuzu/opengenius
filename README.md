@@ -328,3 +328,43 @@ python3 scripts/build_genius_dataset.py \
 出力は`Genius.experimental.sqlite`、`library-assignments.json`、`report.json`。
 本番Libraryを書き換えず、実際の鍵による暗号化も保留する。
 [保存形式・検証結果・残る互換性の課題](docs/research/2026-10-03-genius-dataset.md)
+
+## データ規模と複数起点を試す
+
+DB生成に`--include-library-metadata`を追加すると全曲のmetadataを登録する。
+追加曲の関係は空で、実際のradio/related関係だけを使う。推薦を捏造せずにDB容量を検証する。
+2,974曲の試験ではSQLiteとAES往復が通り、29曲版と同じ25曲を生成できた。
+
+保存済み検索から一意の起点候補を選ぶ場合は、取得側に`--seed-observations`を指定する。
+曲一覧と対応表で再照合し、複数の録音候補や複数video IDがある起点は保留する。
+認証を読み込む前の`--plan-only`で計画を確認できる。
+
+```sh
+python3 scripts/probe_ytmusic_batch.py \
+  --track-snapshot data/final-library-tracks.json \
+  --identity-map data/final-library-identity-map-v03.json \
+  --seed-observations data/ytmusic/final-library-search-replay.json \
+  --auth data/ytmusic/auth-session.json --seeds 20 \
+  --language ja --interval 5 --request-budget 100 \
+  --plan-only --output data/ytmusic/coverage-new
+```
+
+認証更新後、同じ引数から`--plan-only`を外すと取得を開始する。
+全20起点についてrelatedがある場合は認証確認と最大60回の取得で約5分。
+HTTPエラー・認証確認失敗時は停止し、自動再試行しない。
+保存済み検索の選択範囲には偏りがあり、今回の20起点はシャニマス中心。
+
+取得後は共通ID空間で各起点を評価する。起点ごとの生成一覧、候補照合率、
+アーティスト数、同じアーティストの連続、プレイリスト同士の集合の重なりを保存する。
+取得できなかった起点はスキップとして明示し、検索結果から関係は作らない。
+
+```sh
+python3 scripts/evaluate_ytmusic_batch.py \
+  --track-snapshot data/final-library-tracks.json \
+  --identity-map data/final-library-identity-map-v03.json \
+  --observations-directory data/ytmusic/coverage-new \
+  --extra-observation data/ytmusic/tsubasa-authenticated-03.json \
+  --genius-reference data/genius-decrypted.itdb \
+  --executable /home/mizoyuzu/Music.app/Contents/MacOS/Music \
+  --output data/ytmusic/batch-evaluation-new.json
+```
