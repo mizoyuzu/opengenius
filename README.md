@@ -308,3 +308,23 @@ python3 scripts/emulate_ytmusic_candidates.py \
 「ツバサグラビティ」＋28候補から両条件で25曲を生成できた。
 検索結果は関係情報として拒否し、録音同一性・Music.app／iPod受け入れは未確認とする。
 [選曲コアへの接続・生成結果・制約](docs/research/2026-10-03-ytmusic-core-bridge.md)
+
+## 実験用DBとLibrary ID割り当て案を保存する
+
+選曲候補を平文SQLiteの実験用コピーへ追加し、同じIDを使うLibrary割り当て案を作る。
+元DBの行と補助テーブルを保持するが、補助テーブルの本番Libraryへの対応付けは未完了。
+SQLite、使い捨て鍵によるAES往復、保存後DBでの実際の選曲コアを検証してから保存する。
+
+```sh
+python3 scripts/build_genius_dataset.py \
+  --track-snapshot data/final-library-tracks.json \
+  --identity-map data/final-library-identity-map-v03.json \
+  --observations data/ytmusic/tsubasa-authenticated-03.json \
+  --genius-reference data/genius-decrypted.itdb \
+  --executable /home/mizoyuzu/Music.app/Contents/MacOS/Music \
+  --output-directory data/genius-dataset-new
+```
+
+出力は`Genius.experimental.sqlite`、`library-assignments.json`、`report.json`。
+本番Libraryを書き換えず、実際の鍵による暗号化も保留する。
+[保存形式・検証結果・残る互換性の課題](docs/research/2026-10-03-genius-dataset.md)
