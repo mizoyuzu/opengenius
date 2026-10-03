@@ -16,9 +16,17 @@ from music_identity_map import IdentityMap, load_library
 from rewrite_genius import encrypt_pages, table_snapshot
 
 
-def allocate_rows(graph, matcher, reference_metadata, reference_similarities):
+def allocate_rows(graph, matcher, reference_metadata, reference_similarities, include_library_metadata=False):
     """Use disjoint track IDs and group values, retaining graph order/equality."""
-    temporary, metadata, similarities, _ = synthetic_rows(graph, matcher)
+    dataset_graph = graph
+    if include_library_metadata:
+        dataset_graph = {**graph, 'ordered_target_pids': list(dict.fromkeys([
+            *graph['ordered_target_pids'],
+            *(track['persistent_id'] for track in matcher.tracks if track['persistent_id'] != graph['root_pid'])]))}
+    temporary, metadata, similarities, _ = synthetic_rows(dataset_graph, matcher)
+    # Additional Library nodes supply metadata only, never invented recommendations.
+    similarities[temporary[graph['root_pid']]] = pack_similarities(
+        0, [temporary[pid] for pid in graph['ordered_target_pids']])
     tracks = {track['persistent_id']: track for track in matcher.tracks}
     occupied = set(reference_metadata) | set(reference_similarities)
     for track in matcher.tracks:
@@ -58,11 +66,11 @@ def allocate_rows(graph, matcher, reference_metadata, reference_similarities):
     return ids, final_metadata, final_similarities
 
 
-def build(reference, graph, matcher, executable, limit=25):
+def build(reference, graph, matcher, executable, limit=25, include_library_metadata=False):
     if not 1 <= limit <= 100:
         raise ValueError('Limit must be 1..100')
     config, original_metadata, original_similarities = database_rows(reference)
-    ids, metadata, similarities = allocate_rows(graph, matcher, original_metadata, original_similarities)
+    ids, metadata, similarities = allocate_rows(graph, matcher, original_metadata, original_similarities, include_library_metadata)
     controlled = controlled_configs(config)['without-compatible-genre']
     with sqlite3.connect(':memory:') as connection:
         connection.deserialize(reference)
@@ -98,6 +106,8 @@ def main():
     for name in ('track-snapshot', 'identity-map', 'observations', 'genius-reference', 'executable', 'output-directory'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--limit', type=int, default=25)
+    parser.add_argument('--include-library-metadata', action='store_true',
+                        help='Add all Library metadata for storage/selection scaling; no extra relation edges')
     args = parser.parse_args()
     inputs = {name: getattr(args, name).resolve() for name in
               ('track_snapshot', 'identity_map', 'observations', 'genius_reference', 'executable')}
@@ -108,14 +118,14 @@ def main():
     blobs = {name: path.read_bytes() for name, path in inputs.items() if name != 'executable'}
     matcher = IdentityMap(json.loads(blobs['identity_map']), tracks, library_hash)
     graph = candidate_graph(json.loads(blobs['observations']), matcher, library_hash)
-    clear, ids, checks = build(blobs['genius_reference'], graph, matcher, inputs['executable'], args.limit)
+    clear, ids, checks = build(blobs['genius_reference'], graph, matcher, inputs['executable'], args.limit, args.include_library_metadata)
     assignments = {'schema_version': 1, 'source_library_sha256': library_hash,
                    'assignments': [{'persistent_id': pid, 'genius_id': f'{identifier:016X}'} for pid, identifier in sorted(ids.items())]}
     report = {'schema_version': 1, 'library_input': provenance, 'input_sha256': {
         **{name: hashlib.sha256(blob).hexdigest() for name, blob in blobs.items()},
         'executable': hashlib.sha256(inputs['executable'].read_bytes()).hexdigest()},
         'root_pid': graph['root_pid'], 'root_genius_id': f"{ids[graph['root_pid']]:016X}",
-        'dataset_tracks': len(ids), 'directed_relations': len(graph['ordered_target_pids']),
+        'dataset_tracks': len(ids), 'include_library_metadata': args.include_library_metadata, 'directed_relations': len(graph['ordered_target_pids']),
         'genius_plaintext_sha256': hashlib.sha256(clear).hexdigest(), **checks,
         'config_profile': 'without-compatible-genre', 'identity_status': 'unverified',
         'genre': 'zero placeholder; genre filter excluded', 'network_requests': 0,

@@ -32,6 +32,15 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual(parse_similarities(relations[ids['A']])[1], [ids['B']])
         self.assertEqual(parse_similarities(relations[ids['B']])[1], [])
 
+    def test_full_library_metadata_adds_no_invented_edges(self):
+        self.tracks.extend(dict(self.tracks[0], persistent_id=f'EXTRA{i}') for i in range(1000))
+        ids, metadata, relations = allocate_rows(self.graph, self.matcher(), {}, {}, True)
+        self.assertEqual(len(ids), 1002)
+        self.assertEqual(len(metadata), 1002)
+        self.assertEqual(parse_similarities(relations[ids['A']])[1], [ids['B']])
+        self.assertTrue(all(parse_similarities(blob)[1] == [] for identifier, blob in relations.items()
+                            if identifier != ids['A']))
+
     def test_occupied_selected_track_or_missing_gid_rejected(self):
         self.tracks[0]['genius_id'] = '0000000000000001'
         with self.assertRaisesRegex(ValueError, 'already has'):
