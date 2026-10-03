@@ -316,7 +316,12 @@ def main():
     except Exception as error:
         report['status'] = 'stopped'
         report['error_type'] = type(error).__name__  # Never store exception text/headers.
-        print('Stopped (' + type(error).__name__ + '); no automatic retry.', flush=True)
+        status = getattr(getattr(error, 'response', None), 'status_code', None)
+        if type(status) is int and 100 <= status <= 599:
+            report['http_error_status'] = status
+        print('Stopped (' + type(error).__name__ +
+              (' HTTP ' + str(status) if 'http_error_status' in report else '') +
+              '); no automatic retry.', flush=True)
     finally:
         report['http_requests'] = session.count if session else 0
         report['finished_at'] = datetime.now(timezone.utc).isoformat()
