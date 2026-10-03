@@ -3,6 +3,7 @@
 Metadata preferences and synthetic playlist groups never confirm recording identity.
 """
 import argparse
+from collections import deque
 from datetime import datetime
 import hashlib
 import json
@@ -155,18 +156,34 @@ def jaccard(left, right):
     return len(set(left) & set(right)) / len(union) if union else None
 
 
-def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=None):
+def relation_distances(root_pid, edges):
+    """Shortest directed path in observed relations; not a native execution trace."""
+    distances = {root_pid: 0}
+    queue = deque([root_pid])
+    while queue:
+        current = queue.popleft()
+        for target in edges.get(current, []):
+            if target not in distances:
+                distances[target] = distances[current] + 1
+                queue.append(target)
+    return distances
+
+
+def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=None, profile='without-compatible-genre'):
     if not 1 <= limit <= 100:
         raise ValueError('Limit must be 1..100')
+    if profile not in ('without-compatible-genre', 'relations-only'):
+        raise ValueError('Unsupported configuration profile')
     roots = merge_graphs(graphs)
     ids, metadata, similarities, mapping = shared_rows(roots, matcher)
     by_id = {identifier: pid for pid, identifier in ids.items()}
     tracks = {track['persistent_id']: track for track in matcher.tracks}
-    controlled = controlled_configs(config)['without-compatible-genre']
+    controlled = controlled_configs(config)[profile]
     core = None
+    edges = {root['root_pid']: root['ordered_target_pids'] for root in roots}
     results = []
     for root in roots:
-        result = {**root, 'candidate_count': len(root['ordered_target_pids']), 'profile': 'without-compatible-genre'}
+        result = {**root, 'candidate_count': len(root['ordered_target_pids']), 'profile': profile}
         if not root['ordered_target_pids']:
             generated, playlist = {}, []
             result['status'] = 'empty_candidates'
@@ -179,11 +196,16 @@ def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=
             generated = core.generate(ids[root['root_pid']], limit)
             playlist = [by_id[int(identifier, 16)] for identifier in generated['result_genius_ids']]
             result['status'] = 'generated'
+        distances = relation_distances(root['root_pid'], edges)
         credits = [matcher.artist_credits(tracks[pid].get('artist') or '') for pid in playlist]
         adjacent = sum(left == right for left, right in zip(credits, credits[1:]))
         result.update(core_result=generated, playlist_pids=playlist,
                       playlist=[{'persistent_id': pid, 'title': tracks[pid].get('title'),
-                                 'artist': tracks[pid].get('artist'), 'identity_status': 'unverified'} for pid in playlist],
+                                 'artist': tracks[pid].get('artist'), 'observed_relation_hops': distances.get(pid),
+                                 'identity_status': 'unverified'} for pid in playlist],
+                      direct_candidate_count=sum(distances.get(pid) == 1 for pid in playlist),
+                      indirect_candidate_count=sum(distances.get(pid, 0) > 1 for pid in playlist),
+                      unreachable_candidate_count=sum(pid not in distances for pid in playlist),
                       generated_count=len(playlist), generated_nonroot_count=sum(pid != root['root_pid'] for pid in playlist),
                       unique_artist_count=len(set(credits)), adjacent_same_artist_count=adjacent,
                       adjacent_same_artist_rate=adjacent / (len(credits) - 1) if len(credits) > 1 else None,
@@ -226,6 +248,8 @@ def main():
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--extra-observation', type=Path, action='append', default=[])
     parser.add_argument('--limit', type=int, default=25)
+    parser.add_argument('--profile', choices=('without-compatible-genre', 'relations-only'),
+                        default='without-compatible-genre')
     args = parser.parse_args()
     if not 1 <= args.limit <= 100:
         parser.error('Limit must be 1..100')
@@ -247,11 +271,12 @@ def main():
                                'seed_manifest': manifest_hash, 'genius_reference': hashlib.sha256(reference).hexdigest(),
                                'executable': hashlib.sha256(paths['executable'].read_bytes()).hexdigest()},
               'observation_inputs': observation_inputs, 'skipped_snapshots': skipped, 'snapshot_graphs': graphs,
-              **evaluate_graphs(graphs, matcher, config, paths['executable'], args.limit),
+              **evaluate_graphs(graphs, matcher, config, paths['executable'], args.limit, profile=args.profile),
               'grouping_policy': {'ids': 'Sorted local PIDs in one shared temporary uint32 ID space',
                                   'metadata': 'genre 0; canonical artist credits; normalized album; credits plus original title song groups',
                                   'relations': 'Actual radio/related targets only; per-root ordered PID union; no reverse edges',
                                   'empty_candidates': 'No MusicCore call; empty playlist',
+                                  'observed_relation_hops': 'Shortest directed path from root; not a Music core execution trace; null if unreachable',
                                   'artist_metrics': 'Canonical artist credit sets; complete generated playlist including seed',
                                   'overlap': 'PID set Jaccard; empty union is null; nonroot overlap excludes all batch roots'},
               'network_requests': 0, 'account_authentication_rechecked': False, 'identity_status': 'unverified', 'verified_recordings': 0,

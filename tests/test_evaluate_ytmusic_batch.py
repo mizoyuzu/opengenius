@@ -109,6 +109,18 @@ class BatchEvaluationTests(unittest.TestCase):
         self.assertEqual(len(FakeCore.instances), 1)
         self.assertEqual(len(FakeCore.instances[0].calls), 2)
 
+    def test_generated_provenance_distinguishes_direct_indirect_and_unreachable(self):
+        class ExpandedCore(FakeCore):
+            def generate(self, root, limit):
+                return {'result_genius_ids': [f'{value:016X}' for value in sorted(self.metadata)]}
+        graphs = [self.graph(1, [2]), self.graph(2, [3]), self.graph(4, [])]
+        report = evaluate_graphs(graphs, self.matcher, config(), 'unused', core_factory=ExpandedCore)
+        result = report['root_results'][0]
+        self.assertEqual([track['observed_relation_hops'] for track in result['playlist']], [0, 1, 2, None])
+        self.assertEqual(result['direct_candidate_count'], 1)
+        self.assertEqual(result['indirect_candidate_count'], 1)
+        self.assertEqual(result['unreachable_candidate_count'], 1)
+
     def test_seed_only_roots_never_instantiate_or_call_core(self):
         def forbidden(*args):
             raise AssertionError('No Core for seed-only graphs')
