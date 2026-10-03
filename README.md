@@ -368,3 +368,12 @@ python3 scripts/evaluate_ytmusic_batch.py \
   --executable /home/mizoyuzu/Music.app/Contents/MacOS/Music \
   --output data/ytmusic/batch-evaluation-new.json
 ```
+
+Nightly再ログイン後、20起点の取得と既存1起点を合わせた評価が完了した。
+151曲・633関係の共通グラフで、16起点は25曲、BGMの5起点は1〜3曲を生成。
+`--profile relations-only`ではBGMの5起点が5〜13曲になった。
+生成曲には直接関係だけでなく2段の関係で到達するものもあるため、
+`observed_relation_hops`に有向グラフの最短距離を記録する（コア内部の実行経路ではない）。
+最新の全曲一覧はローカル`data/ytmusic/batch-evaluation-v06.md`、
+再照合対応表は`data/final-library-identity-map-v04.json`。
+[追加取得と21起点の比較結果](docs/research/2026-10-03-large-dataset.md)
