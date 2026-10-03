@@ -110,6 +110,14 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(json.loads(response.read())['classifications']['0000000000000001']['kind'], 'bgm')
         conn.request('GET', '/api/state', headers={'Host': 'other.example'})
         response = conn.getresponse(); response.read()
+        self.assertEqual(response.status, 200)
+        headers.update({'Host': 'review.example:8765', 'Origin': 'https://review.example:8765'})
+        conn.request('POST', '/api/edit', body, headers)
+        response = conn.getresponse(); response.read()
+        self.assertEqual(response.status, 200)
+        headers['X-Review-Token'] = 'wrong-token'
+        conn.request('POST', '/api/edit', body, headers)
+        response = conn.getresponse(); response.read()
         self.assertEqual(response.status, 403)
 
 

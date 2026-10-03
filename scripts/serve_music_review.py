@@ -1,4 +1,4 @@
-"""Loopback-only classification editor and offline recommendation review."""
+"""Classification editor and offline recommendation review."""
 import argparse
 import copy
 from datetime import datetime, timezone
@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import secrets
 import threading
+from urllib.parse import urlsplit
 
 from music_clusters import _unique_keys, classify_tracks, scope_graphs
 from music_identity_map import IdentityMap, load_library
@@ -156,13 +157,12 @@ def make_handler(session, token):
             self.end_headers()
             self.wfile.write(raw)
 
-        def trusted_host(self):
-            return self.headers.get('Host') == f'127.0.0.1:{self.server.server_port}'
+        def same_origin(self):
+            origin = urlsplit(self.headers.get('Origin', ''))
+            return (origin.scheme in ('http', 'https') and origin.netloc == self.headers.get('Host')
+                    and not origin.path and not origin.query and not origin.fragment)
 
         def do_GET(self):
-            if not self.trusted_host():
-                self.send(403, {'error': 'Invalid host'})
-                return
             if self.path == '/':
                 self.send(200, WEB.read_bytes().replace(b'__SESSION_TOKEN__', token.encode()), 'text/html; charset=utf-8')
             elif self.path == '/api/state':
@@ -172,8 +172,7 @@ def make_handler(session, token):
                 self.send(404, {'error': 'Not found'})
 
         def do_POST(self):
-            origin = f'http://127.0.0.1:{self.server.server_port}'
-            if (not self.trusted_host() or self.headers.get('Origin') != origin
+            if (not self.same_origin()
                     or self.headers.get('X-Review-Token') != token):
                 self.send(403, {'error': 'Invalid local session'})
                 return
@@ -220,6 +219,7 @@ def main():
     parser.add_argument('--evaluation', type=Path)
     parser.add_argument('--output-directory', type=Path, default=Path('data/music-review'))
     parser.add_argument('--port', type=int, default=8765)
+    parser.add_argument('--host', default='127.0.0.1')
     for name in ('identity-map', 'observations-directory', 'genius-reference', 'executable'):
         parser.add_argument('--' + name, type=Path)
     args = parser.parse_args()
@@ -242,7 +242,7 @@ def main():
                       'executable_sha256': hashlib.sha256(args.executable.read_bytes()).hexdigest()}
         session.engine = (graphs, matcher, config, args.executable, provenance)
     token = secrets.token_hex(32)
-    server = ThreadingHTTPServer(('127.0.0.1', args.port), make_handler(session, token))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(session, token))
     print(f'http://127.0.0.1:{server.server_port} — {len(session.tracks)}曲 / ローカル分類・推薦確認', flush=True)
     try:
         server.serve_forever()

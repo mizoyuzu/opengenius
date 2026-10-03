@@ -2,7 +2,8 @@
 
 2026-10-03。`scripts/serve_music_review.py`と`web/music-review.html`を追加。
 Python標準ライブラリで起動し、画面の外部ライブラリやCDNは使わない。
-127.0.0.1にのみbindし、Host/Originとセッショントークンを検証する。
+既定で127.0.0.1にbindし、Host名は制限しない。変更操作は同一Originとセッショントークンを検証する。
+`--host`で待ち受けアドレスを指定できる。
 
 ## 起動
 
@@ -19,7 +20,8 @@ Python標準ライブラリで起動し、画面の外部ライブラリやCDN�
   --executable ~/Music.app/Contents/MacOS/Music
 ```
 
-`http://127.0.0.1:8765`を開く。`--port`で変更可能。
+`http://127.0.0.1:8765`を開く。Host名の異なるプロキシ経由でも使用できる。
+`--host`と`--port`で待ち受けを変更可能。
 `--track-snapshot`だけでも分類・保存は使える。`--config`を省略すると
 作品タグなし・kind不明（Off Vocal検出のみ）の状態で始める。
 推薦再生成には最後の4入力がすべて必要。取得済みの起点だけを使える。
