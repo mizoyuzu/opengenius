@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "source_library_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "rules": [
+    {
+      "name": "アイマスの作品タグ",
+      "match": {"album_contains": ["THE IDOLM@STER", "アイドルマスター"]},
+      "tags": ["アイマス"]
+    },
+    {
+      "name": "シャニマスのブランドタグ",
+      "match": {"album_contains": ["THE IDOLM@STER SHINY COLORS"]},
+      "tags": ["シャニマス"]
+    },
+    {
+      "name": "選んだアニソン作品",
+      "match": {"album_contains": ["Only My Railgun", "ラブライブ"]},
+      "tags": ["アニソン"]
+    },
+    {
+      "name": "選んだノベルゲーム作品のタグ",
+      "match": {"album_contains": ["CLANNAD ORIGINAL SOUNDTRACK"]},
+      "tags": ["ノベルゲー", "CLANNAD"]
+    }
+  ],
+  "overrides": {}
+}

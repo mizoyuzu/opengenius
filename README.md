@@ -399,3 +399,22 @@ python3 scripts/probe_ytmusic_batch.py \
 今回の20起点は8取得・12保留。8起点の通常条件と比較条件の曲一覧は
 `data/ytmusic/diverse-library-results-v01.md`に保存した。
 [分散20起点の結果と残る偏り](docs/research/2026-10-03-diverse-library-seeds.md)
+
+作品・系統のタグと歌唱/BGM/Off Vocalは別々に指定できる。
+[設定例と説明](examples/music-clusters.README.md)のJSONを`data/`へコピーし、
+Library SHAと自分のルールを設定する。混在サントラのkindは確認したPIDで補う。
+分類プレビューは`music_clusters.py`で出力できる。
+
+```sh
+python3 scripts/music_clusters.py \
+  --track-snapshot data/final-library-tracks.json \
+  --config data/my-clusters.json \
+  --output data/my-classifications.json
+```
+
+上の`evaluate_ytmusic_batch.py`コマンドに
+`--cluster-config data/my-clusters.json --cluster-tag ノベルゲー --track-kind bgm`
+を追加すると、指定範囲の起点・候補だけを共有グラフに渡す。
+`--cluster-tag`を繰り返す場合は全タグに一致する曲を選ぶ。
+BGM向け比較条件は`--profile artist-album-minimum-one`で明示指定する。
+[作品分類と8設定の実測結果](docs/research/2026-10-03-user-clusters.md)

@@ -121,6 +121,18 @@ class BatchEvaluationTests(unittest.TestCase):
         self.assertEqual(result['indirect_candidate_count'], 1)
         self.assertEqual(result['unreachable_candidate_count'], 1)
 
+    def test_cluster_scope_removes_nodes_before_shared_core_creation(self):
+        from music_clusters import scope_graphs
+        labels = {f'{i:016X}': {'tags': ['Family'], 'kind': 'bgm' if i < 3 else 'vocal'}
+                  for i in range(1, 5)}
+        scoped, summary = scope_graphs([self.graph(1, [2]), self.graph(2, [3]), self.graph(4, [1])],
+                                      labels, ['Family'], 'bgm')
+        report = evaluate_graphs(scoped, self.matcher, config(), 'unused', core_factory=FakeCore)
+        self.assertEqual(report['shared_metadata_count'], 2)
+        self.assertEqual(report['root_results'][0]['playlist_pids'], [f'{1:016X}', f'{2:016X}'])
+        self.assertEqual(report['root_results'][1]['status'], 'empty_candidates')
+        self.assertEqual(summary['excluded_root_pids'], [f'{4:016X}'])
+
     def test_seed_only_roots_never_instantiate_or_call_core(self):
         def forbidden(*args):
             raise AssertionError('No Core for seed-only graphs')

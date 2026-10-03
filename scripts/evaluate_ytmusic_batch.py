@@ -172,13 +172,17 @@ def relation_distances(root_pid, edges):
 def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=None, profile='without-compatible-genre'):
     if not 1 <= limit <= 100:
         raise ValueError('Limit must be 1..100')
-    if profile not in ('without-compatible-genre', 'relations-only'):
+    if profile not in ('without-compatible-genre', 'relations-only', 'artist-album-minimum-one'):
         raise ValueError('Unsupported configuration profile')
     roots = merge_graphs(graphs)
     ids, metadata, similarities, mapping = shared_rows(roots, matcher)
     by_id = {identifier: pid for pid, identifier in ids.items()}
     tracks = {track['persistent_id']: track for track in matcher.tracks}
-    controlled = controlled_configs(config)[profile]
+    if profile == 'artist-album-minimum-one':
+        from genius_profiles import distance_profiles
+        controlled = distance_profiles(config)[profile]
+    else:
+        controlled = controlled_configs(config)[profile]
     core = None
     edges = {root['root_pid']: root['ordered_target_pids'] for root in roots}
     results = []
@@ -248,14 +252,21 @@ def main():
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--extra-observation', type=Path, action='append', default=[])
     parser.add_argument('--limit', type=int, default=25)
-    parser.add_argument('--profile', choices=('without-compatible-genre', 'relations-only'),
+    parser.add_argument('--cluster-config', type=Path)
+    parser.add_argument('--cluster-tag', action='append', default=[])
+    parser.add_argument('--track-kind', choices=('vocal', 'bgm', 'off_vocal', 'unknown'))
+    parser.add_argument('--profile', choices=('without-compatible-genre', 'relations-only', 'artist-album-minimum-one'),
                         default='without-compatible-genre')
     args = parser.parse_args()
+    if (args.cluster_tag or args.track_kind) and not args.cluster_config:
+        parser.error('Cluster scope requires --cluster-config')
     if not 1 <= args.limit <= 100:
         parser.error('Limit must be 1..100')
     paths = {name: getattr(args, name).resolve() for name in ('track_snapshot', 'identity_map', 'genius_reference', 'executable')}
     directory, output = args.observations_directory.resolve(), args.output.resolve()
     extras = [path.resolve() for path in args.extra_observation]
+    if args.cluster_config and output == args.cluster_config.resolve():
+        parser.error('Output must differ from cluster config')
     if output.exists() or output in {*paths.values(), *extras} or output.is_relative_to(directory) or output.is_relative_to(paths['executable'].parent):
         parser.error('Output must be new and outside observation inputs and executable directory')
     tracks, library_hash, provenance = load_library(track_snapshot=paths['track_snapshot'])
@@ -263,6 +274,15 @@ def main():
     matcher = IdentityMap(json.loads(map_data), tracks, library_hash)
     observations, manifest_hash = observation_paths(directory, extras, library_hash)
     graphs, skipped, observation_inputs = collect_graphs(observations, matcher, library_hash)
+    cluster_scope = None
+    cluster_config_hash = None
+    if args.cluster_config:
+        from music_clusters import classify_tracks, scope_graphs, _unique_keys
+        cluster_bytes = args.cluster_config.read_bytes()
+        classifications = classify_tracks(json.loads(cluster_bytes, object_pairs_hook=_unique_keys), tracks, library_hash)
+        cluster_config_hash = hashlib.sha256(cluster_bytes).hexdigest()
+        if args.cluster_tag or args.track_kind:
+            graphs, cluster_scope = scope_graphs(graphs, classifications, args.cluster_tag, args.track_kind)
     reference = paths['genius_reference'].read_bytes()
     from emulate_genius import database_rows
     config, _, _ = database_rows(reference)
@@ -271,6 +291,7 @@ def main():
                                'seed_manifest': manifest_hash, 'genius_reference': hashlib.sha256(reference).hexdigest(),
                                'executable': hashlib.sha256(paths['executable'].read_bytes()).hexdigest()},
               'observation_inputs': observation_inputs, 'skipped_snapshots': skipped, 'snapshot_graphs': graphs,
+              'cluster_scope': cluster_scope, 'cluster_config_sha256': cluster_config_hash,
               **evaluate_graphs(graphs, matcher, config, paths['executable'], args.limit, profile=args.profile),
               'grouping_policy': {'ids': 'Sorted local PIDs in one shared temporary uint32 ID space',
                                   'metadata': 'genre 0; canonical artist credits; normalized album; credits plus original title song groups',
