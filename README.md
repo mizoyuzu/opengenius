@@ -230,3 +230,33 @@ python3 scripts/music_identity_map.py '/mnt/temp-hdd/Final Target Apple Music Li
 現時点では一括取得スクリプトへの組み込み、複数クレジットの分解、
 確認済みvideo IDの直接登録は含まない。
 [対応表の形式・初版の結果](docs/research/2026-10-02-identity-map.md)
+
+## HDDを外した状態での再照合
+
+保存済みの曲一覧を使えば、元Libraryを読み込まずに別名照合を続けられる。
+元LibraryのSHAは保存時の値を使い、現在のバイナリを再確認したとは扱わない。
+
+```sh
+python3 scripts/music_identity_map.py \
+  --track-snapshot data/final-library-tracks.json \
+  --identity-map data/final-library-identity-map-reviewed.json \
+  --observations data/ytmusic/tsubasa-authenticated-03.json \
+  --review-proposed --output data/final-library-offline-new.json
+```
+
+表記レビューの判断JSONを新しい対応表に反映する場合:
+
+```sh
+python3 scripts/music_identity_map.py \
+  --track-snapshot data/final-library-tracks.json \
+  --identity-map data/final-library-identity-map.json \
+  --review-decisions data/final-library-title-review-decisions.json \
+  --output data/final-library-reviewed-new.json
+```
+
+判断JSONは対象Libraryと入力対応表のSHA、曲PID、元曲名、別名、理由を持つ。
+新しい対応表に書き出し、表示タグと元対応表を保持する。
+`--review-proposed`の候補は別欄に出すだけで、有効な照合に自動採用しない。
+7曲分の表記を確認して11トラックの別名を追加した結果、保存済み推薦の
+対応候補は31から38 video IDになった。録音同一性は未確認のまま。
+[オフラインの表記レビュー・結果・制約](docs/research/2026-10-03-offline-alias-review.md)
