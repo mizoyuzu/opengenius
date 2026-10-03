@@ -70,7 +70,7 @@ class BatchTests(unittest.TestCase):
                     argv = ['probe', str(root / 'library'), '--output', str(root / 'output'),
                             '--interval=' + interval, '--plan-only']
                     with patch.object(sys, 'argv', argv), patch('sys.stderr', new=io.StringIO()), \
-                            patch('probe_ytmusic_batch.decode_musicdb') as decode:
+                            patch('probe_ytmusic_batch.load_library') as decode:
                         with self.assertRaises(SystemExit) as stopped:
                             main()
                         self.assertEqual(stopped.exception.code, 2)
@@ -120,6 +120,30 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(len(chosen), 2)
         self.assertEqual(len({t['artist'] for t in chosen}), 2)
         self.assertEqual(len({t['album'] for t in chosen}), 2)
+
+    def test_snapshot_plan_with_map_never_authenticates(self):
+        from music_identity_map import build_map
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tracks = [{'persistent_id': '0000000000000001', 'title': 'Song', 'artist': 'Artist',
+                       'album': 'Album', 'duration_ms': 100000}]
+            snapshot = root / 'tracks.json'
+            snapshot.write_text(json.dumps({'source_sha256': 'a' * 64, 'tracks': tracks}))
+            aliases = root / 'map.json'
+            aliases.write_text(json.dumps(build_map(tracks, 'a' * 64)))
+            output = root / 'plan'
+            argv = ['probe', '--track-snapshot', str(snapshot), '--identity-map', str(aliases),
+                    '--output', str(output), '--auth', str(root / 'nonexistent-auth'), '--plan-only']
+            with patch.object(sys, 'argv', argv), patch('sys.stdout', new=io.StringIO()), \
+                    patch('probe_ytmusic_batch.verify_account', side_effect=AssertionError('No authentication')), \
+                    patch('probe_ytmusic_batch.create_paced_session', side_effect=AssertionError('No HTTP')):
+                self.assertEqual(main(), 0)
+            manifest = json.loads((output / 'seeds.json').read_text())
+            self.assertEqual(manifest['library_input']['kind'], 'track_snapshot')
+            self.assertIsNotNone(manifest['identity_map_sha256'])
+            report = json.loads(next(output.glob('summary-*.json')).read_text())
+            self.assertEqual(report['http_requests'], 0)
+            self.assertFalse(report['account_authentication_verified'])
 
 
 if __name__ == '__main__':

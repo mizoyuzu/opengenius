@@ -51,24 +51,28 @@ def local_candidates(track, local_tracks):
                  or abs(t["duration_ms"] / 1000 - duration) <= 3)]
 
 
-def observe(rows, relation, timestamp, local_tracks, seed_video_id, section=None):
+def observe(rows, relation, timestamp, local_tracks, seed_video_id, section=None, candidate_matcher=None):
     observations = []
     for position, row in enumerate(rows, 1):
         if not isinstance(row, dict) or not row.get("videoId"):
             continue
+        details = candidate_matcher(row) if candidate_matcher else []
         observations.append({
             "source": "ytmusic", "relation": relation, "section": section,
             "position": position, "observed_at": timestamp,
             "is_seed": row["videoId"] == seed_video_id,
             "track": clean_track(row),
-            "local_metadata_candidates": local_candidates(row, local_tracks),
-            "matching_method": "exact_title_artist_and_duration_within_3s_if_available",
+            "local_metadata_candidates": [candidate['persistent_id'] for candidate in details]
+                                         if candidate_matcher else local_candidates(row, local_tracks),
+            "candidate_details": details,
+            "matching_method": "explicit_metadata_map_title_artist_duration" if candidate_matcher
+                               else "exact_title_artist_and_duration_within_3s_if_available",
             "identity_status": "unverified", "genius_rank": None,
         })
     return observations
 
 
-def collect(client, local_seed, local_tracks, video_id, limit):
+def collect(client, local_seed, local_tracks, video_id, limit, candidate_matcher=None):
     snapshot = {
         "schema_version": 1, "source_version": version("ytmusicapi"),
         "session_id": str(uuid4()),
@@ -82,7 +86,8 @@ def collect(client, local_seed, local_tracks, video_id, limit):
     snapshot["requests"].append({"endpoint": "watch_radio", "observed_at": radio_time,
                                  "returned_track_count": len(radio.get("tracks") or [])})
     snapshot["observations"].extend(observe(
-        radio.get("tracks") or [], "radio", radio_time, local_tracks, video_id))
+        radio.get("tracks") or [], "radio", radio_time, local_tracks, video_id,
+        candidate_matcher=candidate_matcher))
     # Related is obtained from a separate seed watch response; it need not exist.
     watch_time = datetime.now(timezone.utc).isoformat()
     watch = client.get_watch_playlist(videoId=video_id, radio=False, limit=limit)
@@ -99,7 +104,7 @@ def collect(client, local_seed, local_tracks, video_id, limit):
             if isinstance(rows, list):
                 snapshot["observations"].extend(observe(
                     rows, "related", related_time, local_tracks, video_id,
-                    section=section.get("title")))
+                    section=section.get("title"), candidate_matcher=candidate_matcher))
     return snapshot
 
 

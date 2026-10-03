@@ -58,6 +58,27 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(len(result["observations"]), 1)
         self.assertFalse(result["account_authentication_verified"])
 
+    def test_collect_applies_explicit_map_to_radio_and_related_without_confirming(self):
+        from music_identity_map import IdentityMap, build_map
+        tracks = [{'persistent_id': 'A', 'title': 'Song', 'artist': 'A & B', 'duration_ms': 100000}]
+        document = build_map(tracks, 'hash')
+        document['artist_credit_sets'] = [{'enabled': True, 'labels': ['A & B'], 'components': ['A', 'B']}]
+        matcher = IdentityMap(document, tracks, 'hash')
+        remote = {'videoId': 'example1234', 'title': 'Song',
+                  'artists': [{'name': 'A'}, {'name': 'B'}], 'length': '1:40'}
+        class Client:
+            def get_watch_playlist(self, **kwargs):
+                return {'tracks': [remote], 'related': 'browse-id'}
+            def get_song_related(self, browse_id):
+                return [{'title': 'Related', 'contents': [remote]}]
+        result = collect(Client(), tracks[0], tracks, 'other123456', 25, candidate_matcher=matcher.match)
+        self.assertEqual({o['relation'] for o in result['observations']}, {'radio', 'related'})
+        for row in result['observations']:
+            self.assertEqual(row['local_metadata_candidates'], ['A'])
+            self.assertEqual(row['candidate_details'][0]['artist_match'], 'explicit_credit_set')
+            self.assertEqual(row['identity_status'], 'unverified')
+            self.assertIsNone(row['genius_rank'])
+
 
 if __name__ == "__main__":
     unittest.main()

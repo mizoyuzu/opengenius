@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 import time
 
-from inspect_music_library import decode_musicdb, parse_tracks
+from music_identity_map import IdentityMap, load_library
 from probe_ytmusic import collect, local_candidates, normalize
 
 
@@ -145,7 +145,9 @@ def summary(snapshot):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('bundle', type=Path)
+    parser.add_argument('bundle', type=Path, nargs='?')
+    parser.add_argument('--track-snapshot', type=Path)
+    parser.add_argument('--identity-map', type=Path)
     parser.add_argument('--auth', type=Path, default=Path('../browser.json'))
     parser.add_argument('--output', type=Path, required=True, help='Experiment directory; reuse to resume cached requests')
     parser.add_argument('--plan-only', action='store_true', help='Select local seeds without network access')
@@ -155,7 +157,9 @@ def main():
     parser.add_argument('--request-budget', type=int, default=45)
     args = parser.parse_args()
     output = args.output.resolve()
-    if output.is_relative_to(args.bundle.resolve()) or output == args.auth.resolve():
+    if (args.bundle is None) == (args.track_snapshot is None):
+        parser.error('Specify either bundle or --track-snapshot')
+    if (args.bundle and output.is_relative_to(args.bundle.resolve())) or output == args.auth.resolve():
         parser.error('output must be outside the library and auth file')
     if (not 1 <= args.seeds <= 20 or not math.isfinite(args.interval)
             or args.interval < 2 or not 1 <= args.request_budget <= 100):
@@ -169,9 +173,15 @@ def main():
               'request_budget': args.request_budget, 'identity_status': 'unverified'}
     session = None
     try:
-        tracks, _ = parse_tracks(decode_musicdb((args.bundle / 'Library.musicdb').read_bytes()))
+        tracks, library_hash, provenance = load_library(args.bundle, args.track_snapshot)
+        matcher, map_hash = None, None
+        if args.identity_map:
+            map_bytes = args.identity_map.read_bytes()
+            matcher = IdentityMap(json.loads(map_bytes), tracks, library_hash)
+            map_hash = hashlib.sha256(map_bytes).hexdigest()
         seeds = select_seeds(tracks, args.seeds)
-        manifest = {'library_sha256': hashlib.sha256((args.bundle / 'Library.musicdb').read_bytes()).hexdigest(),
+        manifest = {'library_sha256': library_hash, 'library_input': provenance,
+                    'identity_map_sha256': map_hash,
                     'language': args.language, 'seeds': seeds, 'selection': 'distinct_exact_artist_and_album_labels'}
         manifest_path = output / 'seeds.json'
         if manifest_path.exists():
@@ -198,8 +208,10 @@ def main():
             else:
                 cached.evidence = []
                 found = cached.search(query=seed['title'] + ' ' + seed['artist'], filter='songs', limit=5)
+                def candidate_pids(remote):
+                    return [candidate['persistent_id'] for candidate in matcher.match(remote)] if matcher else local_candidates(remote, tracks)
                 candidates = [r for r in found if r.get('videoId') and
-                              seed['persistent_id'] in local_candidates(r, tracks)]
+                              seed['persistent_id'] in candidate_pids(r)]
                 ids = {r['videoId'] for r in candidates}
                 if len(ids) != 1:
                     report['results'].append({'persistent_id': seed['persistent_id'],
@@ -207,7 +219,11 @@ def main():
                     print(json.dumps({'seed': seed['persistent_id'], 'status': 'search_unresolved',
                                       'candidate_video_ids': len(ids)}), flush=True)
                     continue
-                snapshot = collect(cached, seed, tracks, next(iter(ids)), 25)
+                snapshot = collect(cached, seed, tracks, next(iter(ids)), 25,
+                                   candidate_matcher=matcher.match if matcher else None)
+                snapshot['library_sha256'] = library_hash
+                snapshot['library_input'] = provenance
+                snapshot['identity_map_sha256'] = map_hash
                 snapshot['request_evidence'] = cached.evidence.copy()
                 # Preserve the original observation times when responses came from cache.
                 for evidence in cached.evidence:
