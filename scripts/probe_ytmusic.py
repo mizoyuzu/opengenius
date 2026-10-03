@@ -92,11 +92,21 @@ def collect(client, local_seed, local_tracks, video_id, limit, candidate_matcher
     watch_time = datetime.now(timezone.utc).isoformat()
     watch = client.get_watch_playlist(videoId=video_id, radio=False, limit=limit)
     related_id = watch.get("related")
+    snapshot["related_status"] = "unavailable"
     snapshot["requests"].append({"endpoint": "watch_seed", "observed_at": watch_time,
                                  "related_available": bool(related_id)})
     if related_id:
         related_time = datetime.now(timezone.utc).isoformat()
-        sections = client.get_song_related(related_id)
+        try:
+            sections = client.get_song_related(related_id)
+        except (KeyError, IndexError, TypeError) as error:
+            # Related is optional. Preserve successfully observed radio rows,
+            # but never swallow HTTP/auth/rate-limit/timeout failures.
+            snapshot['related_status'] = 'parser_error'
+            snapshot['requests'].append({'endpoint': 'song_related', 'observed_at': related_time,
+                                         'status': 'parser_error', 'error_type': type(error).__name__})
+            return snapshot
+        snapshot['related_status'] = 'collected'
         snapshot["requests"].append({"endpoint": "song_related", "observed_at": related_time,
                                      "returned_section_count": len(sections)})
         for section in sections:

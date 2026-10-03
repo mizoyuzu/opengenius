@@ -58,6 +58,25 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(len(result["observations"]), 1)
         self.assertFalse(result["account_authentication_verified"])
 
+    def test_optional_related_parser_error_retains_radio_but_http_errors_stop(self):
+        import requests
+        row = self.row
+        class Client:
+            failure = KeyError('private exception content')
+            def get_watch_playlist(self, **kwargs):
+                return {'tracks': [row], 'related': 'browse-id'}
+            def get_song_related(self, browse_id):
+                raise self.failure
+        client = Client()
+        result = collect(client, self.local[0], self.local, 'example1234', 25)
+        self.assertEqual(result['related_status'], 'parser_error')
+        self.assertEqual(len(result['observations']), 1)
+        self.assertEqual(result['observations'][0]['relation'], 'radio')
+        self.assertNotIn('private exception content', str(result))
+        client.failure = requests.HTTPError('private HTTP content')
+        with self.assertRaises(requests.HTTPError):
+            collect(client, self.local[0], self.local, 'example1234', 25)
+
     def test_collect_applies_explicit_map_to_radio_and_related_without_confirming(self):
         from music_identity_map import IdentityMap, build_map
         tracks = [{'persistent_id': 'A', 'title': 'Song', 'artist': 'A & B', 'duration_ms': 100000}]
