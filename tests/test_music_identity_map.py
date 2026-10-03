@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from music_identity_map import IdentityMap, apply_title_review, build_map, load_library, main, version_signature
+from music_identity_map import IdentityMap, apply_title_review, build_map, load_library, main, version_signature, group_candidate_observations
 
 
 class IdentityMapTests(unittest.TestCase):
@@ -163,6 +163,62 @@ class IdentityMapTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'different map revision'):
                     main()
             self.assertFalse(output.exists())
+
+    def test_explicit_credits_require_every_component_without_splitting_slashes(self):
+        tracks = [{'persistent_id': 'C', 'title': 'Song', 'artist': 'Rita & VISUAL ARTS / Key', 'duration_ms': 100000},
+                  {'persistent_id': 'D', 'title': 'Song', 'artist': 'Unlisted / Pair', 'duration_ms': 100000}]
+        document = build_map(tracks, 'hash')
+        document['artist_credit_sets'] = [{'enabled': True, 'labels': ['Rita & VISUAL ARTS / Key'],
+                                           'components': ['Rita', 'VISUAL ARTS / Key']}]
+        matcher = IdentityMap(document, tracks, 'hash')
+        remote = {'title': 'Song', 'artists': [{'name': 'VISUAL ARTS / Key'}, {'name': 'Rita'}], 'duration_seconds': 100}
+        matched = matcher.match(remote)
+        self.assertEqual([row['persistent_id'] for row in matched], ['C'])
+        self.assertEqual(matched[0]['artist_match'], 'explicit_credit_set')
+        for artists in ([{'name': 'Rita'}], [{'name': 'Rita'}, {'name': 'VISUAL ARTS / Key'}, {'name': 'Other'}],
+                        [{'name': 'Unlisted'}, {'name': 'Pair'}]):
+            self.assertEqual(matcher.match({**remote, 'artists': artists}), [])
+
+    def test_credit_declarations_reject_conflicts_and_cycles(self):
+        for declarations in (
+            [{'enabled': True, 'labels': ['A & B'], 'components': ['A', 'B']},
+             {'enabled': True, 'labels': ['A & B'], 'components': ['A', 'C']}],
+            [{'enabled': True, 'labels': ['A'], 'components': ['A', 'B']}],
+        ):
+            document = copy.deepcopy(self.document)
+            document['artist_credit_sets'] = declarations
+            with self.assertRaises(ValueError):
+                IdentityMap(document, self.tracks, 'library-hash')
+
+    def test_grouping_preserves_all_observations_and_album_conflicts(self):
+        def row(pid, album_match):
+            return {'source': 'ytmusic', 'video_id': 'example1234', 'is_seed': False,
+                    'exact_candidates': [pid], 'alias_candidates': [
+                        {'persistent_id': pid, 'album_match': album_match}],
+                    'proposed_alias_candidates': [{'persistent_id': 'P', 'album_match': True}]}
+        conflicted, = group_candidate_observations([row('A', True), row('B', True)])
+        self.assertEqual(conflicted['candidate_pids'], ['A', 'B'])
+        self.assertEqual(conflicted['observation_indices'], [0, 1])
+        self.assertEqual(conflicted['metadata_status'], 'conflicting_album_evidence')
+        self.assertIsNone(conflicted['preferred_metadata_pid'])
+        preferred, = group_candidate_observations([row('A', False), row('B', True)])
+        self.assertEqual(preferred['preferred_metadata_pid'], 'B')
+        self.assertEqual(preferred['candidate_pids'], ['A', 'B'])
+        self.assertEqual(preferred['identity_status'], 'unverified')
+        missing = row('A', False)
+        missing['alias_candidates'] = []
+        unresolved, = group_candidate_observations([missing])
+        self.assertEqual(unresolved['metadata_status'], 'needs_duration_or_credit_evidence')
+        self.assertIsNone(unresolved['preferred_metadata_pid'])
+
+    def test_declared_remote_joint_credit_does_not_match_solo_recording(self):
+        tracks = [{'persistent_id': 'J', 'title': 'Song', 'artist': 'A、B', 'duration_ms': 100000},
+                  {'persistent_id': 'S', 'title': 'Song', 'artist': 'A', 'duration_ms': 100000}]
+        document = build_map(tracks, 'hash')
+        document['artist_credit_sets'] = [{'enabled': True, 'labels': ['A、B'], 'components': ['A', 'B']}]
+        matcher = IdentityMap(document, tracks, 'hash')
+        remote = {'title': 'Song', 'artists': [{'name': 'A、B'}], 'duration_seconds': 100}
+        self.assertEqual([row['persistent_id'] for row in matcher.match(remote)], ['J'])
 
 
 if __name__ == '__main__':

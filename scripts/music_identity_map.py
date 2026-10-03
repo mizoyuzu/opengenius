@@ -154,6 +154,24 @@ class IdentityMap:
                 if name in self.artist_names and self.artist_names[name] != index:
                     raise ValueError('Overlapping artist alias groups')
                 self.artist_names[name] = index
+        self.credit_sets = {}
+        for declaration in document.get('artist_credit_sets', []):
+            if not declaration.get('enabled'):
+                continue
+            labels, components = declaration['labels'], declaration['components']
+            if not isinstance(labels, list) or not isinstance(components, list) or not labels or len(components) < 2 or any(
+                    not isinstance(name, str) or not normalize(name) for name in labels + components):
+                raise ValueError('Invalid artist credit declaration')
+            credits = frozenset(self.artist_key(name) for name in components)
+            if len(credits) != len(components):
+                raise ValueError('Repeated canonical artist in credit declaration')
+            for label in labels:
+                key = self.artist_key(label)
+                if key in self.credit_sets and self.credit_sets[key] != credits:
+                    raise ValueError('Conflicting artist credit declarations')
+                self.credit_sets[key] = credits
+        if any(component in self.credit_sets for credits in self.credit_sets.values() for component in credits):
+            raise ValueError('Nested or cyclic artist credit declarations are unsupported')
         self.titles = {}
         self.proposed_titles = {}
         for row in document.get('track_title_aliases', []):
@@ -180,9 +198,16 @@ class IdentityMap:
             return ('alias_group', self.artist_names[normalized])
         return ('literal', normalized)
 
+    def artist_credits(self, name):
+        key = self.artist_key(name)
+        return self.credit_sets.get(key, frozenset({key}))
+
     def match(self, remote, include_proposed=False):
         title = normalize(remote.get('title') or '')
-        artists = {self.artist_key(a.get('name') or '') for a in (remote.get('artists') or []) if a.get('name')}
+        artists = {credit for artist in (remote.get('artists') or []) if artist.get('name')
+                   for credit in self.artist_credits(artist['name'])}
+        remote_declared_credits = any(self.artist_key(artist['name']) in self.credit_sets
+                                      for artist in (remote.get('artists') or []) if artist.get('name'))
         duration = remote.get('duration_seconds')
         if duration is None and isinstance(remote.get('length'), str):
             parts = remote['length'].split(':')
@@ -213,7 +238,14 @@ class IdentityMap:
                     continue
             if not exact_title and version_signature(local.get('title') or '') != version_signature(remote.get('title') or ''):
                 continue
-            if self.artist_key(local.get('artist') or '') not in artists:
+            local_artist = local.get('artist') or ''
+            local_key = self.artist_key(local_artist)
+            credit_match = local_key in self.credit_sets or remote_declared_credits
+            if credit_match:
+                artist_matches = self.artist_credits(local_artist) == artists
+            else:
+                artist_matches = local_key in artists
+            if not artist_matches:
                 continue
             if duration is None or local.get('duration_ms') is None:
                 continue  # Alias-assisted matching requires duration evidence.
@@ -227,11 +259,59 @@ class IdentityMap:
                                'local_metadata': {key: local.get(key) for key in ('title', 'artist', 'album', 'duration_ms')},
                                'title_match': 'exact' if exact_title else ('proposed_alias' if pending_title else 'explicit_alias'),
                                'alias_review_status': 'needs_review' if pending_title else 'active_metadata_candidate',
-                               'artist_match': 'exact' if exact_artist else 'explicit_alias',
+                               'artist_match': 'explicit_credit_set' if credit_match else ('exact' if exact_artist else 'explicit_alias'),
                                'duration_difference_seconds': round(delta, 3),
                                'album_match': (normalize(remote_album) == normalize(local.get('album') or '')) if remote_album else None,
                                'identity_status': 'unverified'})
         return candidates
+
+
+def group_candidate_observations(observations):
+    """Preserve all observations; a metadata preference never confirms a recording."""
+    grouped = {}
+    for index, row in enumerate(observations):
+        if row['is_seed']:
+            continue
+        key = (row['source'], row['video_id'])
+        group = grouped.setdefault(key, {
+            'source': key[0], 'video_id': key[1], 'observation_indices': [],
+            'all_candidates': set(), 'duration_supported': set(), 'album_supported': set(),
+        })
+        group['observation_indices'].append(index)
+        group['all_candidates'].update(row['exact_candidates'])
+        for candidate in row['alias_candidates']:
+            pid = candidate['persistent_id']
+            group['all_candidates'].add(pid)
+            group['duration_supported'].add(pid)
+            if candidate['album_match'] is True:
+                group['album_supported'].add(pid)
+    result = []
+    for group in grouped.values():
+        duration_supported = group.pop('duration_supported')
+        album_supported = group.pop('album_supported')
+        candidates = group.pop('all_candidates')
+        preferred = None
+        if len(album_supported) > 1:
+            status = 'conflicting_album_evidence'
+        elif len(album_supported) == 1:
+            status = 'unique_album_metadata_preference'
+            preferred = next(iter(album_supported))
+        elif len(duration_supported) == 1:
+            status = 'single_duration_supported_candidate'
+            preferred = next(iter(duration_supported))
+        elif duration_supported:
+            status = 'ambiguous_metadata_candidates'
+        elif candidates:
+            status = 'needs_duration_or_credit_evidence'
+        else:
+            status = 'unmatched'
+        group.update(candidate_pids=sorted(candidates),
+                     duration_supported_pids=sorted(duration_supported),
+                     album_supported_pids=sorted(album_supported),
+                     metadata_status=status, preferred_metadata_pid=preferred,
+                     identity_status='unverified')
+        result.append(group)
+    return result
 
 
 def main():
@@ -283,6 +363,8 @@ def main():
                 rows.append({'source': observation['source'], 'relation': observation['relation'],
                              'video_id': remote['video_id'], 'is_seed': observation['is_seed'],
                              'remote_track': remote,
+                             'search_query': observation.get('search_query'),
+                             'request_file_sha256': observation.get('request_file_sha256'),
                              'section': observation.get('section'),
                              'position': observation['position'], 'observed_at': observation['observed_at'],
                              'exact_candidates': local_candidates(remote, tracks),
@@ -294,6 +376,8 @@ def main():
                       'identity_map_sha256': hashlib.sha256(args.identity_map.read_bytes()).hexdigest(),
                       'observation_file_sha256': hashlib.sha256(args.observations.read_bytes()).hexdigest(),
                       'source_session_id': snapshot.get('session_id'), 'observations': rows}
+            report['input_origin'] = snapshot.get('origin', 'ytmusic_observations')
+            report['candidate_groups'] = group_candidate_observations(rows)
             nonseed = [row for row in rows if not row['is_seed']]
             summary = {'nonseed_exact_video_ids': len({r['video_id'] for r in nonseed if r['exact_candidates']}),
                        'nonseed_alias_video_ids': len({r['video_id'] for r in nonseed if r['alias_candidates']}),
@@ -302,6 +386,11 @@ def main():
                        'pending_review_video_ids': len({r['video_id'] for r in nonseed if r['proposed_alias_candidates']}),
                        'new_pending_review_video_ids': len({r['video_id'] for r in nonseed if r['proposed_alias_candidates']} - {r['video_id'] for r in nonseed if r['exact_candidates'] or r['alias_candidates']}),
                        'verified_recordings': 0}
+            summary['metadata_preferences'] = sum(group['preferred_metadata_pid'] is not None
+                                                  for group in report['candidate_groups'])
+            summary['metadata_status_counts'] = {
+                status: sum(group['metadata_status'] == status for group in report['candidate_groups'])
+                for status in sorted({group['metadata_status'] for group in report['candidate_groups']})}
     report['library_input'] = provenance
     if not args.create and not args.review_decisions:
         report['summary'] = summary
