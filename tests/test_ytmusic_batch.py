@@ -1,3 +1,5 @@
+import copy
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -8,7 +10,7 @@ from unittest.mock import patch
 import requests
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from probe_ytmusic_batch import (AuthenticationUnconfirmed, CachedClient,
-                                 create_paced_session, main, select_observed_seeds, select_seeds, verify_account)
+                                 create_paced_session, main, resolve_seed_search, select_observed_seeds, select_planned_seeds, select_seeds, verify_account)
 
 
 class OfflineAdapter(requests.adapters.BaseAdapter):
@@ -33,6 +35,66 @@ class OfflineAdapter(requests.adapters.BaseAdapter):
 
 
 class BatchTests(unittest.TestCase):
+    def test_explicit_seed_plan_preserves_order_metadata_and_original_tracks(self):
+        tracks = [{'persistent_id': f'{index:016X}', 'title': f'Original {index}', 'artist': 'Artist',
+                   'album': 'Album', 'duration_ms': 100000, 'nested': {'value': index}} for index in (1, 2)]
+        before = copy.deepcopy(tracks)
+        plan = {'schema_version': 1, 'source_library_sha256': 'a' * 64, 'seeds': [
+            {'persistent_id': tracks[index]['persistent_id'], 'series': 'Series', 'sample_kind': 'album_track'}
+            for index in (1, 0)]}
+        chosen = select_planned_seeds(plan, tracks, 'a' * 64, 2)
+        self.assertEqual([row['title'] for row in chosen], ['Original 2', 'Original 1'])
+        self.assertEqual(chosen[0]['seed_series'], 'Series')
+        self.assertEqual(chosen[0]['seed_sample_kind'], 'album_track')
+        chosen[0]['nested']['value'] = 999
+        self.assertEqual(tracks, before)
+        invalid = []
+        foreign = copy.deepcopy(plan); foreign['source_library_sha256'] = 'b' * 64; invalid.append(foreign)
+        duplicate = copy.deepcopy(plan); duplicate['seeds'][1]['persistent_id'] = tracks[1]['persistent_id']; invalid.append(duplicate)
+        unknown = copy.deepcopy(plan); unknown['seeds'][0]['persistent_id'] = 'F' * 16; invalid.append(unknown)
+        override = copy.deepcopy(plan); override['seeds'][0]['title'] = 'Injected title'; invalid.append(override)
+        lower = copy.deepcopy(plan); lower['seeds'][0]['persistent_id'] = 'abcdef0123456789'; invalid.append(lower)
+        empty_label = copy.deepcopy(plan); empty_label['seeds'][0]['series'] = ' '; invalid.append(empty_label)
+        invalid_kind = copy.deepcopy(plan); invalid_kind['seeds'][0]['sample_kind'] = None; invalid.append(invalid_kind)
+        invalid.extend([{**plan, 'seeds': []}, {**plan, 'seeds': {}}, {**plan, 'schema_version': True}])
+        for index, document in enumerate(invalid):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                select_planned_seeds(document, tracks, 'a' * 64, 2)
+        with self.assertRaisesRegex(ValueError, 'exactly --seeds'):
+            select_planned_seeds(plan, tracks, 'a' * 64, 1)
+
+    def test_explicit_seed_plan_cli_is_network_free_and_records_input_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            track = {'persistent_id': '0000000000000001', 'title': 'Original song', 'artist': 'Artist',
+                     'album': 'Album', 'duration_ms': 100000}
+            snapshot = root / 'tracks.json'
+            snapshot.write_text(json.dumps({'source_sha256': 'a' * 64, 'tracks': [track]}))
+            plan = root / 'plan.json'
+            plan.write_text(json.dumps({'schema_version': 1, 'source_library_sha256': 'a' * 64, 'seeds': [
+                {'persistent_id': track['persistent_id'], 'series': 'Series', 'sample_kind': 'album_track'}]}))
+            output = root / 'experiment'
+            argv = ['probe', '--track-snapshot', str(snapshot), '--seed-plan', str(plan), '--seeds', '1',
+                    '--output', str(output), '--auth', str(root / 'absent-auth'), '--plan-only']
+            with patch.object(sys, 'argv', argv), patch('sys.stdout', new=io.StringIO()), \
+                    patch('probe_ytmusic_batch.verify_account', side_effect=AssertionError('No auth')), \
+                    patch('probe_ytmusic_batch.create_paced_session', side_effect=AssertionError('No HTTP')):
+                self.assertEqual(main(), 0)
+            manifest = json.loads((output / 'seeds.json').read_text())
+            self.assertEqual(manifest['seed_plan_sha256'], hashlib.sha256(plan.read_bytes()).hexdigest())
+            self.assertEqual(manifest['selection'], 'explicit_diverse_library_seed_plan')
+            self.assertEqual(manifest['seeds'][0]['title'], track['title'])
+            self.assertEqual(manifest['seeds'][0]['seed_series'], 'Series')
+            summary = json.loads(next(output.glob('summary-*.json')).read_text())
+            self.assertEqual(summary['http_requests'], 0)
+            self.assertFalse(summary['account_authentication_verified'])
+            with patch.object(sys, 'argv', [*argv, '--seed-observations', str(root / 'absent-observations')]), \
+                    patch('sys.stderr', new=io.StringIO()), patch('probe_ytmusic_batch.load_library') as library:
+                with self.assertRaises(SystemExit) as rejected:
+                    main()
+                self.assertEqual(rejected.exception.code, 2)
+                library.assert_not_called()
+
     def test_redirects_stop_without_an_unpaced_followup_send(self):
         for status in (300, 301, 302, 303, 304, 307, 308):
             with self.subTest(status=status):
@@ -76,6 +138,19 @@ class BatchTests(unittest.TestCase):
                         self.assertEqual(stopped.exception.code, 2)
                         decode.assert_not_called()
                     self.assertFalse((root / 'output').exists())
+
+    def test_localized_filtered_search_stops_before_auth_or_library_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv = ['probe', '--track-snapshot', str(root / 'missing.json'),
+                    '--output', str(root / 'output'), '--language', 'ja']
+            with patch.object(sys, 'argv', argv), patch('sys.stderr', new=io.StringIO()), \
+                    patch('probe_ytmusic_batch.load_library') as load:
+                with self.assertRaises(SystemExit) as stopped:
+                    main()
+                self.assertEqual(stopped.exception.code, 2)
+                load.assert_not_called()
+            self.assertFalse((root / 'output').exists())
 
     def test_missing_account_stops_instead_of_claiming_authenticated(self):
         class Client:
@@ -144,6 +219,22 @@ class BatchTests(unittest.TestCase):
         snapshot['observations'][0]['relation'] = 'radio'
         with self.assertRaisesRegex(ValueError, 'search candidates'):
             select_observed_seeds(snapshot, matcher, 3)
+
+    def test_seed_album_preference_preserves_ambiguity_without_unique_album(self):
+        from music_identity_map import IdentityMap, build_map
+        seed = dict(persistent_id='ROOT', title='Song', artist='Artist', album='Deluxe', duration_ms=100000)
+        matcher = IdentityMap(build_map([seed], 'hash'), [seed], 'hash')
+        def row(video, album, duration=100):
+            return {'videoId': video, 'title': 'Song', 'artists': [{'name': 'Artist'}],
+                    'album': {'name': album}, 'duration_seconds': duration}
+        found = [row('original001', 'Original'), row('deluxe00001', 'Deluxe')]
+        chosen, count, status = resolve_seed_search(found, seed, [seed], matcher)
+        self.assertEqual((chosen, count, status), ('deluxe00001', 2, 'unique_album_metadata_preference_unverified'))
+        found.append(row('deluxe00002', 'Deluxe'))
+        self.assertEqual(resolve_seed_search(found, seed, [seed], matcher)[0], None)
+        found[1]['duration_seconds'] = 120
+        found[2]['duration_seconds'] = 120
+        self.assertEqual(resolve_seed_search(found, seed, [seed], matcher)[0], 'original001')
 
     def test_snapshot_plan_with_map_never_authenticates(self):
         from music_identity_map import build_map

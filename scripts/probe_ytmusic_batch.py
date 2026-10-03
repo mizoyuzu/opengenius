@@ -4,6 +4,7 @@ All recording identities remain unverified. No Apple databases are written.
 """
 import argparse
 from collections import Counter
+import copy
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -11,6 +12,7 @@ import math
 import re
 from pathlib import Path
 import time
+import traceback
 
 from music_identity_map import IdentityMap, group_candidate_observations, load_library
 from probe_ytmusic import collect, local_candidates, normalize
@@ -56,6 +58,33 @@ def select_seeds(tracks, count):
     return selected
 
 
+def select_planned_seeds(plan, tracks, library_hash, count):
+    """Select exact current Library records; plans contain labels, never metadata."""
+    if (not isinstance(plan, dict) or type(plan.get('schema_version')) is not int
+            or plan['schema_version'] != 1 or plan.get('source_library_sha256') != library_hash):
+        raise ValueError('Seed plan schema or source Library hash differs')
+    rows = plan.get('seeds')
+    if not isinstance(rows, list) or not rows or len(rows) != count:
+        raise ValueError('Seed plan must contain exactly --seeds records')
+    by_pid = {track['persistent_id']: track for track in tracks}
+    if len(by_pid) != len(tracks):
+        raise ValueError('Duplicate Library persistent IDs')
+    chosen, seen = [], set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {'persistent_id', 'series', 'sample_kind'}:
+            raise ValueError('Seed plan records permit only persistent_id, series and sample_kind')
+        pid = row['persistent_id']
+        if not isinstance(pid, str) or not re.fullmatch('[0-9A-F]{16}', pid) or pid in seen or pid not in by_pid:
+            raise ValueError('Invalid, duplicate or unknown seed plan persistent ID')
+        if any(not isinstance(row[field], str) or not row[field].strip() for field in ('series', 'sample_kind')):
+            raise ValueError('Seed plan series and sample_kind must be nonempty strings')
+        seen.add(pid)
+        track = copy.deepcopy(by_pid[pid])
+        track.update(seed_series=row['series'], seed_sample_kind=row['sample_kind'])
+        chosen.append(track)
+    return chosen
+
+
 def select_observed_seeds(snapshot, matcher, count):
     """Reuse uniquely associated search video IDs; never turn search into edges."""
     rows = []
@@ -97,6 +126,25 @@ def select_observed_seeds(snapshot, matcher, count):
             if len(selected) == count:
                 break
     return selected
+
+
+def resolve_seed_search(found, seed, tracks, matcher):
+    candidates = []
+    for row in found:
+        if not row.get('videoId'):
+            continue
+        pids = [candidate['persistent_id'] for candidate in matcher.match(row)] if matcher else local_candidates(row, tracks)
+        if seed['persistent_id'] in pids:
+            candidates.append(row)
+    ids = {row['videoId'] for row in candidates}
+    if len(ids) == 1:
+        return next(iter(ids)), len(ids), 'unique_metadata_candidate_unverified'
+    album = normalize(seed.get('album') or '')
+    album_ids = {row['videoId'] for row in candidates
+                 if album and normalize((row.get('album') or {}).get('name') or '') == album}
+    if len(album_ids) == 1:
+        return next(iter(album_ids)), len(ids), 'unique_album_metadata_preference_unverified'
+    return None, len(ids), 'unresolved'
 
 
 class AuthenticationUnconfirmed(Exception):
@@ -184,6 +232,7 @@ def summary(snapshot):
         'candidate_local_ids': sorted({p for o in matched for p in o['local_metadata_candidates']}),
         'ambiguous_observations': sum(len(o['local_metadata_candidates']) > 1 for o in matched),
         'verified_recordings': 0,
+        'related_status': snapshot.get('related_status', 'not_recorded'),
     }
 
 
@@ -192,7 +241,9 @@ def main():
     parser.add_argument('bundle', type=Path, nargs='?')
     parser.add_argument('--track-snapshot', type=Path)
     parser.add_argument('--identity-map', type=Path)
-    parser.add_argument('--seed-observations', type=Path, help='Saved search observations; re-match seeds without new searches')
+    seed_source = parser.add_mutually_exclusive_group()
+    seed_source.add_argument('--seed-observations', type=Path, help='Saved search observations; re-match seeds without new searches')
+    seed_source.add_argument('--seed-plan', type=Path, help='Explicit Library PID plan; must contain exactly --seeds records')
     parser.add_argument('--auth', type=Path, default=Path('../browser.json'))
     parser.add_argument('--output', type=Path, required=True, help='Experiment directory; reuse to resume cached requests')
     parser.add_argument('--plan-only', action='store_true', help='Select local seeds without network access')
@@ -209,6 +260,8 @@ def main():
     if (not 1 <= args.seeds <= 20 or not math.isfinite(args.interval)
             or args.interval < 2 or not 1 <= args.request_budget <= 100):
         parser.error('seeds: 1..20; interval: finite and >=2; request-budget: 1..100')
+    if args.language != 'en' and not args.plan_only and not args.seed_observations:
+        parser.error('Filtered songs search requires --language en with the current YTMusic adapter; localized shelf headings may be discarded')
     output.mkdir(parents=True, exist_ok=True)
     cache = output / 'requests'
     cache.mkdir(exist_ok=True)
@@ -224,8 +277,13 @@ def main():
             map_bytes = args.identity_map.read_bytes()
             matcher = IdentityMap(json.loads(map_bytes), tracks, library_hash)
             map_hash = hashlib.sha256(map_bytes).hexdigest()
-        seed_evidence_hash = None
-        if args.seed_observations:
+        seed_evidence_hash, seed_plan_hash = None, None
+        if args.seed_plan:
+            plan_bytes = args.seed_plan.read_bytes()
+            seeds = select_planned_seeds(json.loads(plan_bytes), tracks, library_hash, args.seeds)
+            seed_plan_hash = hashlib.sha256(plan_bytes).hexdigest()
+            selection = 'explicit_diverse_library_seed_plan'
+        elif args.seed_observations:
             if matcher is None:
                 raise ValueError('Seed observations require an identity map')
             seed_bytes = args.seed_observations.read_bytes()
@@ -234,15 +292,19 @@ def main():
                 raise ValueError('Seed observations belong to another Library')
             seeds = select_observed_seeds(seed_document, matcher, args.seeds)
             seed_evidence_hash = hashlib.sha256(seed_bytes).hexdigest()
+            selection = 'unique_search_video_round_robin_canonical_credits'
         else:
             seeds = select_seeds(tracks, args.seeds)
+            selection = 'distinct_exact_artist_and_album_labels'
         if not seeds:
             raise ValueError('No usable seeds')
         manifest = {'library_sha256': library_hash, 'library_input': provenance,
                     'identity_map_sha256': map_hash,
                     'language': args.language, 'seeds': seeds,
                     'seed_evidence_sha256': seed_evidence_hash,
-                    'selection': 'unique_search_video_round_robin_canonical_credits' if args.seed_observations else 'distinct_exact_artist_and_album_labels'}
+                    'selection': selection}
+        if args.seed_plan:
+            manifest['seed_plan_sha256'] = seed_plan_hash
         manifest_path = output / 'seeds.json'
         if manifest_path.exists():
             if json.loads(manifest_path.read_text()) != manifest:
@@ -269,19 +331,17 @@ def main():
                 cached.evidence = []
                 if seed.get('seed_video_id'):
                     ids = {seed['seed_video_id']}
+                    candidate_count, seed_status = 1, 'unique_metadata_candidate_unverified'
                 else:
                     found = cached.search(query=seed['title'] + ' ' + seed['artist'], filter='songs', limit=5)
-                    def candidate_pids(remote):
-                        return [candidate['persistent_id'] for candidate in matcher.match(remote)] if matcher else local_candidates(remote, tracks)
-                    candidates = [r for r in found if r.get('videoId') and
-                                  seed['persistent_id'] in candidate_pids(r)]
-                    ids = {r['videoId'] for r in candidates}
-                    if len(ids) != 1:
+                    selected_video, candidate_count, seed_status = resolve_seed_search(found, seed, tracks, matcher)
+                    if selected_video is None:
                         report['results'].append({'persistent_id': seed['persistent_id'],
-                                                  'status': 'search_unresolved', 'candidate_video_ids': len(ids)})
+                                                  'status': 'search_unresolved', 'candidate_video_ids': candidate_count})
                         print(json.dumps({'seed': seed['persistent_id'], 'status': 'search_unresolved',
-                                          'candidate_video_ids': len(ids)}), flush=True)
+                                          'candidate_video_ids': candidate_count}), flush=True)
                         continue
+                    ids = {selected_video}
                 snapshot = collect(cached, seed, tracks, next(iter(ids)), 25,
                                    candidate_matcher=matcher.match if matcher else None)
                 snapshot['library_sha256'] = library_hash
@@ -305,7 +365,8 @@ def main():
                         for observation in snapshot['observations']:
                             if observation['relation'] == relation:
                                 observation['observed_at'] = evidence['observed_at']
-                snapshot['seed_identity_status'] = 'unique_metadata_candidate_unverified'
+                snapshot['seed_identity_status'] = seed_status
+                snapshot['seed_search_candidate_video_count'] = candidate_count
                 snapshot['account_authentication_verified'] = True
                 save(path, snapshot)
             row = {'status': 'collected', **summary(snapshot)}
@@ -316,6 +377,11 @@ def main():
     except Exception as error:
         report['status'] = 'stopped'
         report['error_type'] = type(error).__name__  # Never store exception text/headers.
+        frames = traceback.extract_tb(error.__traceback__)
+        if frames:
+            last = frames[-1]
+            report['error_location'] = {'file': Path(last.filename).name,
+                                        'function': last.name, 'line': last.lineno}
         status = getattr(getattr(error, 'response', None), 'status_code', None)
         if type(status) is int and 100 <= status <= 599:
             report['http_error_status'] = status
