@@ -8,7 +8,7 @@ from unittest.mock import patch
 import requests
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from probe_ytmusic_batch import (AuthenticationUnconfirmed, CachedClient,
-                                 create_paced_session, main, select_seeds, verify_account)
+                                 create_paced_session, main, select_observed_seeds, select_seeds, verify_account)
 
 
 class OfflineAdapter(requests.adapters.BaseAdapter):
@@ -120,6 +120,30 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(len(chosen), 2)
         self.assertEqual(len({t['artist'] for t in chosen}), 2)
         self.assertEqual(len({t['album'] for t in chosen}), 2)
+
+    def test_saved_search_seeds_deduplicate_videos_and_spread_canonical_credits(self):
+        from music_identity_map import IdentityMap, build_map
+        tracks = [dict(persistent_id=str(i), title=title, artist=artist, album='Album', duration_ms=100000)
+                  for i, (title, artist) in enumerate([('First', 'A'), ('Second', 'A'), ('Third', 'B')])]
+        matcher = IdentityMap(build_map(tracks, 'hash'), tracks, 'hash')
+        def row(index, video):
+            track = tracks[index]
+            return {'source': 'ytmusic', 'relation': 'search_candidate', 'track': {
+                'video_id': video, 'title': track['title'], 'artists': [{'name': track['artist']}],
+                'album': {'name': 'Album'}, 'duration_seconds': 100}}
+        snapshot = {'observations': [row(0, 'abcdefghij0'), row(0, 'abcdefghij0'),
+                                     row(1, 'abcdefghij1'), row(2, 'abcdefghij2')]}
+        seeds = select_observed_seeds(snapshot, matcher, 3)
+        self.assertEqual([seed['artist'] for seed in seeds], ['A', 'B', 'A'])
+        self.assertEqual(len({seed['seed_video_id'] for seed in seeds}), 3)
+        snapshot['observations'].append(row(0, 'abcdefghij3'))
+        self.assertNotIn('0', [seed['persistent_id'] for seed in select_observed_seeds(snapshot, matcher, 3)])
+        duplicated = [*tracks, dict(tracks[2], persistent_id='duplicate', album='Other album')]
+        ambiguous_matcher = IdentityMap(build_map(duplicated, 'hash'), duplicated, 'hash')
+        self.assertNotIn('2', [seed['persistent_id'] for seed in select_observed_seeds(snapshot, ambiguous_matcher, 3)])
+        snapshot['observations'][0]['relation'] = 'radio'
+        with self.assertRaisesRegex(ValueError, 'search candidates'):
+            select_observed_seeds(snapshot, matcher, 3)
 
     def test_snapshot_plan_with_map_never_authenticates(self):
         from music_identity_map import build_map

@@ -8,10 +8,11 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 import time
 
-from music_identity_map import IdentityMap, load_library
+from music_identity_map import IdentityMap, group_candidate_observations, load_library
 from probe_ytmusic import collect, local_candidates, normalize
 
 
@@ -52,6 +53,49 @@ def select_seeds(tracks, count):
         albums.add(album)
         if len(selected) == count:
             break
+    return selected
+
+
+def select_observed_seeds(snapshot, matcher, count):
+    """Reuse uniquely associated search video IDs; never turn search into edges."""
+    rows = []
+    for observation in snapshot['observations']:
+        if observation.get('source') != 'ytmusic' or observation.get('relation') != 'search_candidate':
+            raise ValueError('Seed evidence must contain only YTMusic search candidates')
+        track = observation['track']
+        video = track.get('video_id')
+        if not isinstance(video, str) or not re.fullmatch(r'[A-Za-z0-9_-]{11}', video):
+            raise ValueError('Invalid seed video ID')
+        rows.append({'source': 'ytmusic', 'video_id': video, 'is_seed': False,
+                     'exact_candidates': [], 'alias_candidates': matcher.match(track)})
+    videos_by_pid = {}
+    for group in group_candidate_observations(rows):
+        pid = group['preferred_metadata_pid']
+        if pid is not None and group['duration_supported_pids'] == [pid]:
+            videos_by_pid.setdefault(pid, []).append(group['video_id'])
+    tracks = {track['persistent_id']: track for track in matcher.tracks}
+    buckets = {}
+    for pid, videos in videos_by_pid.items():
+        if len(videos) != 1:
+            continue
+        track = tracks[pid]
+        # Avoid fragments, long loops and instrumental versions in this seed sample.
+        if not 30000 <= (track.get('duration_ms') or 0) <= 900000:
+            continue
+        if any(word in normalize(track['title']) for word in ('off vocal', 'instrumental', 'カラオケ')):
+            continue
+        credits = tuple(sorted(matcher.artist_credits(track['artist'])))
+        buckets.setdefault(credits, []).append({**track, 'seed_video_id': videos[0],
+                                                'seed_identity_status': 'unique_metadata_candidate_unverified'})
+    selected = []
+    # Round-robin across canonical credits, then add further songs per credit.
+    while buckets and len(selected) < count:
+        for credits in sorted(list(buckets)):
+            selected.append(buckets[credits].pop(0))
+            if not buckets[credits]:
+                del buckets[credits]
+            if len(selected) == count:
+                break
     return selected
 
 
@@ -148,6 +192,7 @@ def main():
     parser.add_argument('bundle', type=Path, nargs='?')
     parser.add_argument('--track-snapshot', type=Path)
     parser.add_argument('--identity-map', type=Path)
+    parser.add_argument('--seed-observations', type=Path, help='Saved search observations; re-match seeds without new searches')
     parser.add_argument('--auth', type=Path, default=Path('../browser.json'))
     parser.add_argument('--output', type=Path, required=True, help='Experiment directory; reuse to resume cached requests')
     parser.add_argument('--plan-only', action='store_true', help='Select local seeds without network access')
@@ -179,10 +224,25 @@ def main():
             map_bytes = args.identity_map.read_bytes()
             matcher = IdentityMap(json.loads(map_bytes), tracks, library_hash)
             map_hash = hashlib.sha256(map_bytes).hexdigest()
-        seeds = select_seeds(tracks, args.seeds)
+        seed_evidence_hash = None
+        if args.seed_observations:
+            if matcher is None:
+                raise ValueError('Seed observations require an identity map')
+            seed_bytes = args.seed_observations.read_bytes()
+            seed_document = json.loads(seed_bytes)
+            if seed_document.get('library_sha256') not in (None, library_hash):
+                raise ValueError('Seed observations belong to another Library')
+            seeds = select_observed_seeds(seed_document, matcher, args.seeds)
+            seed_evidence_hash = hashlib.sha256(seed_bytes).hexdigest()
+        else:
+            seeds = select_seeds(tracks, args.seeds)
+        if not seeds:
+            raise ValueError('No usable seeds')
         manifest = {'library_sha256': library_hash, 'library_input': provenance,
                     'identity_map_sha256': map_hash,
-                    'language': args.language, 'seeds': seeds, 'selection': 'distinct_exact_artist_and_album_labels'}
+                    'language': args.language, 'seeds': seeds,
+                    'seed_evidence_sha256': seed_evidence_hash,
+                    'selection': 'unique_search_video_round_robin_canonical_credits' if args.seed_observations else 'distinct_exact_artist_and_album_labels'}
         manifest_path = output / 'seeds.json'
         if manifest_path.exists():
             if json.loads(manifest_path.read_text()) != manifest:
@@ -207,18 +267,21 @@ def main():
                 snapshot = json.loads(path.read_text())
             else:
                 cached.evidence = []
-                found = cached.search(query=seed['title'] + ' ' + seed['artist'], filter='songs', limit=5)
-                def candidate_pids(remote):
-                    return [candidate['persistent_id'] for candidate in matcher.match(remote)] if matcher else local_candidates(remote, tracks)
-                candidates = [r for r in found if r.get('videoId') and
-                              seed['persistent_id'] in candidate_pids(r)]
-                ids = {r['videoId'] for r in candidates}
-                if len(ids) != 1:
-                    report['results'].append({'persistent_id': seed['persistent_id'],
-                                              'status': 'search_unresolved', 'candidate_video_ids': len(ids)})
-                    print(json.dumps({'seed': seed['persistent_id'], 'status': 'search_unresolved',
-                                      'candidate_video_ids': len(ids)}), flush=True)
-                    continue
+                if seed.get('seed_video_id'):
+                    ids = {seed['seed_video_id']}
+                else:
+                    found = cached.search(query=seed['title'] + ' ' + seed['artist'], filter='songs', limit=5)
+                    def candidate_pids(remote):
+                        return [candidate['persistent_id'] for candidate in matcher.match(remote)] if matcher else local_candidates(remote, tracks)
+                    candidates = [r for r in found if r.get('videoId') and
+                                  seed['persistent_id'] in candidate_pids(r)]
+                    ids = {r['videoId'] for r in candidates}
+                    if len(ids) != 1:
+                        report['results'].append({'persistent_id': seed['persistent_id'],
+                                                  'status': 'search_unresolved', 'candidate_video_ids': len(ids)})
+                        print(json.dumps({'seed': seed['persistent_id'], 'status': 'search_unresolved',
+                                          'candidate_video_ids': len(ids)}), flush=True)
+                        continue
                 snapshot = collect(cached, seed, tracks, next(iter(ids)), 25,
                                    candidate_matcher=matcher.match if matcher else None)
                 snapshot['library_sha256'] = library_hash
