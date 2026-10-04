@@ -21,16 +21,31 @@ from probe_macos_real_library import (MAX_OUTPUT, PID, parse_playback, parse_sel
 
 
 def real_import_script(media_paths):
-    lines = ['with timeout of 180 seconds', 'set outputText to ""', 'tell application "Music"']
+    lines = [
+        'on currentLibraryPIDs()',
+        'tell application "Music"',
+        'set resultPIDs to {}',
+        'set trackCount to count of tracks of library playlist 1',
+        'if trackCount is 0 then return resultPIDs',
+        'repeat with i from 1 to trackCount',
+        'set end of resultPIDs to (persistent ID of track i of library playlist 1 as text)',
+        'end repeat', 'return resultPIDs', 'end tell', 'end currentLibraryPIDs',
+        'with timeout of 180 seconds', 'set outputText to ""', 'tell application "Music"',
+    ]
     for pid, path in media_paths.items():
         if not isinstance(pid, str) or not PID.fullmatch(pid):
             raise ValueError('invalid original PID')
-        lines += ['try', f'set addedResult to add {{(POSIX file {apple_string(path)})}}',
-                  'if class of addedResult is list then',
-                  'if (count of addedResult) is not 1 then error "Unexpected import result count"',
-                  'set t to item 1 of addedResult', 'else', 'set t to addedResult', 'end if',
-                  f'set outputText to outputText & "IMPORTED" & tab & "{pid}" & tab & (persistent ID of t) & tab & (duration of t as text) & tab & (name of t) & tab & (POSIX path of location of t) & linefeed',
-                  'on error', f'set outputText to outputText & "IMPORT_FAILED" & tab & "{pid}" & linefeed', 'end try']
+        lines += ['try', 'set beforePIDs to my currentLibraryPIDs()',
+                  f'add {{(POSIX file {apple_string(path)})}}',
+                  'set afterPIDs to my currentLibraryPIDs()', 'set newPIDs to {}',
+                  'repeat with candidatePID in afterPIDs',
+                  'if beforePIDs does not contain (candidatePID as text) then set end of newPIDs to (candidatePID as text)',
+                  'end repeat', 'if (count of newPIDs) is not 1 then error "Unexpected native PID difference" number -2700',
+                  'set nativePID to item 1 of newPIDs',
+                  'set t to item 1 of (every track of library playlist 1 whose persistent ID is nativePID)',
+                  f'set outputText to outputText & "IMPORTED" & tab & "{pid}" & tab & nativePID & tab & (duration of t as text) & tab & (name of t) & tab & (POSIX path of location of t) & linefeed',
+                  'on error errorText number errorNumber',
+                  f'set outputText to outputText & "IMPORT_FAILED" & tab & "{pid}" & tab & (errorNumber as text) & linefeed', 'end try']
     return '\n'.join(lines + ['set nativeCount to count of tracks of library playlist 1', 'end tell',
                                'return "IMPORT_LIBRARY_COUNT" & tab & nativeCount & linefeed & outputText', 'end timeout'])
 
@@ -47,11 +62,11 @@ def parse_import(stdout, manifest):
     seen, native_seen, records = set(), set(), []
     for line in lines[1:]:
         fields = line.split('\t')
-        if len(fields) not in (2, 6) or fields[1] not in originals or fields[1] in seen:
+        if len(fields) not in (2, 3, 6) or fields[1] not in originals or fields[1] in seen:
             raise ValueError('invalid or duplicate original import PID')
         seen.add(fields[1])
-        if len(fields) == 2 and fields[0] == 'IMPORT_FAILED':
-            records.append({'original_pid': fields[1], 'status': 'failed'})
+        if len(fields) in (2, 3) and fields[0] == 'IMPORT_FAILED':
+            records.append({'original_pid': fields[1], 'status': 'failed', 'native_error_number': int(fields[2]) if len(fields) == 3 else None})
             continue
         if len(fields) != 6 or fields[0] != 'IMPORTED' or not PID.fullmatch(fields[2]) or fields[2] in native_seen:
             raise ValueError('invalid or duplicate native import PID')
@@ -62,9 +77,9 @@ def parse_import(stdout, manifest):
         records.append({'original_pid': fields[1], 'persistent_id': fields[2], 'duration_seconds': duration,
                         'duration_ms': round(duration * 1000), 'relative_media_path': originals[fields[1]]['relative_media_path'],
                         'title': fields[4], 'native_location': fields[5], 'status': 'imported'})
-    if seen != set(originals) or count != len(native_seen):
+    if seen != set(originals) or count < len(native_seen):
         raise ValueError('native import rows and Library count inconsistent')
-    return {'native_library_count': count, 'tracks': records, 'all_selected_media_imported': len(native_seen) == len(originals)}
+    return {'native_library_count': count, 'tracks': records, 'all_selected_media_imported': len(native_seen) == len(originals) == count, 'native_tracks_without_mapping': count - len(native_seen)}
 
 
 def import_with_bootstrap(media_paths, runner, popen):

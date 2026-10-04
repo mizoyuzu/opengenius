@@ -42,18 +42,24 @@ class RealImportTests(unittest.TestCase):
         self.assertIn('a\\"b.m4a', script)
         self.assertNotIn('set name', script)
         self.assertNotIn('set location', script)
-        self.assertIn('persistent ID of t', script)
-        self.assertIn('set addedResult to add {(POSIX file', script)
-        self.assertIn('if class of addedResult is list then', script)
-        self.assertIn('set t to item 1 of addedResult', script)
-        self.assertIn('else\nset t to addedResult\nend if', script)
+        self.assertIn('persistent ID of track i', script)
+        self.assertIn('set beforePIDs to my currentLibraryPIDs()', script)
+        self.assertIn('set afterPIDs to my currentLibraryPIDs()', script)
+        self.assertIn('beforePIDs does not contain', script)
+        self.assertIn('if (count of newPIDs) is not 1', script)
+        self.assertIn('on error errorText number errorNumber', script)
+        self.assertNotIn('addedResult', script)
 
     def test_partial_import_is_reported_and_ambiguous_native_ids_rejected(self):
         partial = f'IMPORT_LIBRARY_COUNT\t1\nIMPORTED\t{P1}\t{N1}\t200\tEnglish metadata\t/tmp/native/one.m4a\nIMPORT_FAILED\t{P2}\n'
         parsed = parse_import(partial, MANIFEST)
         self.assertFalse(parsed['all_selected_media_imported'])
         self.assertEqual(parsed['tracks'][1]['status'], 'failed')
-        for bad in (NATIVE.replace(N2, N1), NATIVE.replace('\t200\t', '\tnan\t'), NATIVE.replace('IMPORT_LIBRARY_COUNT\t2', 'IMPORT_LIBRARY_COUNT\t47'), NATIVE.replace(P2, 'FFFFFFFFFFFFFFFF')):
+        diagnostics = parse_import(f'IMPORT_LIBRARY_COUNT\t2\nIMPORT_FAILED\t{P1}\t-1728\nIMPORT_FAILED\t{P2}\t-2700\n', MANIFEST)
+        self.assertEqual(diagnostics['native_tracks_without_mapping'], 2)
+        self.assertEqual(diagnostics['tracks'][0]['native_error_number'], -1728)
+        self.assertFalse(diagnostics['all_selected_media_imported'])
+        for bad in (NATIVE.replace(N2, N1), NATIVE.replace('\t200\t', '\tnan\t'), NATIVE.replace('IMPORT_LIBRARY_COUNT\t2', 'IMPORT_LIBRARY_COUNT\t1'), NATIVE.replace(P2, 'FFFFFFFFFFFFFFFF')):
             with self.assertRaises(ValueError):
                 parse_import(bad, MANIFEST)
 
