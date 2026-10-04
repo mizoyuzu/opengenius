@@ -16,11 +16,16 @@ from genius_format import parse_id
 from inspect_music_library import decode_musicdb, parse_tracks, u32
 
 
-def encode_library(expanded, template):
+def encode_library(expanded, template, *, allow_unverified_profile=False):
     if (len(template) < 160 or template[:4] != b'hfma' or u32(template, 4) != 160
             or u32(template, 8) != len(template) or u32(template, 128) not in (0, len(template))
             or u32(template, 84) != 102400):
         raise ValueError('Unsupported Library hfma header profile')
+    # This legacy profile round-trips locally but its rewritten copy was
+    # reset by native Music 1.6.6. Use a copy saved by Music before editing.
+    legacy = u32(template, 12) == 0x320009 and template[16:48].split(b'\0', 1)[0] == b'1.5.6.11'
+    if legacy and not allow_unverified_profile:
+        raise ValueError('Legacy 1.5.6.11 rewrite is unverified: open and save a copy in Music first')
     parse_tracks(expanded)
     compressed = zlib.compress(expanded, 1)
     length = 160 + len(compressed)

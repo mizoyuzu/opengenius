@@ -61,6 +61,22 @@ class MusicIDWriterTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from('<I', output, 8)[0], len(output))
         self.assertEqual(decode_musicdb(output), changed)
 
+    def test_legacy_rewrite_requires_native_migration_or_explicit_codec_only_mode(self):
+        expanded, encoded = library_fixture()
+        legacy = bytearray(encoded)
+        struct.pack_into('<I', legacy, 12, 0x320009)
+        legacy[16:48] = b'1.5.6.11' + bytes(24)
+        changed, _ = patch_ids(expanded, [self.assignment()])
+        with self.assertRaisesRegex(ValueError, 'save a copy in Music'):
+            encode_library(changed, bytes(legacy))
+        # A codec-only diagnostic can still reproduce the legacy encoding;
+        # this opt-in does not assert Music accepts it.
+        self.assertEqual(decode_musicdb(encode_library(changed, bytes(legacy), allow_unverified_profile=True)), changed)
+        migrated = bytearray(legacy)
+        struct.pack_into('<I', migrated, 12, 0x1f000c)
+        migrated[16:48] = b'1.6.6.4' + bytes(25)
+        self.assertEqual(decode_musicdb(encode_library(changed, bytes(migrated))), changed)
+
     def test_rejects_existing_missing_duplicate_and_unrepresentable_ids(self):
         expanded, encoded = library_fixture()
         for assignments in [[self.assignment(34, 51)], [self.assignment(99, 51)],

@@ -1,0 +1,55 @@
+name: macOS private real-library probe
+on:
+  workflow_dispatch:
+    inputs:
+      collector:
+        description: Native experiment stage
+        type: choice
+        default: library
+        options:
+          - library
+          - import
+      bundle_overlay:
+        description: Bundle comparison or native rebase
+        type: choice
+        default: none
+        options:
+          - none
+          - original
+          - rebased
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Install authenticated transport dependency
+        run: |
+          python3 -m venv .probe-venv
+          .probe-venv/bin/python -m pip install --quiet cryptography==43.0.0
+      - name: Assemble encrypted input
+        run: cat fixtures/macos/private-real-input.enc.part-* > fixtures/macos/private-real-input.enc
+      - name: Run private native Music experiment
+        env:
+          MACOS_PROBE_KEY: ${{ secrets.MACOS_PROBE_KEY }}
+          PROBE_COLLECTOR: ${{ inputs.collector }}
+          BUNDLE_OVERLAY: ${{ inputs.bundle_overlay }}
+        run: |
+          .probe-venv/bin/python - <<'PYTHON'
+          import os, subprocess, sys
+          command = [sys.executable, 'scripts/secure_macos_probe.py', 'run', 'fixtures/macos/private-real-input.enc', 'data/private-result.enc', '--collector', os.environ['PROBE_COLLECTOR']]
+          command.extend(['--bundle-overlay', os.environ['BUNDLE_OVERLAY']])
+          subprocess.run(command, check=True)
+          PYTHON
+      - name: Collect encrypted result only
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: private-native-${{ github.run_id }}
+          path: data/private-result.enc
+          retention-days: 3
+          if-no-files-found: error

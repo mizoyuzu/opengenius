@@ -443,3 +443,11 @@ Music.app全体での実曲Genius生成・iPod生成は未確認。
 
 [コマンドと実曲の結果](docs/research/2026-10-04-real-library-experiment.md)、
 [iPodへ渡す経路と読み取り監査器](docs/research/2026-10-04-ipod-genius-path.md)。
+
+
+実曲のネイティブMusic検証も実施した。macOS 26.6.2 / Music 1.6.6で、
+Musicが保存した形式を使うと2,974曲・214件のGenius ID・関連性723本が読み込まれ、
+終了後も保持された。HDDの実音源47曲を接続し、3曲の再生位置の進行を確認した。
+未サインイン環境ではGenius Playlistメニューが無効で、生成成功は未確認。
+旧1.5.6.11形式は直接書き直さず、Musicで開いて保存したコピーを土台にする。
+[`prepare_macos_real_rebase.py`による全Library／取り込み後PIDへの適用と実行結果](docs/research/2026-10-04-native-real-library.md)。
