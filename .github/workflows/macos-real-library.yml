@@ -12,13 +12,15 @@ jobs:
         with:
           persist-credentials: false
       - name: Install authenticated transport dependency
-        run: python3 -m pip install --quiet cryptography==43.0.0 --break-system-packages
+        run: |
+          python3 -m venv .probe-venv
+          .probe-venv/bin/python -m pip install --quiet cryptography==43.0.0
       - name: Assemble encrypted input
         run: cat fixtures/macos/private-real-input.enc.part-* > fixtures/macos/private-real-input.enc
       - name: Run private native Music experiment
         env:
           MACOS_PROBE_KEY: ${{ secrets.MACOS_PROBE_KEY }}
-        run: python3 scripts/secure_macos_probe.py run fixtures/macos/private-real-input.enc data/private-result.enc
+        run: .probe-venv/bin/python scripts/secure_macos_probe.py run fixtures/macos/private-real-input.enc data/private-result.enc
       - name: Collect encrypted result only
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
