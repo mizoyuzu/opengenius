@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Restore a bounded synthetic Music fixture on a fresh Actions macOS runner.
 
-Only queries library metadata and Genius menu availability. No account login,
+Queries library metadata and Genius menu availability; optionally invokes only
+an enabled Genius Playlist action for a known synthetic track. No account login,
 Genius enable action, audio import, key output, or probe network request.
 """
 import argparse
@@ -152,6 +153,102 @@ end tell
 end timeout'''
 
 
+def generate_script(seed_pid):
+    if not isinstance(seed_pid, str) or not PID.fullmatch(seed_pid):
+        raise ValueError('invalid synthetic seed PID')
+    return f'''with timeout of 15 seconds
+tell application "Music"
+set seedTracks to every track of library playlist 1 whose persistent ID is "{seed_pid}"
+if (count of seedTracks) is not 1 then return "SEED_MISSING"
+activate
+reveal item 1 of seedTracks
+end tell
+delay 1
+tell application "System Events"
+tell process "Music"
+try
+set geniusItem to menu item "Genius Playlist" of menu 1 of menu item "New" of menu 1 of menu bar item "File" of menu bar 1
+if not (enabled of geniusItem) then return "DISABLED"
+click geniusItem
+return "CLICKED"
+on error
+return "UNAVAILABLE"
+end try
+end tell
+end tell
+end timeout'''
+
+
+def genius_playlists_script():
+    return '''with timeout of 15 seconds
+set outputText to ""
+tell application "Music"
+set geniusLists to every user playlist whose genius is true
+if (count of geniusLists) > 4 then error "Unexpected synthetic playlist count"
+set outputText to "PLAYLIST_COUNT" & tab & (count of geniusLists) & linefeed
+repeat with i from 1 to count of geniusLists
+set p to item i of geniusLists
+if (count of tracks of p) > 2 then error "Unexpected synthetic playlist size"
+set outputText to outputText & "PLAYLIST" & tab & i & tab & (count of tracks of p) & linefeed
+repeat with t in tracks of p
+set outputText to outputText & "TRACK" & tab & (persistent ID of t) & tab & (name of t) & tab & (duration of t as text) & linefeed
+end repeat
+end repeat
+end tell
+return outputText
+end timeout'''
+
+
+def parse_genius_playlists(stdout, expected_tracks):
+    lines = stdout.strip().splitlines()
+    if not lines or len(lines[0].split('\t')) != 2 or lines[0].split('\t')[0] != 'PLAYLIST_COUNT':
+        raise ValueError('invalid native playlist count')
+    count = int(lines[0].split('\t')[1])
+    if not 0 <= count <= 4:
+        raise ValueError('native playlist count exceeds fixture limit')
+    cursor = 1
+    playlists = []
+    expected = {(t['persistent_id'], t['title']) for t in expected_tracks}
+    for index in range(1, count + 1):
+        if cursor >= len(lines):
+            raise ValueError('missing native playlist')
+        fields = lines[cursor].split('\t')
+        if len(fields) != 3 or fields[:2] != ['PLAYLIST', str(index)]:
+            raise ValueError('invalid native playlist index')
+        size = int(fields[2])
+        if not 0 <= size <= 2:
+            raise ValueError('native playlist size exceeds fixture limit')
+        cursor += 1
+        tracks = parse_query('COUNT\t' + str(size) + '\n' + '\n'.join(lines[cursor:cursor + size]))
+        if any((t['persistent_id'], t['title']) not in expected or abs(t['duration'] - 3.0) > .05 for t in tracks):
+            raise ValueError('native playlist contains unexpected synthetic metadata')
+        playlists.append({'index': index, 'tracks': tracks})
+        cursor += size
+    if cursor != len(lines):
+        raise ValueError('unexpected trailing native playlist output')
+    return playlists
+
+
+def try_genius_playlist(expected_tracks, runner=subprocess.run):
+    seed = next(t for t in expected_tracks if t['title'] == 'synthetic-tone-1')
+    click = run_step(['osascript', '-e', generate_script(seed['persistent_id'])], 20, runner)
+    status = click.get('stdout', '').strip() if click['status'] == 'ok' else click['status']
+    if status not in ('CLICKED', 'DISABLED', 'SEED_MISSING', 'UNAVAILABLE', 'failed', 'timeout', 'unavailable'):
+        status = 'unexpected_menu_response'
+    result = {'status': status.lower(), 'menu_action': click, 'generation_attempted': status == 'CLICKED', 'generation_observed': False}
+    if status == 'CLICKED':
+        time.sleep(1)
+        query = run_step(['osascript', '-e', genius_playlists_script()], 20, runner)
+        result['playlist_query'] = query
+        if query['status'] == 'ok':
+            try:
+                result['playlists'] = parse_genius_playlists(query.get('stdout', ''), expected_tracks)
+                result['generation_observed'] = any(p['tracks'] for p in result['playlists'])
+            except ValueError as error:
+                result['parse_error'] = str(error)
+    return result
+
+
 def native_query(runner=subprocess.run, popen=subprocess.Popen):
     process = popen(['osascript', '-e', query_script()], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     started = time.monotonic()
@@ -172,7 +269,7 @@ def native_query(runner=subprocess.run, popen=subprocess.Popen):
     return result
 
 
-def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, home=None, explicit_library=False):
+def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, home=None, explicit_library=False, try_genius=False):
     if platform.system() != 'Darwin' or os.environ.get('GITHUB_ACTIONS') != 'true':
         raise ValueError('requires a disposable GitHub Actions macOS runner')
     fixture = Path(fixture).resolve()
@@ -191,7 +288,7 @@ def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, hom
         raise ValueError('output overlaps fixture or Music library')
     output.mkdir(parents=True, exist_ok=False)
     report = dict(schema_version=1, fixture_kind='synthetic-tone-only', fixture_sha256=hashlib.sha256(fixture.read_bytes()).hexdigest(),
-                  app_template_version=document['app_template_version'], explicit_library=explicit_library, platform=platform.platform(), architecture=platform.machine(),
+                  app_template_version=document['app_template_version'], explicit_library=explicit_library, try_genius_playlist_requested=try_genius, platform=platform.platform(), architecture=platform.machine(),
                   probe_network_requests=0, actual_genius_generation_tested=False, steps={}, files={}, expected_tracks=document['expected_tracks'])
     steps = report['steps']
     def step(name, command, timeout=20):
@@ -235,7 +332,18 @@ def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, hom
                 report['expected_tracks_loaded'] = False
         else:
             report['expected_tracks_loaded'] = False
+        # Welcome and automation prompts can consume the first UI pass; the
+        # promotion may appear only after that pass and the native query finish.
+        step('bootstrap_ui_after_query', ['osascript', '-e', bootstrap_script()], 30)
+        from probe_macos_music import dismiss_music_promotion
+        steps['dismiss_music_promotion'] = dismiss_music_promotion(output, runner)
         step('genius_menu_after', ['osascript', '-e', menu_script()], 15)
+        if try_genius:
+            if report.get('expected_tracks_loaded'):
+                report['genius_generation'] = try_genius_playlist(document['expected_tracks'], runner)
+                report['actual_genius_generation_tested'] = report['genius_generation']['generation_attempted']
+            else:
+                report['genius_generation'] = {'status': 'skipped_expected_tracks_not_loaded', 'generation_attempted': False, 'generation_observed': False}
         step('screenshot_after', ['screencapture', '-x', str(output / 'music-after.png')], 15)
     finally:
         if launched:
@@ -286,12 +394,13 @@ def main():
     parser.add_argument('--fixture', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--explicit-library', action='store_true')
+    parser.add_argument('--try-genius-playlist', action='store_true')
     args = parser.parse_args()
     try:
-        report = probe(args.fixture, args.output, explicit_library=args.explicit_library)
+        report = probe(args.fixture, args.output, explicit_library=args.explicit_library, try_genius=args.try_genius_playlist)
     except (ValueError, OSError) as error:
         parser.exit(1, f'{type(error).__name__}: {error}\n')
-    print(json.dumps({'expected_tracks_loaded': report.get('expected_tracks_loaded'), 'actual_genius_generation_tested': False}))
+    print(json.dumps({'expected_tracks_loaded': report.get('expected_tracks_loaded'), 'actual_genius_generation_tested': report['actual_genius_generation_tested']}))
 
 
 if __name__ == '__main__':

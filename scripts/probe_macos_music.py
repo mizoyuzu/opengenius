@@ -179,6 +179,77 @@ def bootstrap_music(paths, runner=subprocess.run, popen=subprocess.Popen):
     return results
 
 
+
+def dismiss_music_promotion(output, runner=subprocess.run):
+    """Click OCR-verified Not Now only on the known Music promotion screen."""
+    output = Path(output)
+    screenshot = output / 'promotion-ocr.png'
+    capture = run_step(['screencapture', '-x', str(screenshot)], 15, runner)
+    if capture.get('status') != 'ok':
+        return {'status': 'skipped', 'reason': 'screenshot_failed', 'capture': capture}
+    swift = output / 'recognize-promotion.swift'
+    swift.write_text(r'''import Foundation
+import Vision
+import ImageIO
+let url = URL(fileURLWithPath: CommandLine.arguments[1])
+guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+      let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { exit(2) }
+let request = VNRecognizeTextRequest()
+request.recognitionLevel = .accurate
+request.recognitionLanguages = ["en-US"]
+request.usesLanguageCorrection = false
+try VNImageRequestHandler(cgImage: image).perform([request])
+let rows = (request.results ?? []).compactMap { observation -> [String: Any]? in
+    guard let text = observation.topCandidates(1).first?.string else { return nil }
+    let box = observation.boundingBox
+    return ["text": text, "x": box.midX * Double(image.width),
+            "y": (1.0 - box.midY) * Double(image.height)]
+}
+let data = try JSONSerialization.data(withJSONObject: rows)
+print(String(data: data, encoding: .utf8)!)
+''')
+    recognition = run_step(['swift', str(swift), str(screenshot)], 45, runner)
+    if recognition.get('status') != 'ok':
+        return {'status': 'skipped', 'reason': 'ocr_failed', 'recognition': recognition}
+    try:
+        rows = json.loads(recognition.get('stdout', ''))
+        if not isinstance(rows, list) or len(rows) > 200:
+            raise ValueError('Invalid OCR shape')
+        titles = [r for r in rows if r.get('text') == 'Hear About New Music First']
+        buttons = [r for r in rows if r.get('text') == 'Not Now']
+        if len(titles) != 1 or len(buttons) != 1:
+            return {'status': 'skipped', 'reason': 'known_promotion_not_found'}
+        button = buttons[0]
+        x, y = float(button['x']), float(button['y'])
+        if not (0 < x < 4096 and 0 < y < 4096):
+            raise ValueError('Invalid OCR coordinates')
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return {'status': 'skipped', 'reason': 'invalid_ocr_result'}
+    activate = run_step(['osascript', '-e',
+        'with timeout of 10 seconds\ntell application "System Events" to set frontmost of process "Music" to true\nend timeout'], 15, runner)
+    if activate.get('status') != 'ok':
+        return {'status': 'skipped', 'reason': 'music_activation_failed', 'activate': activate}
+    # System Events click-at resolves AXStaticText here but does not press its
+    # enclosing web control. Post the real mouse down/up at the OCR target.
+    mouse = output / 'click-promotion.swift'
+    mouse.write_text(r'''import Foundation
+import CoreGraphics
+let x = Double(CommandLine.arguments[1])!
+let y = Double(CommandLine.arguments[2])!
+let point = CGPoint(x: x, y: y)
+guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
+                        mouseCursorPosition: point, mouseButton: .left),
+      let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp,
+                      mouseCursorPosition: point, mouseButton: .left) else { exit(2) }
+down.post(tap: .cghidEventTap)
+Thread.sleep(forTimeInterval: 0.1)
+up.post(tap: .cghidEventTap)
+''')
+    click = run_step(['swift', str(mouse), str(round(x)), str(round(y))], 45, runner)
+    return {'status': click['status'], 'action': 'posted_mouse_click_on_ocr_verified_music_not_now', 'click': click}
+
+
+
 def library_roots(music_directory):
     if not music_directory.exists():
         return []
@@ -251,6 +322,7 @@ def probe(output, *, runner=subprocess.run, popen=subprocess.Popen, home=None):
             # Ask Music to quit so copied DBs are more likely to be flushed.
             step('music_windows', ['osascript', '-e', 'with timeout of 10 seconds\ntell application "System Events"\nreturn {UI elements enabled, count of windows of process "Music"}\nend tell\nend timeout'], 15)
             step('screenshot', ['screencapture', '-x', str(output / 'music-screen.png')], 15)
+            steps['dismiss_music_promotion'] = dismiss_music_promotion(output, runner)
             step('quit_music', ['osascript', '-e', 'with timeout of 15 seconds\ntell application "Music" to quit\nend timeout'], 20)
             report['music_exited'] = False
             for attempt in range(40):
