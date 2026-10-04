@@ -7,9 +7,13 @@ Apple Music／iTunes側への読み込みも検証対象。
 
 現時点でLibrary.musicdbの読み取りと、提供されたMusic.appの特定ビルドを
 使ったGenius.itdbのオフライン復号に成功している。
-既存Genius IDの曲との対応付けと、既存の関係リストだけを変更した
-暗号化DBの生成にも対応している。Music.app／純正iPodによる受け入れ、
-新しい曲のGenius化、Apple形式のrank生成は未検証。
+既存Genius IDの曲との対応付けと、関係リストを変更した暗号化DBの生成に対応する。
+実ライブラリのコピーへ新規IDと関係を保存し、macOSのMusic.appで2,974曲・
+270件のID・825本の関係が終了後も保持されることを確認した。
+通常プレイリストの再起動後の曲順も確認済み。
+Music自身によるGeniusプレイリスト生成、純正iPodでの動作、
+Apple形式のrank生成は未検証。
+[実Musicでの検証結果と制約](docs/research/2026-10-04-native-real-library.md)を参照。
 
 ## Genius DBのオフライン復号
 
@@ -422,7 +426,10 @@ BGM向け比較条件は`--profile artist-album-minimum-one`で明示指定す�
 分類と推薦はローカル画面でも確認できる。
 `serve_music_review.py`で曲一覧を開き、アルバム一括タグ付けと曲ごとの種類訂正、
 新規設定ファイルへの保存、保存済み関係からの推薦再生成を行う。
-[起動方法・保存場所・検証範囲](docs/research/2026-10-03-music-review-ui.md)
+[起動方法・保存場所・検証範囲](docs/research/2026-10-03-music-review-ui.md)。
+`--observations-directory`は複数指定でき、`--extra-observation`で保存済み観測も追加できる。
+画面は保存済みの選曲条件を復元し、条件変更後は再生成が必要と表示する。
+[2,974曲・39起点でのブラウザ検証](docs/research/2026-10-05-review-ui-smoke.md)
 
 GitHub ActionsのmacOS 26でも、Music.appへの合成音源2曲の取り込みと
 Library/Genius DBの回収を確認した。GUI操作許可と初回画面はSystem Eventsで処理する。
