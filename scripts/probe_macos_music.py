@@ -36,6 +36,19 @@ def make_tone(path, frequency, seconds=3, sample_rate=22050):
         audio.writeframes(frames)
 
 
+def validate_track_count(track_count):
+    if type(track_count) is not int or not 2 <= track_count <= 128:
+        raise ValueError('track_count must be an integer from 2 to 128')
+    return track_count
+
+
+def tone_frequency(index):
+    """Stable frequencies, preserving the original two-tone fixture."""
+    if type(index) is not int or not 1 <= index <= 128:
+        raise ValueError('synthetic tone index must be an integer from 1 to 128')
+    return 440 if index == 1 else 660 + (index - 2) * 40
+
+
 def run_step(command, timeout=20, runner=subprocess.run):
     """Bound execution and output; command failures are probe evidence."""
     started = time.monotonic()
@@ -58,18 +71,18 @@ def apple_string(value):
 
 
 def import_script(paths):
-    lines = ['with timeout of 85 seconds', 'tell application "Music"']
-    for index, path in enumerate(paths, 1):
-        lines.extend([
-            f'set importedTracks to add (POSIX file {apple_string(path)})',
-            'repeat with importedTrack in importedTracks',
-            f'set name of importedTrack to "Synthetic Tone {index}"',
-            'set artist of importedTrack to "OpenGenius Probe"',
-            'set album of importedTrack to "Synthetic Probe"',
-            'end repeat',
-        ])
-    lines.extend(['return {"synthetic import complete", count of tracks of library playlist 1}', 'end tell', 'end timeout'])
-    return '\n'.join(lines)
+    paths = list(paths)
+    if not 1 <= len(paths) <= 128:
+        raise ValueError('synthetic import requires 1 to 128 paths')
+    audio_list = '{' + ', '.join(f'(POSIX file {apple_string(path)})' for path in paths) + '}'
+    return '\n'.join([
+        'with timeout of 150 seconds',
+        'tell application "Music"',
+        f'set importedTracks to add {audio_list}',
+        'return {"synthetic import complete", count of tracks of library playlist 1}',
+        'end tell',
+        'end timeout',
+    ])
 
 
 def bootstrap_script():
@@ -164,7 +177,7 @@ def bootstrap_music(paths, runner=subprocess.run, popen=subprocess.Popen):
     try:
         results['bootstrap_ui'] = run_step(['osascript', '-e', bootstrap_script()], 30, runner)
         try:
-            stdout, stderr = process.communicate(timeout=max(1, 90 - (time.monotonic() - started)))
+            stdout, stderr = process.communicate(timeout=max(1, 180 - (time.monotonic() - started)))
             results['import_synthetic_audio'] = {'status': 'ok' if process.returncode == 0 else 'failed',
                                               'returncode': process.returncode,
                                               'stdout': (stdout or '')[:12000], 'stderr': (stderr or '')[:12000]}
@@ -283,7 +296,8 @@ def collect_libraries(music_directory, output, preexisting):
     return records
 
 
-def probe(output, *, runner=subprocess.run, popen=subprocess.Popen, home=None):
+def probe(output, *, runner=subprocess.run, popen=subprocess.Popen, home=None, track_count=2):
+    validate_track_count(track_count)
     if platform.system() != 'Darwin':
         raise ValueError('this probe requires macOS')
     if os.environ.get('GITHUB_ACTIONS') != 'true':
@@ -292,7 +306,7 @@ def probe(output, *, runner=subprocess.run, popen=subprocess.Popen, home=None):
     output.mkdir(parents=True, exist_ok=False)
     music_directory = (Path(home) if home else Path.home()) / 'Music'
     preexisting = set(library_roots(music_directory))
-    report = {'schema_version': 1, 'synthetic_audio_only': True,
+    report = {'schema_version': 1, 'synthetic_audio_only': True, 'track_count': track_count,
               'probe_network_requests': 0, 'music_app_network_activity_observed': False,
               'platform': platform.platform(),
               'architecture': platform.machine(), 'steps': {}, 'libraries': []}
@@ -313,9 +327,9 @@ def probe(output, *, runner=subprocess.run, popen=subprocess.Popen, home=None):
         else:
             audio_directory = output / 'synthetic-media'
             audio_directory.mkdir()
-            tones = [audio_directory / f'synthetic-tone-{index}.wav' for index in (1, 2)]
-            for path, frequency in zip(tones, (440, 660)):
-                make_tone(path, frequency)
+            tones = [audio_directory / f'synthetic-tone-{index}.wav' for index in range(1, track_count + 1)]
+            for index, path in enumerate(tones, 1):
+                make_tone(path, tone_frequency(index))
             step('launch_music', ['open', '-a', str(app)])
             steps.update(bootstrap_music(tones, runner, popen))
             report['import_status'] = steps['import_synthetic_audio']['status']
@@ -344,9 +358,10 @@ def probe(output, *, runner=subprocess.run, popen=subprocess.Popen, home=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', required=True, type=Path, help='new output directory')
+    parser.add_argument('--track-count', type=int, default=2)
     args = parser.parse_args()
     try:
-        report = probe(args.output)
+        report = probe(args.output, track_count=args.track_count)
     except (ValueError, FileExistsError) as error:
         parser.error(str(error))
     print(json.dumps({'output': str(args.output), 'import_status': report['import_status'],

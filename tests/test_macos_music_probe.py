@@ -10,7 +10,7 @@ from unittest.mock import patch
 import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from probe_macos_music import bootstrap_music, bootstrap_script, collect_libraries, dismiss_music_promotion, import_script, make_tone, probe, run_step
+from probe_macos_music import bootstrap_music, bootstrap_script, collect_libraries, dismiss_music_promotion, import_script, make_tone, probe, run_step, tone_frequency, validate_track_count
 
 
 class FinishedProcess:
@@ -58,6 +58,35 @@ class MacOSProbeTests(unittest.TestCase):
             self.assertGreater(max(samples), 4000)
             self.assertLessEqual(max(map(abs, samples)), 4096)
 
+    def test_track_count_and_tone_indices_have_strict_boundaries(self):
+        for valid in (2, 128):
+            self.assertEqual(validate_track_count(valid), valid)
+        for invalid in (True, 1, 129, '2', 2.0):
+            with self.assertRaises(ValueError):
+                validate_track_count(invalid)
+        frequencies = [tone_frequency(i) for i in range(1, 129)]
+        self.assertEqual(frequencies[:2], [440, 660])
+        self.assertEqual(len(set(frequencies)), 128)
+        self.assertLess(max(frequencies), 22050 / 2)
+        for invalid in (True, 0, 129):
+            with self.assertRaises(ValueError):
+                tone_frequency(invalid)
+
+    def test_large_import_is_one_bounded_batch_with_filename_titles(self):
+        paths = [Path(f'/tmp/synthetic-tone-{i}.wav') for i in range(1, 129)]
+        script = import_script(paths)
+        self.assertEqual(script.count('set importedTracks to add'), 1)
+        self.assertEqual(script.count('(POSIX file'), 128)
+        self.assertIn('synthetic-tone-128.wav', script)
+        self.assertNotIn('repeat with importedTrack', script)
+        with self.assertRaises(ValueError):
+            import_script(paths + [Path('/tmp/extra.wav')])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            with self.assertRaises(ValueError):
+                probe(output, track_count=129)
+            self.assertFalse(output.exists())
+
     def test_timeout_is_evidence_and_does_not_retain_partial_output(self):
         def runner(command, **kwargs):
             self.assertEqual(kwargs['timeout'], 7)
@@ -69,8 +98,10 @@ class MacOSProbeTests(unittest.TestCase):
     def test_import_paths_are_applescript_escaped_and_metadata_synthetic(self):
         script = import_script([Path('/tmp/a"b\\c.wav')])
         self.assertIn('a\\"b\\\\c.wav', script)
-        self.assertIn('Synthetic Tone 1', script)
-        self.assertIn('with timeout of 85 seconds', script)
+        self.assertIn('set importedTracks to add {(POSIX file', script)
+        self.assertNotIn('set name', script)
+        self.assertNotIn('set artist', script)
+        self.assertIn('with timeout of 150 seconds', script)
         self.assertIn('count of tracks of library playlist 1', script)
 
     def test_only_new_library_databases_copied(self):
@@ -143,7 +174,7 @@ class MacOSProbeTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 1, '', 'UI permission unavailable')
                 if command[0] == 'osascript' and 'to quit' in command[-1]:
                     (home / 'Music/Music/Music Library.musiclibrary/Library.musicdb').write_bytes(b'flushed db')
-                self.assertLessEqual(kwargs['timeout'], 90)
+                self.assertLessEqual(kwargs['timeout'], 180)
                 return subprocess.CompletedProcess(command, 1 if command[0] == 'pgrep' else 0, '', '')
             def popen(command, **kwargs):
                 runner(command, timeout=90)
@@ -151,6 +182,7 @@ class MacOSProbeTests(unittest.TestCase):
             with patch('probe_macos_music.platform.system', return_value='Darwin'), patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}):
                 result = probe(home / 'output', runner=runner, popen=popen, home=home)
             self.assertEqual(result['import_status'], 'ok')
+            self.assertEqual(result['track_count'], 2)
             self.assertTrue(result['music_exited'])
             self.assertTrue(result['after_copy_consistent_exit'])
             self.assertEqual(result['probe_network_requests'], 0)
@@ -163,6 +195,22 @@ class MacOSProbeTests(unittest.TestCase):
             self.assertEqual(len(list((home / 'output/synthetic-media').glob('*.wav'))), 2)
             self.assertTrue(any(command[0] == 'screencapture' for command in commands))
             self.assertEqual(sum(command[0] == 'osascript' and 'importedTracks' in command[-1] for command in commands), 1)
+
+    def test_probe_generates_configured_128_tracks_with_shared_frequencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            triggered = []
+            def runner(command, **kwargs):
+                return subprocess.CompletedProcess(command, 1 if command[0] == 'pgrep' else 0, '', '')
+            def popen(command, **kwargs):
+                triggered.append(command[-1])
+                return FinishedProcess()
+            with patch('probe_macos_music.platform.system', return_value='Darwin'), patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch('probe_macos_music.make_tone') as make_audio, patch('probe_macos_music.dismiss_music_promotion', return_value={'status': 'not_needed'}):
+                result = probe(home / 'out', runner=runner, popen=popen, home=home, track_count=128)
+            self.assertEqual(result['track_count'], 128)
+            self.assertEqual(make_audio.call_count, 128)
+            self.assertEqual(make_audio.call_args_list[-1].args, (home / 'out/synthetic-media/synthetic-tone-128.wav', tone_frequency(128)))
+            self.assertEqual(triggered[0].count('(POSIX file'), 128)
 
     def test_bootstrap_permission_whitelist_and_bounded_loop(self):
         script = bootstrap_script()

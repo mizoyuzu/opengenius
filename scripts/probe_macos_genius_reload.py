@@ -23,9 +23,17 @@ import zlib
 from probe_macos_music import bootstrap_script, make_tone, run_step
 
 FILES = frozenset(('Library.musicdb', 'Genius.itdb', 'Library Preferences.musicdb'))
-MAX_FILE = 100 * 1024
-MAX_DOCUMENT = 420 * 1024
+MAX_TRACKS = 128
+MAX_FILE = 1024 * 1024
+MAX_DOCUMENT = 5 * 1024 * 1024
 PID = re.compile(r'[0-9A-F]{16}\Z')
+
+
+def valid_tone_title(title):
+    if not isinstance(title, str):
+        return False
+    match = re.fullmatch(r'synthetic-tone-([1-9][0-9]{0,2})', title)
+    return bool(match and int(match[1]) <= MAX_TRACKS)
 
 
 def validate_fixture(document):
@@ -59,8 +67,8 @@ def validate_fixture(document):
             raise ValueError('unsupported encrypted Genius page header')
         decoded[name] = data
     tracks = document['expected_tracks']
-    if not isinstance(tracks, list) or len(tracks) != 2:
-        raise ValueError('expected exactly two synthetic tracks')
+    if not isinstance(tracks, list) or not 2 <= len(tracks) <= MAX_TRACKS:
+        raise ValueError('expected 2..128 synthetic tracks')
     seen = set()
     for index, track in enumerate(tracks, 1):
         if not isinstance(track, dict) or set(track) != {'persistent_id', 'genius_id', 'title', 'duration_ms'}:
@@ -70,15 +78,30 @@ def validate_fixture(document):
             raise ValueError('invalid or duplicate persistent ID')
         if not isinstance(track['genius_id'], str) or not PID.fullmatch(track['genius_id']) or not 0 <= int(track['genius_id'], 16) <= 0xFFFFFFFF:
             raise ValueError('invalid Genius ID')
-        if track['title'] not in ('synthetic-tone-1', 'synthetic-tone-2') or type(track['duration_ms']) is not int or track['duration_ms'] != 3000:
+        if not valid_tone_title(track['title']) or type(track['duration_ms']) is not int or track['duration_ms'] != 3000:
             raise ValueError('only synthetic tone titles are allowed')
         seen.add(pid)
     gids = [int(t['genius_id'], 16) for t in tracks]
-    if gids != [0, 0] and (0 in gids or len(set(gids)) != 2):
+    if any(gids) and (0 in gids or len(set(gids)) != len(tracks)):
         raise ValueError('expected both zero or distinct nonzero Genius IDs')
-    if {t['title'] for t in tracks} != {'synthetic-tone-1', 'synthetic-tone-2'}:
-        raise ValueError('expected two distinct synthetic tone titles')
+    if {t['title'] for t in tracks} != {f'synthetic-tone-{i}' for i in range(1, len(tracks) + 1)}:
+        raise ValueError('expected distinct sequential synthetic tone titles')
     return decoded
+
+
+def decode_fixture_gzip(compressed, max_document=MAX_DOCUMENT):
+    if not isinstance(compressed, bytes) or len(compressed) > 4 * MAX_FILE:
+        raise ValueError('invalid fixture gzip size')
+    try:
+        inflater = zlib.decompressobj(31)
+        raw = inflater.decompress(compressed, max_document + 1)
+        if len(raw) > max_document or not inflater.eof or inflater.unused_data or inflater.unconsumed_tail:
+            raise ValueError('invalid or oversized fixture gzip stream')
+        document = json.loads(raw)
+    except (zlib.error, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError('invalid fixture gzip stream') from None
+    validate_fixture(document)
+    return document
 
 
 def decode_fixture_payload(payload):
@@ -87,15 +110,9 @@ def decode_fixture_payload(payload):
         raise ValueError('invalid fixture payload size')
     try:
         compressed = base64.b64decode(payload, validate=True)
-        inflater = zlib.decompressobj(31)
-        raw = inflater.decompress(compressed, 350001)
-        if len(raw) > 350000 or not inflater.eof or inflater.unused_data or inflater.unconsumed_tail:
-            raise ValueError('invalid or oversized fixture gzip stream')
-        document = json.loads(raw)
-    except (binascii.Error, zlib.error, UnicodeDecodeError, json.JSONDecodeError):
+        return decode_fixture_gzip(compressed, max_document=350000)
+    except (binascii.Error, ValueError):
         raise ValueError('invalid encoded fixture payload') from None
-    validate_fixture(document)
-    return document
 
 
 def query_script():
@@ -116,7 +133,7 @@ def parse_query(stdout):
     if not lines or len(lines[0].split('\t')) != 2 or lines[0].split('\t')[0] != 'COUNT':
         raise ValueError('invalid native query count')
     count = int(lines[0].split('\t')[1])
-    if not 0 <= count <= 2:
+    if not 0 <= count <= MAX_TRACKS:
         raise ValueError('native query exceeds synthetic fixture track count')
     tracks = []
     seen = set()
@@ -127,7 +144,7 @@ def parse_query(stdout):
         duration = float(fields[3])
         if not math.isfinite(duration) or not 0 <= duration <= 10:
             raise ValueError('invalid synthetic track duration')
-        if fields[2] not in ('synthetic-tone-1', 'synthetic-tone-2'):
+        if not valid_tone_title(fields[2]):
             raise ValueError('unexpected non-synthetic native track')
         tracks.append(dict(persistent_id=fields[1], title=fields[2], duration=duration))
         seen.add(fields[1])
@@ -188,7 +205,7 @@ if (count of geniusLists) > 4 then error "Unexpected synthetic playlist count"
 set outputText to "PLAYLIST_COUNT" & tab & (count of geniusLists) & linefeed
 repeat with i from 1 to count of geniusLists
 set p to item i of geniusLists
-if (count of tracks of p) > 2 then error "Unexpected synthetic playlist size"
+if (count of tracks of p) > 128 then error "Unexpected synthetic playlist size"
 set outputText to outputText & "PLAYLIST" & tab & i & tab & (count of tracks of p) & linefeed
 repeat with t in tracks of p
 set outputText to outputText & "TRACK" & tab & (persistent ID of t) & tab & (name of t) & tab & (duration of t as text) & linefeed
@@ -216,7 +233,7 @@ def parse_genius_playlists(stdout, expected_tracks):
         if len(fields) != 3 or fields[:2] != ['PLAYLIST', str(index)]:
             raise ValueError('invalid native playlist index')
         size = int(fields[2])
-        if not 0 <= size <= 2:
+        if not 0 <= size <= len(expected_tracks):
             raise ValueError('native playlist size exceeds fixture limit')
         cursor += 1
         tracks = parse_query('COUNT\t' + str(size) + '\n' + '\n'.join(lines[cursor:cursor + size]))
@@ -304,7 +321,9 @@ def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, hom
         # Original fixture import path used by the first Actions probe.
         audio = Path.cwd() / 'data/macos-probe/synthetic-media'
         audio.mkdir(parents=True, exist_ok=True)
-        for index, frequency in ((1, 440), (2, 660)):
+        from probe_macos_music import tone_frequency
+        for index in range(1, len(document['expected_tracks']) + 1):
+            frequency = tone_frequency(index)
             target = audio / f'synthetic-tone-{index}.wav'
             if target.exists() or target.is_symlink():
                 raise ValueError('refusing pre-existing synthetic audio path')

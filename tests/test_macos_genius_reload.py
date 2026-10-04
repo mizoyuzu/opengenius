@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from probe_macos_genius_reload import decode_fixture_payload, menu_script, parse_query, probe, query_script, validate_fixture, generate_script, genius_playlists_script, parse_genius_playlists, try_genius_playlist
+from probe_macos_genius_reload import decode_fixture_gzip, decode_fixture_payload, menu_script, parse_query, probe, query_script, validate_fixture, generate_script, genius_playlists_script, parse_genius_playlists, try_genius_playlist
 
 
 def fixture_document():
@@ -29,6 +29,19 @@ def fixture_document():
 
 
 class ReloadTests(unittest.TestCase):
+    def test_128_track_fixture_and_query_preserve_every_id(self):
+        document = fixture_document()
+        document['expected_tracks'] = [dict(persistent_id=f'{i:016X}', genius_id=f'{0x70000000+i:016X}', title=f'synthetic-tone-{i}', duration_ms=3000) for i in range(1,129)]
+        validate_fixture(document)
+        self.assertEqual(decode_fixture_gzip(gzip.compress(json.dumps(document).encode())), document)
+        native = 'COUNT\t128\n' + ''.join(f'TRACK\t{i:016X}\tsynthetic-tone-{i}\t3\n' for i in range(1,129))
+        self.assertEqual(len(parse_query(native)),128)
+        document['expected_tracks'][-1]['title'] = 'synthetic-tone-129'
+        with self.assertRaises(ValueError):
+            validate_fixture(document)
+        with self.assertRaises(ValueError):
+            decode_fixture_gzip(gzip.compress(b'x' * 1001), max_document=1000)
+
     def test_fixture_headers_and_sha_checked(self):
         document = fixture_document()
         self.assertEqual(set(validate_fixture(document)), set(document['files']))
