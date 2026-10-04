@@ -146,3 +146,31 @@ proof of a scheduler or of a running job.
   or unverified. The overnight goal is active; next useful work includes actual
   UI smoke testing with the expanded dataset and reviewing remaining identity
   ambiguities. Do not rerun completed batches/jobs merely from old checkpoints.
+
+## UI and matching evidence, 00:27 JST
+
+- Real offline browser smoke completed for 2,974 tracks and the expanded
+  39-root engine. Search, 30-page navigation, selection-only editing, save/reset,
+  standard versus minimum-one generation, prior-result comparison, conflicting
+  scope rejection and 390px layout verified. Browser session closed; isolated
+  HTTP server session `99369` terminated normally with exit 0.
+- Original classifier file SHA matches the earlier v03 build report exactly:
+  `de4011b2430475363d0743f9f4f6b201b00b58c2db10a3ede98f04a03a5b3e2a`.
+  Only the separate smoke output copies were saved.
+- UI now restores saved generation criteria and marks retained results stale
+  when criteria change. Success clears the cue; failure retains last valid
+  results. Actual browser and JavaScript syntax checks passed.
+- Offline matcher distinguishes complete/partial artist-credit evidence without
+  changing candidate selection. Sixteen matcher tests passed; seven HTTP review
+  tests passed with local socket permission. No credential exposure.
+- Actual 39-root v03 reconstruction after this matcher change has byte-identical
+  Library/preferences and identical Genius logical tables. Private evidence:
+  `data/real-library-experiment-v03-credit-evidence-repro/reproduction-audit.json`.
+  No new native run needed for unchanged binary payload.
+- Primary title/credit sources recorded in the title-alias evidence note. Alias
+  trials remain separate from the active v04 map and recording identity remains
+  unverified. `auxiliary_metadata` is preparing one bounded offline alias trial.
+- `review_ytmusic_batch` is auditing 39-root recommendation bottlenecks using
+  the same Off Vocal-excluded 270-node/825-edge scope and per-filter ablations.
+  Check live agent/session state before restarting. No Actions jobs or transport
+  secrets are live; Apple login remains deferred. Goal remains active to 07:00 JST.

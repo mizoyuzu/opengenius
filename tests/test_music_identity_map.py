@@ -220,6 +220,43 @@ class IdentityMapTests(unittest.TestCase):
         remote = {'title': 'Song', 'artists': [{'name': 'A、B'}], 'duration_seconds': 100}
         self.assertEqual([row['persistent_id'] for row in matcher.match(remote)], ['J'])
 
+    def test_additional_remote_credit_is_reported_without_changing_candidates(self):
+        tracks = [{'persistent_id': 'S', 'title': 'Song', 'artist': 'Singer', 'duration_ms': 100000},
+                  {'persistent_id': 'J', 'title': 'Song', 'artist': 'Singer & Publisher', 'duration_ms': 100000}]
+        document = build_map(tracks, 'hash')
+        document['artist_credit_sets'] = [{'enabled': True, 'labels': ['Singer & Publisher'],
+                                           'components': ['Singer', 'Publisher']}]
+        matcher = IdentityMap(document, tracks, 'hash')
+        remote = {'title': 'Song', 'artists': [{'name': 'Singer'}, {'name': 'Publisher'}], 'duration_seconds': 100}
+        matches = matcher.match(remote)
+        self.assertEqual([row['persistent_id'] for row in matches], ['S', 'J'])
+        self.assertEqual([row['artist_credit_match'] for row in matches], ['partial', 'complete'])
+        self.assertEqual(matches[0]['artist_match'], 'exact')  # Literal name evidence only.
+        remote['artists'] = [{'name': 'Singer'}, {'name': 'Singer'}]
+        solo, = matcher.match(remote)
+        self.assertEqual(solo['artist_credit_match'], 'complete')
+
+    def test_preference_reports_partial_credit_reliance_and_preserves_observations(self):
+        def row(credit=None):
+            candidate = {'persistent_id': 'S', 'album_match': False}
+            if credit is not None:
+                candidate['artist_credit_match'] = credit
+            return {'source': 'ytmusic', 'video_id': 'example1234', 'is_seed': False,
+                    'exact_candidates': [], 'alias_candidates': [candidate]}
+        partial, = group_candidate_observations([row('partial')])
+        self.assertEqual(partial['preferred_metadata_pid'], 'S')
+        self.assertEqual(partial['preferred_artist_credit_match'], 'partial')
+        self.assertTrue(partial['preferred_relies_on_partial_artist_credits'])
+        combined, = group_candidate_observations([row('partial'), row('complete')])
+        self.assertEqual(combined['observation_indices'], [0, 1])
+        self.assertEqual(combined['complete_credit_supported_pids'], ['S'])
+        self.assertEqual(combined['partial_credit_supported_pids'], ['S'])
+        self.assertEqual(combined['preferred_artist_credit_match'], 'complete')
+        self.assertFalse(combined['preferred_relies_on_partial_artist_credits'])
+        legacy, = group_candidate_observations([row()])
+        self.assertEqual(legacy['preferred_artist_credit_match'], 'unknown')
+        self.assertFalse(legacy['preferred_relies_on_partial_artist_credits'])
+
 
 if __name__ == '__main__':
     unittest.main()

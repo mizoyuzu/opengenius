@@ -221,23 +221,33 @@ def main():
     parser.add_argument('--output-directory', type=Path, default=Path('data/music-review'))
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--host', default='127.0.0.1')
-    for name in ('identity-map', 'observations-directory', 'genius-reference', 'executable'):
+    for name in ('identity-map', 'genius-reference', 'executable'):
         parser.add_argument('--' + name, type=Path)
+    parser.add_argument('--observations-directory', type=Path, action='append', default=[])
+    parser.add_argument('--extra-observation', type=Path, action='append', default=[])
     args = parser.parse_args()
     evaluation_args = (args.identity_map, args.observations_directory, args.genius_reference, args.executable)
     if any(evaluation_args) and not all(evaluation_args):
         parser.error('Offline generation needs all four evaluation inputs')
+    if args.extra_observation and not all(evaluation_args):
+        parser.error('Extra observations require offline generation inputs')
     session = ReviewSession(args.track_snapshot, args.config, args.output_directory, args.evaluation)
     if all(evaluation_args):
         from emulate_genius import database_rows
         from evaluate_ytmusic_batch import collect_graphs, observation_paths
         map_bytes = args.identity_map.read_bytes()
         matcher = IdentityMap(json.loads(map_bytes), session.tracks, session.library_hash)
-        paths, manifest_hash = observation_paths(args.observations_directory, [], session.library_hash)
+        paths, manifests = [], []
+        for directory in args.observations_directory:
+            selected, manifest_hash = observation_paths(directory, [], session.library_hash)
+            paths.extend(selected)
+            manifests.append({'directory': str(directory), 'sha256': manifest_hash})
+        paths = list(dict.fromkeys([*paths, *args.extra_observation]))
         graphs, skipped, inputs = collect_graphs(paths, matcher, session.library_hash)
         reference = args.genius_reference.read_bytes()
         config, _, _ = database_rows(reference)
-        provenance = {'observations': inputs, 'skipped_snapshots': skipped, 'seed_manifest_sha256': manifest_hash,
+        provenance = {'observations': inputs, 'skipped_snapshots': skipped, 'seed_manifests': manifests,
+                      'seed_manifest_sha256': manifests[0]['sha256'] if len(manifests) == 1 else None,
                       'identity_map_sha256': hashlib.sha256(map_bytes).hexdigest(),
                       'genius_reference_sha256': hashlib.sha256(reference).hexdigest(),
                       'executable_sha256': hashlib.sha256(args.executable.read_bytes()).hexdigest()}

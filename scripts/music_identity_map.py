@@ -260,6 +260,9 @@ class IdentityMap:
                                'title_match': 'exact' if exact_title else ('proposed_alias' if pending_title else 'explicit_alias'),
                                'alias_review_status': 'needs_review' if pending_title else 'active_metadata_candidate',
                                'artist_match': 'explicit_credit_set' if credit_match else ('exact' if exact_artist else 'explicit_alias'),
+                               # A literal singer match may omit an additional remote
+                               # credit. Report that evidence without assuming its role.
+                               'artist_credit_match': 'complete' if self.artist_credits(local_artist) == artists else 'partial',
                                'duration_difference_seconds': round(delta, 3),
                                'album_match': (normalize(remote_album) == normalize(local.get('album') or '')) if remote_album else None,
                                'identity_status': 'unverified'})
@@ -276,6 +279,7 @@ def group_candidate_observations(observations):
         group = grouped.setdefault(key, {
             'source': key[0], 'video_id': key[1], 'observation_indices': [],
             'all_candidates': set(), 'duration_supported': set(), 'album_supported': set(),
+            'complete_credit_supported': set(), 'partial_credit_supported': set(),
         })
         group['observation_indices'].append(index)
         group['all_candidates'].update(row['exact_candidates'])
@@ -285,11 +289,17 @@ def group_candidate_observations(observations):
             group['duration_supported'].add(pid)
             if candidate['album_match'] is True:
                 group['album_supported'].add(pid)
+            if candidate.get('artist_credit_match') == 'complete':
+                group['complete_credit_supported'].add(pid)
+            elif candidate.get('artist_credit_match') == 'partial':
+                group['partial_credit_supported'].add(pid)
     result = []
     for group in grouped.values():
         duration_supported = group.pop('duration_supported')
         album_supported = group.pop('album_supported')
         candidates = group.pop('all_candidates')
+        complete_credits = group.pop('complete_credit_supported')
+        partial_credits = group.pop('partial_credit_supported')
         preferred = None
         if len(album_supported) > 1:
             status = 'conflicting_album_evidence'
@@ -306,6 +316,12 @@ def group_candidate_observations(observations):
         else:
             status = 'unmatched'
         group.update(candidate_pids=sorted(candidates),
+                     complete_credit_supported_pids=sorted(complete_credits),
+                     partial_credit_supported_pids=sorted(partial_credits),
+                     preferred_artist_credit_match=('complete' if preferred in complete_credits else
+                                                    'partial' if preferred in partial_credits else
+                                                    'unknown' if preferred is not None else None),
+                     preferred_relies_on_partial_artist_credits=(preferred in partial_credits and preferred not in complete_credits),
                      duration_supported_pids=sorted(duration_supported),
                      album_supported_pids=sorted(album_supported),
                      metadata_status=status, preferred_metadata_pid=preferred,
