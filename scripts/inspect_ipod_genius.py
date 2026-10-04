@@ -15,6 +15,8 @@ import struct
 import time
 
 MAX_BYTES = 32 * 1024 * 1024
+MAX_NESTED_RECORDS = 250_000
+MAX_PLAYLIST_MEMBERS = 1_000_000
 KNOWN_FILES = ('iTunesDB', 'iTunesCDB', 'Genius.itdb', 'iTunesSD',
                'Library.itdb', 'Locations.itdb', 'Dynamic.itdb', 'Extras.itdb')
 KNOWN_TABLES = ('genius_metadata', 'genius_similarities', 'genius_config',
@@ -65,11 +67,199 @@ def inspect_itunesdb(data):
         if kind == 9:
             section.update(cuid_present=size > length, cuid_bytes=size - length,
                            expected_cuid_length=size - length == 32)
-        sections.append(section)
+        sections.append((section, position, position + size))
         position += size
+
+    # Parse tracks first so playlist references can be checked regardless of
+    # section ordering. Only the record layouts read by libgpod are interpreted.
+    track_ids = set()
+    dbids, dbid2s = set(), set()
+    dbid_nonzero_records = dbid2_nonzero_records = dbid2_available_records = 0
+    dbid_equal_dbid2_nonzero_records = track_record_count = 0
+    track_sections = []
+    for section, start, end in sections:
+        if section['type'] == 1:
+            nested = _parse_track_section(data, start, end, section['header_bytes'])
+            section['nested_records'] = nested
+            if nested['status'] == 'invalid':
+                return dict(status='invalid_nested_records', error=nested['error'],
+                            header_bytes=header, sections=[item[0] for item in sections],
+                            nested_records_validated=False, checksum_validated=False)
+            if nested['status'] in ('validated', 'validated_with_unparsed_trailing_bytes'):
+                track_ids.update(nested.pop('_track_ids'))
+                dbids.update(nested.pop('_dbids'))
+                dbid2s.update(nested.pop('_dbid2s'))
+                dbid_nonzero_records += nested['dbid_nonzero_records']
+                dbid2_nonzero_records += nested['dbid2_nonzero_records']
+                dbid2_available_records += nested['dbid2_available_records']
+                dbid_equal_dbid2_nonzero_records += nested['dbid_equal_dbid2_nonzero_records']
+                track_record_count += nested['track_records']
+                track_sections.append(nested)
+
+    playlist_sections = []
+    referenced_track_ids = set()
+    for section, start, end in sections:
+        if section['type'] in (2, 3):
+            nested = _parse_playlist_section(data, start, end, section['header_bytes'], track_ids)
+            section['nested_records'] = nested
+            if nested['status'] == 'invalid':
+                return dict(status='invalid_nested_records', error=nested['error'],
+                            header_bytes=header, sections=[item[0] for item in sections],
+                            nested_records_validated=False, checksum_validated=False)
+            if nested['status'] in ('validated', 'validated_with_unparsed_trailing_bytes'):
+                referenced_track_ids.update(nested.pop('_referenced_ids'))
+                playlist_sections.append(nested)
+
+    known_nested = [item for item, _, _ in sections if item['type'] in (1, 2, 3)]
+    nested_validated = bool(known_nested) and all(
+        item.get('nested_records', {}).get('status') == 'validated' for item in known_nested)
     return dict(status='structure_valid', header_bytes=header,
-                database_version=struct.unpack_from('<I', data, 16)[0], sections=sections,
-                nested_records_validated=False, checksum_validated=False)
+                database_version=struct.unpack_from('<I', data, 16)[0],
+                sections=[item[0] for item in sections],
+                nested_records_validated=nested_validated,
+                nested_coverage='libgpod_track_and_playlist_records',
+                track_records=track_record_count,
+                track_ids_unique=len(track_ids),
+                track_ids_duplicate_records=track_record_count - len(track_ids),
+                dbid_nonzero_records=dbid_nonzero_records,
+                dbid_unique_values=len(dbids),
+                dbid_duplicate_records=dbid_nonzero_records - len(dbids),
+                dbid2_available_records=dbid2_available_records,
+                dbid2_nonzero_records=dbid2_nonzero_records,
+                dbid2_unique_values=len(dbid2s),
+                dbid2_duplicate_records=dbid2_nonzero_records - len(dbid2s),
+                dbid_equal_dbid2_nonzero_records=dbid_equal_dbid2_nonzero_records,
+                playlists=sum(item['playlist_records'] for item in playlist_sections),
+                playlist_members=sum(item['membership_entries'] for item in playlist_sections),
+                playlist_unique_track_ids_referenced=len(referenced_track_ids),
+                dangling_playlist_members=sum(item['dangling_members'] for item in playlist_sections),
+                checksum_validated=False)
+
+
+def _bounded_chunk(data, offset, limit, magic, min_header):
+    if offset < 0 or limit - offset < 12 or data[offset:offset + 4] != magic:
+        raise ValueError('missing_' + magic.decode('ascii'))
+    header, total = struct.unpack_from('<II', data, offset + 4)
+    if header < min_header or total < header or offset + total > limit:
+        raise ValueError('invalid_' + magic.decode('ascii') + '_bounds')
+    return header, total
+
+
+def _count_header(data, offset, limit, magic):
+    if offset < 0 or limit - offset < 12 or data[offset:offset + 4] != magic:
+        raise ValueError('missing_' + magic.decode('ascii'))
+    header = struct.unpack_from('<I', data, offset + 4)[0]
+    if header < 12 or offset + header > limit:
+        raise ValueError('invalid_' + magic.decode('ascii') + '_bounds')
+    return header
+
+
+def _scan_mhods(data, offset, limit, count):
+    if count > MAX_NESTED_RECORDS:
+        raise ValueError('mhod_limit')
+    position = offset
+    for _ in range(count):
+        header, total = _bounded_chunk(data, position, limit, b'mhod', 16)
+        position += total
+    return position
+
+
+def _parse_track_section(data, start, end, section_header):
+    payload = start + section_header
+    try:
+        header = _count_header(data, payload, end, b'mhlt')
+        count = struct.unpack_from('<I', data, payload + 8)[0]
+        if count > MAX_NESTED_RECORDS:
+            raise ValueError('track_limit')
+        position = payload + header
+        track_ids, dbids, dbid2s = set(), set(), set()
+        dbid_nonzero = dbid2_nonzero = dbid2_available = dbid_equal = records = 0
+        for _ in range(count):
+            header, total = _bounded_chunk(data, position, end, b'mhit', 0x9c)
+            record_end = position + total
+            track_id = struct.unpack_from('<I', data, position + 16)[0]
+            dbid = struct.unpack_from('<Q', data, position + 112)[0]
+            child_count = struct.unpack_from('<I', data, position + 12)[0]
+            child_end = _scan_mhods(data, position + header, record_end, child_count)
+            if child_end != record_end:
+                raise ValueError('mhit_child_size_mismatch')
+            track_ids.add(track_id)
+            if dbid:
+                dbid_nonzero += 1
+                dbids.add(dbid)
+            if header >= 0xf4:
+                dbid2_available += 1
+                dbid2 = struct.unpack_from('<Q', data, position + 168)[0]
+                if dbid2:
+                    dbid2_nonzero += 1
+                    dbid2s.add(dbid2)
+                dbid_equal += bool(dbid and dbid == dbid2)
+            records += 1
+            position = record_end
+        trailing = end - position
+        return dict(status='validated' if trailing == 0 else 'validated_with_unparsed_trailing_bytes',
+                    unparsed_trailing_bytes=trailing, track_records=records,
+                    dbid_nonzero_records=dbid_nonzero, dbid_unique_values=len(dbids),
+                    dbid_duplicate_records=dbid_nonzero - len(dbids),
+                    dbid2_available_records=dbid2_available,
+                    dbid2_nonzero_records=dbid2_nonzero, dbid2_unique_values=len(dbid2s),
+                    dbid2_duplicate_records=dbid2_nonzero - len(dbid2s),
+                    dbid_equal_dbid2_nonzero_records=dbid_equal, _track_ids=track_ids,
+                    _dbids=dbids, _dbid2s=dbid2s)
+    except ValueError as error:
+        if str(error).startswith(('missing_mhlt',)):
+            return dict(status='unsupported_nested_layout')
+        return dict(status='invalid', error=str(error))
+
+
+def _parse_playlist_section(data, start, end, section_header, track_ids):
+    payload = start + section_header
+    try:
+        header = _count_header(data, payload, end, b'mhlp')
+        count = struct.unpack_from('<I', data, payload + 8)[0]
+        if count > MAX_NESTED_RECORDS:
+            raise ValueError('playlist_limit')
+        position = payload + header
+        memberships = dangling = playlists = 0
+        referenced = set()
+        for _ in range(count):
+            playlist_header, playlist_total = _bounded_chunk(data, position, end, b'mhyp', 48)
+            playlist_end = position + playlist_total
+            children = struct.unpack_from('<I', data, position + 12)[0]
+            member_count = struct.unpack_from('<I', data, position + 16)[0]
+            if memberships + member_count > MAX_PLAYLIST_MEMBERS:
+                raise ValueError('playlist_member_limit')
+            cursor = _scan_mhods(data, position + playlist_header, playlist_end, children)
+            for _ in range(member_count):
+                member_header, member_total = _bounded_chunk(data, cursor, playlist_end, b'mhip', 36)
+                member_end = cursor + member_total
+                child_count = struct.unpack_from('<I', data, cursor + 12)[0]
+                track_id = struct.unpack_from('<I', data, cursor + 24)[0]
+                child_end = _scan_mhods(data, cursor + member_header, playlist_end, child_count)
+                # Older iTunes wrote mhip.total == mhip.header even when child
+                # MHODs follow. libgpod advances using those child lengths.
+                if member_total == member_header and child_count:
+                    cursor = child_end
+                else:
+                    if child_end > member_end:
+                        raise ValueError('mhip_child_size_mismatch')
+                    cursor = member_end
+                memberships += 1
+                dangling += track_id not in track_ids
+                referenced.add(track_id)
+            if cursor != playlist_end:
+                raise ValueError('mhyp_child_size_mismatch')
+            playlists += 1
+            position = playlist_end
+        trailing = end - position
+        return dict(status='validated' if trailing == 0 else 'validated_with_unparsed_trailing_bytes',
+                    unparsed_trailing_bytes=trailing, playlist_records=playlists,
+                    membership_entries=memberships, dangling_members=dangling,
+                    _referenced_ids=referenced)
+    except ValueError as error:
+        if str(error).startswith(('missing_mhlp',)):
+            return dict(status='unsupported_nested_layout')
+        return dict(status='invalid', error=str(error))
 
 
 def _unsigned(value):

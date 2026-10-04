@@ -81,3 +81,25 @@ proof of a scheduler or of a running job.
 - iPod parser review found potential private-reference leakage on malformed
   later sections and insufficient trailing-byte validation; agent is fixing
   both before acceptance. Do not treat its current draft as finished.
+
+## Verified results, 23:38 JST
+
+- Run `37209669955` terminal success. Encrypted output downloaded and decrypted
+  locally; independent audit saved under its private probe directory.
+- All three ordinary playlists persist with the same playlist IDs, names,
+  ordered 10/14/25 members and `genius=false` after a verified Music exit/reopen.
+- Full 2,974-track PID and Genius-ID sets and all Genius SQL tables preserved;
+  47 relinked locations and three advancing native playback positions verified.
+- Genuine native Genius playlist count remains zero; generation and iPod
+  acceptance remain unverified. Do not equate ordinary persistence with Genius.
+- Actions transport secret deleted; `gh secret list` returned an empty list.
+- iPod parser review fixes applied: internal ID sets removed before any early
+  error output; trailing section bytes reported as incomplete validation.
+  Ten targeted parser tests pass. Source-backed research note completed.
+- Cached-only quality evaluation completed: 29 roots, 222 metadata candidates,
+  737 directed edges. Minimum artist/album interval increases output diversity
+  but also same-artist adjacency. Native tested dataset remains 214/723; these
+  two observation collections must not be conflated.
+- Fresh Nightly auth file prepared locally, but primary signing/session cookies
+  are unchanged. Login validity unproven. Account-response diagnostic is being
+  implemented offline to distinguish SDK shape errors; no further requests yet.
