@@ -51,6 +51,18 @@ class ReloadTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_fixture(document)
 
+    def test_original_zero_ids_accepted_but_mixed_and_duplicate_rejected(self):
+        document = fixture_document()
+        for track in document['expected_tracks']:
+            track['genius_id'] = '0000000000000000'
+        validate_fixture(document)
+        document['expected_tracks'][0]['genius_id'] = '0000000070000001'
+        with self.assertRaisesRegex(ValueError, 'both zero'):
+            validate_fixture(document)
+        document['expected_tracks'][1]['genius_id'] = '0000000070000001'
+        with self.assertRaisesRegex(ValueError, 'distinct'):
+            validate_fixture(document)
+
     def test_payload_bounds_trailing_stream_and_bomb(self):
         document = fixture_document()
         compressed = gzip.compress(json.dumps(document).encode())
@@ -102,11 +114,20 @@ class ReloadTests(unittest.TestCase):
             commands = []
             def runner(command, **kwargs):
                 commands.append(command)
+                if command[0] == 'open':
+                    bundle = home / 'Music/Music/Music Library.musiclibrary'
+                    (bundle / 'Application.musicdb').write_bytes(b'synthetic support')
+                    (bundle / 'Extras.itdb').write_bytes(b'synthetic extras')
+                    (bundle / 'Preferences.plist').write_bytes(b'synthetic settings')
+                    (bundle / 'sentinel').touch()
                 return subprocess.CompletedProcess(command, 1 if command[0] == 'pgrep' else 0, '', '')
             with patch('probe_macos_genius_reload.platform.system', return_value='Darwin'), patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch('probe_macos_genius_reload.Path.cwd', return_value=home):
                 report = probe(fixture, home / 'out', runner=runner, popen=lambda *a, **kw: Process(), home=home)
             self.assertTrue(report['expected_tracks_loaded'])
             self.assertTrue(report['after_copy_consistent_exit'])
+            self.assertFalse(report['explicit_library'])
+            self.assertEqual(len(report['support_files']), 4)
+            self.assertEqual((home / 'out/support-after/Application.musicdb').read_bytes(), b'synthetic support')
             self.assertFalse(report['actual_genius_generation_tested'])
             self.assertEqual(len(list((home / 'out/after').iterdir())), 3)
             self.assertFalse(any('importedTracks' in c[-1] for c in commands))

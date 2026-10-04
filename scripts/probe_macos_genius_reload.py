@@ -67,13 +67,14 @@ def validate_fixture(document):
         pid = track['persistent_id']
         if not isinstance(pid, str) or not PID.fullmatch(pid) or pid in seen:
             raise ValueError('invalid or duplicate persistent ID')
-        if not isinstance(track['genius_id'], str) or not PID.fullmatch(track['genius_id']) or not 0 < int(track['genius_id'], 16) <= 0xFFFFFFFF:
+        if not isinstance(track['genius_id'], str) or not PID.fullmatch(track['genius_id']) or not 0 <= int(track['genius_id'], 16) <= 0xFFFFFFFF:
             raise ValueError('invalid Genius ID')
         if track['title'] not in ('synthetic-tone-1', 'synthetic-tone-2') or type(track['duration_ms']) is not int or track['duration_ms'] != 3000:
             raise ValueError('only synthetic tone titles are allowed')
         seen.add(pid)
-    if len({t['genius_id'] for t in tracks}) != 2:
-        raise ValueError('expected distinct Genius IDs')
+    gids = [int(t['genius_id'], 16) for t in tracks]
+    if gids != [0, 0] and (0 in gids or len(set(gids)) != 2):
+        raise ValueError('expected both zero or distinct nonzero Genius IDs')
     if {t['title'] for t in tracks} != {'synthetic-tone-1', 'synthetic-tone-2'}:
         raise ValueError('expected two distinct synthetic tone titles')
     return decoded
@@ -171,7 +172,7 @@ def native_query(runner=subprocess.run, popen=subprocess.Popen):
     return result
 
 
-def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, home=None):
+def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, home=None, explicit_library=False):
     if platform.system() != 'Darwin' or os.environ.get('GITHUB_ACTIONS') != 'true':
         raise ValueError('requires a disposable GitHub Actions macOS runner')
     fixture = Path(fixture).resolve()
@@ -190,7 +191,7 @@ def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, hom
         raise ValueError('output overlaps fixture or Music library')
     output.mkdir(parents=True, exist_ok=False)
     report = dict(schema_version=1, fixture_kind='synthetic-tone-only', fixture_sha256=hashlib.sha256(fixture.read_bytes()).hexdigest(),
-                  app_template_version=document['app_template_version'], platform=platform.platform(), architecture=platform.machine(),
+                  app_template_version=document['app_template_version'], explicit_library=explicit_library, platform=platform.platform(), architecture=platform.machine(),
                   probe_network_requests=0, actual_genius_generation_tested=False, steps={}, files={}, expected_tracks=document['expected_tracks'])
     steps = report['steps']
     def step(name, command, timeout=20):
@@ -214,7 +215,10 @@ def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, hom
         report['synthetic_media_directory'] = str(audio)
         step('os', ['sw_vers'])
         step('music_version', ['/usr/libexec/PlistBuddy', '-c', 'Print :CFBundleShortVersionString', '/System/Applications/Music.app/Contents/Info.plist'])
-        step('launch_music', ['open', '-a', '/System/Applications/Music.app'])
+        launch = ['open', '-a', '/System/Applications/Music.app']
+        if explicit_library:
+            launch.append(str(bundle))
+        step('launch_music', launch)
         launched = True
         step('screenshot_before', ['screencapture', '-x', str(output / 'music-before.png')], 15)
         step('genius_menu_before', ['osascript', '-e', menu_script()], 15)
@@ -237,7 +241,7 @@ def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, hom
         if launched:
             step('quit_music', ['osascript', '-e', 'with timeout of 15 seconds\ntell application "Music" to quit\nend timeout'], 20)
             # Wait boundedly for Music to leave before collecting its files.
-            for attempt in range(10):
+            for attempt in range(40):
                 check = run_step(['pgrep', '-x', 'Music'], 5, runner)
                 if check.get('returncode') == 1:
                     report['music_exited'] = True
@@ -245,6 +249,8 @@ def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, hom
                 time.sleep(.5)
             else:
                 report['music_exited'] = False
+                step('screenshot_quit_pending', ['screencapture', '-x', str(output / 'music-quit-pending.png')], 15)
+                step('quit_pending_ui', ['osascript', '-e', 'with timeout of 10 seconds\ntell application "System Events" to return name of windows of process "Music"\nend timeout'], 15)
         (output / 'after').mkdir(exist_ok=True)
         for name in FILES:
             target = bundle / name
@@ -254,6 +260,22 @@ def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, hom
                 record = report['files'].setdefault(name, {})
                 record.update(after_sha256=hashlib.sha256(after).hexdigest(), after_size=len(after))
                 record['changed'] = record.get('before_sha256') != record['after_sha256']
+        report['support_files'] = []
+        support = output / 'support-after'
+        support.mkdir(exist_ok=True)
+        total = 0
+        if bundle.is_dir():
+            for target in sorted(bundle.iterdir()):
+                if not target.is_file() or target.is_symlink() or target.name in FILES:
+                    continue
+                size = target.stat().st_size
+                info = {'name': target.name, 'size': size, 'copied': False}
+                if size <= MAX_FILE * 10 and total + size <= 10 * MAX_FILE * 10:
+                    data = target.read_bytes()
+                    (support / target.name).write_bytes(data)
+                    info.update(copied=True, sha256=hashlib.sha256(data).hexdigest())
+                    total += size
+                report['support_files'].append(info)
         report['after_copy_consistent_exit'] = report.get('music_exited', False)
         (output / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
     return report
@@ -263,9 +285,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fixture', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--explicit-library', action='store_true')
     args = parser.parse_args()
     try:
-        report = probe(args.fixture, args.output)
+        report = probe(args.fixture, args.output, explicit_library=args.explicit_library)
     except (ValueError, OSError) as error:
         parser.exit(1, f'{type(error).__name__}: {error}\n')
     print(json.dumps({'expected_tracks_loaded': report.get('expected_tracks_loaded'), 'actual_genius_generation_tested': False}))

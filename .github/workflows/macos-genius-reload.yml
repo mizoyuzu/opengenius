@@ -8,6 +8,11 @@ on:
         required: true
         type: string
 
+      explicit_library:
+        description: Open the restored bundle explicitly
+        type: boolean
+        default: false
+
 permissions:
   contents: read
 
@@ -35,7 +40,14 @@ jobs:
           Path('data/reload-fixture.json').write_text(json.dumps(fixture))
           PYTHON
       - name: Restore synthetic library and reopen Music
-        run: python3 scripts/probe_macos_genius_reload.py --fixture data/reload-fixture.json --output data/macos-reload
+        env:
+          EXPLICIT_LIBRARY: ${{ inputs.explicit_library }}
+        run: |
+          if [ "$EXPLICIT_LIBRARY" = true ]; then
+            python3 scripts/probe_macos_genius_reload.py --fixture data/reload-fixture.json --output data/macos-reload --explicit-library
+          else
+            python3 scripts/probe_macos_genius_reload.py --fixture data/reload-fixture.json --output data/macos-reload
+          fi
       - name: Collect reload results
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
