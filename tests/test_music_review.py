@@ -1,5 +1,6 @@
 """Review edits remain Library-bound, transactional and separate from inputs."""
 import copy
+import hashlib
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 import json
@@ -62,6 +63,109 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(restored.config, self.session.config)
         self.assertEqual(self.snapshot.read_bytes(), self.original_bytes)
 
+    def test_legacy_cli_raw_hash_gets_semantic_identity_without_changing_files(self):
+        config = self.directory / 'clusters.json'
+        config.write_text(json.dumps(self.session.config, indent=4, ensure_ascii=False))
+        original_config = config.read_bytes()
+        raw_hash = hashlib.sha256(original_config).hexdigest()
+        report = self.directory / 'evaluation.json'
+        report.write_text(json.dumps({'library_sha256': self.session.library_hash,
+                                      'cluster_config_sha256': raw_hash, 'root_results': []}))
+        original_report = report.read_bytes()
+        loaded = ReviewSession(self.snapshot, config=config, evaluation=report)
+        self.assertNotEqual(raw_hash, loaded.config_hash())
+        self.assertEqual(loaded.latest['cluster_config_sha256'], raw_hash)
+        self.assertEqual(loaded.latest['cluster_config_semantic_sha256'], loaded.config_hash())
+        self.assertEqual(config.read_bytes(), original_config)
+        self.assertEqual(report.read_bytes(), original_report)
+        loaded.edit({'persistent_ids': ['0000000000000001'], 'kind': 'bgm'})
+        self.assertNotEqual(loaded.latest['cluster_config_semantic_sha256'], loaded.config_hash())
+
+    def test_explicit_semantic_hash_accepts_reformatted_same_config_but_not_changed_config(self):
+        compact = json.dumps(self.session.config, separators=(',', ':'), ensure_ascii=False).encode()
+        config = self.directory / 'clusters.json'
+        config.write_text(json.dumps(self.session.config, indent=2, ensure_ascii=False))
+        report = self.directory / 'evaluation.json'
+        raw_hash = hashlib.sha256(compact).hexdigest()
+        report.write_text(json.dumps({'library_sha256': self.session.library_hash,
+                                      'cluster_config_sha256': raw_hash,
+                                      'cluster_config_semantic_sha256': self.session.config_hash(),
+                                      'root_results': []}))
+        self.assertNotEqual(raw_hash, hashlib.sha256(config.read_bytes()).hexdigest())
+        original_config, original_report = config.read_bytes(), report.read_bytes()
+        loaded = ReviewSession(self.snapshot, config=config, evaluation=report)
+        self.assertEqual(loaded.latest['cluster_config_semantic_sha256'], loaded.config_hash())
+        loaded.edit({'persistent_ids': ['0000000000000001'], 'tags': ['Changed']})
+        self.assertNotEqual(loaded.latest['cluster_config_semantic_sha256'], loaded.config_hash())
+        self.assertEqual(config.read_bytes(), original_config)
+        self.assertEqual(report.read_bytes(), original_report)
+
+    def test_unknown_legacy_hash_is_not_assumed_to_match_current_config(self):
+        config = self.directory / 'clusters.json'
+        config.write_text(json.dumps(self.session.config))
+        report = self.directory / 'evaluation.json'
+        report.write_text(json.dumps({'library_sha256': self.session.library_hash,
+                                      'cluster_config_sha256': 'b' * 64, 'root_results': []}))
+        loaded = ReviewSession(self.snapshot, config=config, evaluation=report)
+        self.assertNotIn('cluster_config_semantic_sha256', loaded.latest)
+        self.assertNotEqual(loaded.latest['cluster_config_sha256'], loaded.config_hash())
+
+    def test_evaluation_source_hashes_detect_changes_and_ignore_paths(self):
+        provenance = {'observations': [{'path': '/old/a', 'sha256': '1' * 64},
+                                       {'path': '/old/b', 'sha256': '2' * 64}],
+                      'identity_map_sha256': '3' * 64, 'executable_sha256': '4' * 64,
+                      'genius_reference_sha256': '5' * 64}
+        self.session.engine = ([], 'matcher', b'config', 'executable', provenance)
+        self.session.latest = {'input_provenance': copy.deepcopy(provenance)}
+        self.assertEqual(self.session.state()['evaluation_source_status'], 'current')
+        self.session.latest['input_provenance']['observations'][0]['path'] = '/new/a'
+        self.assertEqual(self.session.state()['evaluation_source_status'], 'current')
+        for key in ('identity_map_sha256', 'executable_sha256', 'genius_reference_sha256'):
+            with self.subTest(key=key):
+                self.session.latest = {'input_provenance': {**provenance, key: '6' * 64}}
+                self.assertEqual(self.session.state()['evaluation_source_status'], 'changed')
+        self.session.latest = {'input_provenance': {**provenance,
+                               'observations': list(reversed(provenance['observations']))}}
+        self.assertEqual(self.session.state()['evaluation_source_status'], 'changed')
+        self.session.latest = {'input_provenance': {**provenance,
+                               'observations': provenance['observations'] + [{'sha256': '6' * 64}]}}
+        self.assertEqual(self.session.state()['evaluation_source_status'], 'changed')
+
+    def test_legacy_cli_sources_and_incomplete_or_unavailable_sources(self):
+        provenance = {'observations': [{'path': '/a', 'sha256': '1' * 64}],
+                      'identity_map_sha256': '3' * 64, 'executable_sha256': '4' * 64,
+                      'genius_reference_sha256': '5' * 64}
+        self.session.engine = ([], 'matcher', b'config', 'executable', provenance)
+        self.session.latest = {'observation_inputs': [{'path': '/moved', 'sha256': '1' * 64}],
+                               'input_sha256': {'identity_map': '3' * 64, 'executable': '4' * 64,
+                                                'genius_reference': '5' * 64}}
+        self.assertEqual(self.session.state()['evaluation_source_status'], 'current')
+        del self.session.latest['input_sha256']['identity_map']
+        self.assertEqual(self.session.state()['evaluation_source_status'], 'unverified')
+        self.session.latest = {'input_provenance': {'observations': []}}
+        self.assertEqual(self.session.state()['evaluation_source_status'], 'unverified')
+        self.session.engine = None
+        self.assertEqual(self.session.state()['evaluation_source_status'], 'unverified')
+
+    def test_successful_evaluation_refreshes_source_status_and_failure_keeps_result(self):
+        pid = self.tracks[0]['persistent_id']
+        provenance = {'observations': [{'sha256': '1' * 64}], 'identity_map_sha256': '3' * 64,
+                      'executable_sha256': '4' * 64, 'genius_reference_sha256': '5' * 64}
+        self.session.engine = ([{'root_pid': pid, 'ordered_target_pids': []}],
+                               'matcher', b'config', 'executable', provenance)
+        self.session.latest = {'input_provenance': {**provenance, 'executable_sha256': '6' * 64}}
+        self.assertEqual(self.session.state()['evaluation_source_status'], 'changed')
+        with patch('evaluate_ytmusic_batch.evaluate_graphs') as evaluate:
+            evaluate.return_value = {'root_results': [{'root_pid': pid}], 'root_overlaps': []}
+            result = self.session.evaluate({'root_pid': pid})
+        self.assertEqual(result['evaluation_source_status'], 'current')
+        self.assertEqual(self.session.state()['evaluation_source_status'], 'current')
+        success = copy.deepcopy(self.session.latest)
+        with self.assertRaises(ValueError):
+            self.session.evaluate({'kind': 'off_vocal', 'excluded_kinds': ['off_vocal']})
+        self.assertEqual(self.session.latest, success)
+        self.assertEqual(self.session.state()['evaluation_source_status'], 'current')
+
     def test_foreign_evaluation_is_rejected(self):
         report = self.directory / 'foreign.json'
         report.write_text(json.dumps({'library_sha256': 'b' * 64, 'root_results': []}))
@@ -83,6 +187,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(scoped[1]['ordered_target_pids'], [])
         self.assertEqual(result['evaluation']['root_results'], [{'root_pid': pids[0]}])
         self.assertEqual(result['evaluation']['cluster_config_sha256'], self.session.config_hash())
+        self.assertEqual(result['evaluation']['cluster_config_semantic_sha256'], self.session.config_hash())
         self.assertTrue(Path(result['path']).exists())
 
     def test_unobserved_or_scope_excluded_root_never_calls_evaluator(self):

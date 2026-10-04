@@ -18,10 +18,27 @@ PROFILES = ('without-compatible-genre', 'artist-album-minimum-one', 'relations-o
 WEB = Path(__file__).resolve().parents[1] / 'web' / 'music-review.html'
 
 
+def _source_signature(provenance):
+    """Compare content hashes, retaining observation order and ignoring locations."""
+    if not isinstance(provenance, dict):
+        return None
+    observations = provenance.get('observations')
+    if not isinstance(observations, list) or not observations:
+        return None
+    values = [row.get('sha256') if isinstance(row, dict) else None for row in observations]
+    values.extend(provenance.get(key) for key in
+                  ('identity_map_sha256', 'executable_sha256', 'genius_reference_sha256'))
+    if any(not isinstance(value, str) or len(value) != 64
+           or any(c not in '0123456789abcdefABCDEF' for c in value) for value in values):
+        return None
+    return tuple(value.lower() for value in values)
+
+
 class ReviewSession:
     def __init__(self, snapshot, config=None, output_directory=None, evaluation=None, engine=None):
         self.tracks, self.library_hash, self.provenance = load_library(track_snapshot=snapshot)
-        self.config = (json.loads(config.read_bytes(), object_pairs_hook=_unique_keys) if config else
+        config_bytes = config.read_bytes() if config else None
+        self.config = (json.loads(config_bytes, object_pairs_hook=_unique_keys) if config else
                        {'schema_version': 1, 'source_library_sha256': self.library_hash, 'rules': [], 'overrides': {}})
         classify_tracks(self.config, self.tracks, self.library_hash)
         self.output_directory = output_directory or Path('data/music-review')
@@ -33,15 +50,39 @@ class ReviewSession:
             self.latest = json.loads(evaluation.read_bytes())
             if self.latest.get('library_sha256') != self.library_hash:
                 raise ValueError('Evaluation belongs to a different Library')
+            # Legacy CLI reports stored a file-byte hash; only an exact input match
+            # establishes its semantic identity. Retain the original provenance.
+            if ('cluster_config_semantic_sha256' not in self.latest and config_bytes is not None
+                    and self.latest.get('cluster_config_sha256') == hashlib.sha256(config_bytes).hexdigest()):
+                self.latest['cluster_config_semantic_sha256'] = self.config_hash()
 
     def state(self):
         return {'tracks': self.tracks, 'config': self.config,
                 'classifications': classify_tracks(self.config, self.tracks, self.library_hash),
                 'library_sha256': self.library_hash, 'evaluation': self.latest,
+                'evaluation_source_status': self.evaluation_source_status(),
                 'evaluation_available': self.engine is not None,
                 'available_root_pids': sorted({g['root_pid'] for g in self.engine[0]}) if self.engine else [],
                 'config_sha256': self.config_hash(),
                 'has_unsaved_changes': self.config_hash() != self.saved_config_sha256, 'profiles': list(PROFILES)}
+
+    def evaluation_source_status(self):
+        if self.latest is None:
+            return None
+        if self.engine is None:
+            return 'unverified'
+        current = _source_signature(self.engine[4])
+        if 'input_provenance' in self.latest:
+            previous = _source_signature(self.latest['input_provenance'])
+        else:
+            hashes = self.latest.get('input_sha256')
+            previous = _source_signature({
+                'observations': self.latest.get('observation_inputs'),
+                **{key + '_sha256': hashes.get(key) if isinstance(hashes, dict) else None
+                   for key in ('identity_map', 'executable', 'genius_reference')}})
+        if current is None or previous is None:
+            return 'unverified'
+        return 'current' if current == previous else 'changed'
 
     def config_hash(self):
         return hashlib.sha256(json.dumps(self.config, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
@@ -129,14 +170,16 @@ class ReviewSession:
         evaluated = evaluate_graphs(filtered, matcher, config, executable, profile=profile,
                                     root_pids=[root] if root is not None else None)
         report = {'schema_version': 1, 'library_sha256': self.library_hash, 'library_input': self.provenance,
-                  'cluster_config_sha256': self.config_hash(), 'cluster_config': copy.deepcopy(self.config),
+                  'cluster_config_sha256': self.config_hash(),
+                  'cluster_config_semantic_sha256': self.config_hash(), 'cluster_config': copy.deepcopy(self.config),
                   'cluster_scope': scope,
                   'input_provenance': provenance, 'profile': profile, **evaluated,
                   'network_requests': 0, 'identity_status': 'unverified',
                   'music_app_acceptance_verified': False, 'ipod_acceptance_verified': False}
         path = self._save('evaluation', report)
         self.latest = report
-        return {'path': path, 'evaluation': report}
+        return {'path': path, 'evaluation': report,
+                'evaluation_source_status': self.evaluation_source_status()}
 
 
 def make_handler(session, token):

@@ -264,3 +264,41 @@ proof of a scheduler or of a running job.
   observed shortest relation path on demand in existing detail dialog. No new
   recommendation edges/core behavior; not a Music execution trace. Finish and
   verify before07:00, or leave bounded explicit checkpoint if not completed.
+
+## Delivery preparation, 06:54 JST
+
+- Observed-path disclosure complete: real45root Sweden18 playlist unchanged;
+  all paths follow actual graph edges,1root/13direct/4indirect. Old cache paths
+  not invented; existing detail dialog distinguishes observed paths from core
+  execution trace and keeps recordings unverified. Browser keyboard/mobile/
+  console checks passed. BFS parent/distance avoids materializing all paths.
+- Full **214 tests passed**, actual executable+HTTP, session27776 terminal exit0,
+  log `data/overnight-suite-20261005-path.log`. Path browser session closed;
+  server44063/session30384 stopped normally exit0. Earlier path startup
+  session57104 also stopped exit0 before optimized code restart.
+- Existing64430 listener absent. Requested0.0.0.0 delivery bind was rejected by
+  automatic approval review for all-interface exposure of personal metadata and
+  editing API. Safer127.0.0.1 bind authorized instead, new server session21595
+  starting on64430. Do not bypass/retry all-interface rejection without a
+  specifically authorized exposure. No need to stop localhost delivery service.
+- Delivery reads v04-outgoing observations and path-enabled cached18 result;
+  saves only to `data/music-review-v04-outgoing`. It performs no external calls.
+  Final audit and local commit pending; deadline remains07:00 JST.
+
+## Final delivery verification, 06:56 JST
+
+- Local delivery server21595 live on127.0.0.1:64430; HTTP state independently
+  verified2,974 tracks/45 observed roots, cached18 path-enabled tracks, current
+  source recipe, matching semantic classification, no unsaved edits. Intended
+  user service remains running; no experimental server/native job remains.
+- Source data files preserved, transport secret absent, all encrypted native
+  results recovered and audited, private artifacts/credentials remain ignored.
+- Final214-test suite passed after last code change; graph and source sync,
+  shortest paths and actual browser/mobile delivery tested. Final docs/code
+  committed locally; public isolated branch contains only ciphertext additions.
+- Follow-up requires Apple login for actual Music Genius generation and the
+  physical iPod/model for stock-device acceptance. Neither is claimed achieved
+  by this time-boxed overnight work. Reviewed alias shadow was not adopted.
+- On resume, inspect service21595 and delivery-health.json before starting a new
+  service. Retained data/driver inputs allow cached/offline rebuilds; do not
+  repeat the26-request outgoing collection or completed macOS runs gratuitously.

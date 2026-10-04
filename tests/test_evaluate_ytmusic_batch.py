@@ -8,7 +8,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from evaluate_ytmusic_batch import (InvalidObservation, collect_graphs, evaluate_graphs, jaccard,
-                                    merge_graphs, observation_paths, shared_rows, validate_observations)
+                                    merge_graphs, observation_paths, relation_paths, relation_distances, shared_rows, validate_observations)
 from emulate_ytmusic_candidates import candidate_graph
 from genius_format import pack_config, parse_similarities
 from music_identity_map import IdentityMap, build_map
@@ -127,6 +127,9 @@ class BatchEvaluationTests(unittest.TestCase):
         result, = report['root_results']
         self.assertEqual(result['root_pid'], f'{1:016X}')
         self.assertEqual([track['observed_relation_hops'] for track in result['playlist']], [0, 1, 2, None])
+        self.assertEqual([track['observed_relation_path'] for track in result['playlist']],
+                         [[f'{1:016X}'], [f'{1:016X}', f'{2:016X}'],
+                          [f'{1:016X}', f'{2:016X}', f'{3:016X}'], None])
         self.assertEqual(report['root_overlaps'], [])
 
     def test_root_subset_overlaps_only_generated_roots(self):
@@ -147,6 +150,29 @@ class BatchEvaluationTests(unittest.TestCase):
                                 core_factory=FakeCore, root_pids=subset)
         self.assertEqual(FakeCore.instances, [])
 
+    def test_observed_paths_are_shortest_deterministic_and_cycle_safe(self):
+        edges = {'root': ['left', 'right'], 'left': ['target', 'root'],
+                 'right': ['target'], 'target': ['leaf'], 'isolated': ['root']}
+        paths = relation_paths('root', edges)
+        self.assertEqual(paths, {'root': ['root'], 'left': ['root', 'left'],
+                                 'right': ['root', 'right'], 'target': ['root', 'left', 'target'],
+                                 'leaf': ['root', 'left', 'target', 'leaf']})
+        self.assertNotIn('isolated', paths)
+        self.assertEqual(relation_distances('root', edges),
+                         {pid: len(path) - 1 for pid, path in paths.items()})
+        for path in paths.values():
+            self.assertEqual(path[0], 'root')
+            for source, target in zip(path, path[1:]):
+                self.assertIn(target, edges[source])
+        self.assertEqual(relation_paths('root', {**edges, 'root': ['right', 'left']})['target'],
+                         ['root', 'right', 'target'])
+
+    def test_long_chain_distance_traversal_is_iterative(self):
+        edges = {str(i): [str(i + 1)] for i in range(2000)}
+        distances = relation_distances('0', edges)
+        self.assertEqual(len(distances), 2001)
+        self.assertEqual(distances['2000'], 2000)
+
     def test_generated_provenance_distinguishes_direct_indirect_and_unreachable(self):
         class ExpandedCore(FakeCore):
             def generate(self, root, limit):
@@ -155,6 +181,9 @@ class BatchEvaluationTests(unittest.TestCase):
         report = evaluate_graphs(graphs, self.matcher, config(), 'unused', core_factory=ExpandedCore)
         result = report['root_results'][0]
         self.assertEqual([track['observed_relation_hops'] for track in result['playlist']], [0, 1, 2, None])
+        self.assertEqual([track['observed_relation_path'] for track in result['playlist']],
+                         [[f'{1:016X}'], [f'{1:016X}', f'{2:016X}'],
+                          [f'{1:016X}', f'{2:016X}', f'{3:016X}'], None])
         self.assertEqual(result['direct_candidate_count'], 1)
         self.assertEqual(result['indirect_candidate_count'], 1)
         self.assertEqual(result['unreachable_candidate_count'], 1)

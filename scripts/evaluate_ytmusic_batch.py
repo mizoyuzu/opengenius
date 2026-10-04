@@ -156,17 +156,39 @@ def jaccard(left, right):
     return len(set(left) & set(right)) / len(union) if union else None
 
 
-def relation_distances(root_pid, edges):
-    """Shortest directed path in observed relations; not a native execution trace."""
-    distances = {root_pid: 0}
+def _relation_tree(root_pid, edges):
+    """Linear breadth-first traversal; first observed edge wins equal-length ties."""
+    distances, parents = {root_pid: 0}, {root_pid: None}
     queue = deque([root_pid])
     while queue:
         current = queue.popleft()
         for target in edges.get(current, []):
             if target not in distances:
                 distances[target] = distances[current] + 1
+                parents[target] = current
                 queue.append(target)
-    return distances
+    return distances, parents
+
+
+def _observed_path(pid, parents):
+    if pid not in parents:
+        return None
+    path = []
+    while pid is not None:
+        path.append(pid)
+        pid = parents[pid]
+    return list(reversed(path))
+
+
+def relation_paths(root_pid, edges):
+    """Materialize all shortest observed paths when explicitly requested."""
+    _, parents = _relation_tree(root_pid, edges)
+    return {pid: _observed_path(pid, parents) for pid in parents}
+
+
+def relation_distances(root_pid, edges):
+    """Shortest observed path lengths without materializing paths."""
+    return _relation_tree(root_pid, edges)[0]
 
 
 def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=None, profile='without-compatible-genre', root_pids=None):
@@ -211,12 +233,13 @@ def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=
             generated = core.generate(ids[root['root_pid']], limit)
             playlist = [by_id[int(identifier, 16)] for identifier in generated['result_genius_ids']]
             result['status'] = 'generated'
-        distances = relation_distances(root['root_pid'], edges)
+        distances, parents = _relation_tree(root['root_pid'], edges)
         credits = [matcher.artist_credits(tracks[pid].get('artist') or '') for pid in playlist]
         adjacent = sum(left == right for left, right in zip(credits, credits[1:]))
         result.update(core_result=generated, playlist_pids=playlist,
                       playlist=[{'persistent_id': pid, 'title': tracks[pid].get('title'),
                                  'artist': tracks[pid].get('artist'), 'observed_relation_hops': distances.get(pid),
+                                 'observed_relation_path': _observed_path(pid, parents),
                                  'identity_status': 'unverified'} for pid in playlist],
                       direct_candidate_count=sum(distances.get(pid) == 1 for pid in playlist),
                       indirect_candidate_count=sum(distances.get(pid, 0) > 1 for pid in playlist),
@@ -288,10 +311,13 @@ def main():
     graphs, skipped, observation_inputs = collect_graphs(observations, matcher, library_hash)
     cluster_scope = None
     cluster_config_hash = None
+    cluster_config_semantic_hash = None
     if args.cluster_config:
         from music_clusters import classify_tracks, scope_graphs, _unique_keys
         cluster_bytes = args.cluster_config.read_bytes()
-        classifications = classify_tracks(json.loads(cluster_bytes, object_pairs_hook=_unique_keys), tracks, library_hash)
+        cluster_document = json.loads(cluster_bytes, object_pairs_hook=_unique_keys)
+        classifications = classify_tracks(cluster_document, tracks, library_hash)
+        cluster_config_semantic_hash = hashlib.sha256(json.dumps(cluster_document, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         cluster_config_hash = hashlib.sha256(cluster_bytes).hexdigest()
         if args.cluster_tag or args.track_kind or args.exclude_kind:
             graphs, cluster_scope = scope_graphs(graphs, classifications, args.cluster_tag, args.track_kind,
@@ -305,6 +331,7 @@ def main():
                                'executable': hashlib.sha256(paths['executable'].read_bytes()).hexdigest()},
               'observation_inputs': observation_inputs, 'skipped_snapshots': skipped, 'snapshot_graphs': graphs,
               'cluster_scope': cluster_scope, 'cluster_config_sha256': cluster_config_hash,
+              'cluster_config_semantic_sha256': cluster_config_semantic_hash,
               **evaluate_graphs(graphs, matcher, config, paths['executable'], args.limit, profile=args.profile),
               'grouping_policy': {'ids': 'Sorted local PIDs in one shared temporary uint32 ID space',
                                   'metadata': 'genre 0; canonical artist credits; normalized album; credits plus original title song groups',
