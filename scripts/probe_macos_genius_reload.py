@@ -235,6 +235,9 @@ def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, hom
                 report['expected_tracks_loaded'] = False
         else:
             report['expected_tracks_loaded'] = False
+        # Welcome and automation prompts can consume the first UI pass; the
+        # promotion may appear only after that pass and the native query finish.
+        step('bootstrap_ui_after_query', ['osascript', '-e', bootstrap_script()], 30)
         step('genius_menu_after', ['osascript', '-e', menu_script()], 15)
         step('screenshot_after', ['screencapture', '-x', str(output / 'music-after.png')], 15)
     finally:
