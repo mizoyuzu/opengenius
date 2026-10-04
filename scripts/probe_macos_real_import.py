@@ -22,30 +22,52 @@ from probe_macos_real_library import (MAX_OUTPUT, PID, parse_playback, parse_sel
 
 def real_import_script(media_paths):
     lines = [
-        'on currentLibraryPIDs()',
-        'tell application "Music"',
-        'set resultPIDs to {}',
+        'global probeStage', 'set probeStage to "initializing"',
+        'on sanitizedDiagnostic(rawText)',
+        'set cleanText to rawText as text',
+        "set savedDelimiters to AppleScript's text item delimiters",
+        'repeat with separator in {tab, linefeed, return}',
+        "set AppleScript's text item delimiters to separator as text",
+        'set pieces to text items of cleanText',
+        "set AppleScript's text item delimiters to \" \"",
+        'set cleanText to pieces as text', 'end repeat',
+        "set AppleScript's text item delimiters to savedDelimiters",
+        'if (length of cleanText) > 2048 then set cleanText to text 1 thru 2048 of cleanText',
+        'return cleanText', 'end sanitizedDiagnostic',
+        'on currentLibraryPIDs()', 'global probeStage', 'set callingStage to probeStage',
+        'tell application "Music"', 'set resultPIDs to {}',
+        'set probeStage to callingStage & ":count"',
         'set trackCount to count of tracks of library playlist 1',
         'if trackCount is 0 then return resultPIDs',
         'repeat with i from 1 to trackCount',
-        'set end of resultPIDs to (persistent ID of track i of library playlist 1 as text)',
+        'set probeStage to callingStage & ":getPID"',
+        'set retrievedPID to (get persistent ID of track i of library playlist 1)',
+        'set probeStage to callingStage & ":coercePID"',
+        'set textPID to retrievedPID as text', 'set end of resultPIDs to textPID',
         'end repeat', 'return resultPIDs', 'end tell', 'end currentLibraryPIDs',
         'with timeout of 180 seconds', 'set outputText to ""', 'tell application "Music"',
     ]
     for pid, path in media_paths.items():
         if not isinstance(pid, str) or not PID.fullmatch(pid):
             raise ValueError('invalid original PID')
-        lines += ['try', 'set beforePIDs to my currentLibraryPIDs()',
-                  f'add {{(POSIX file {apple_string(path)})}}',
-                  'set afterPIDs to my currentLibraryPIDs()', 'set newPIDs to {}',
-                  'repeat with candidatePID in afterPIDs',
-                  'if beforePIDs does not contain (candidatePID as text) then set end of newPIDs to (candidatePID as text)',
+        lines += ['try', 'set probeStage to "beforePIDs"', 'set beforePIDs to my currentLibraryPIDs()',
+                  'set probeStage to "add"', f'add {{(POSIX file {apple_string(path)})}}',
+                  'set probeStage to "afterPIDs"', 'set afterPIDs to my currentLibraryPIDs()',
+                  'set probeStage to "resolving"', 'set newPIDs to {}',
+                  'repeat with candidatePID in afterPIDs', 'set candidateText to candidatePID as text',
+                  'if beforePIDs does not contain candidateText then set end of newPIDs to candidateText',
                   'end repeat', 'if (count of newPIDs) is not 1 then error "Unexpected native PID difference" number -2700',
                   'set nativePID to item 1 of newPIDs',
                   'set t to item 1 of (every track of library playlist 1 whose persistent ID is nativePID)',
-                  f'set outputText to outputText & "IMPORTED" & tab & "{pid}" & tab & nativePID & tab & (duration of t as text) & tab & (name of t) & tab & (POSIX path of location of t) & linefeed',
+                  'set probeStage to "getduration"', 'set nativeDuration to (get duration of t)',
+                  'set durationText to nativeDuration as text',
+                  'set probeStage to "getname"', 'set nativeTitle to (get name of t)',
+                  'set probeStage to "getlocation"', 'set nativeLocation to (get location of t)',
+                  'set probeStage to "coerceLocation"', 'set nativePath to POSIX path of nativeLocation',
+                  'set probeStage to "formatting"',
+                  f'set outputText to outputText & "IMPORTED" & tab & "{pid}" & tab & nativePID & tab & durationText & tab & nativeTitle & tab & nativePath & linefeed',
                   'on error errorText number errorNumber',
-                  f'set outputText to outputText & "IMPORT_FAILED" & tab & "{pid}" & tab & (errorNumber as text) & linefeed', 'end try']
+                  f'set outputText to outputText & "IMPORT_FAILED" & tab & "{pid}" & tab & (errorNumber as text) & tab & probeStage & tab & (my sanitizedDiagnostic(errorText)) & linefeed', 'end try']
     return '\n'.join(lines + ['set nativeCount to count of tracks of library playlist 1', 'end tell',
                                'return "IMPORT_LIBRARY_COUNT" & tab & nativeCount & linefeed & outputText', 'end timeout'])
 
@@ -62,11 +84,12 @@ def parse_import(stdout, manifest):
     seen, native_seen, records = set(), set(), []
     for line in lines[1:]:
         fields = line.split('\t')
-        if len(fields) not in (2, 3, 6) or fields[1] not in originals or fields[1] in seen:
+        if len(fields) not in (2, 3, 5, 6) or fields[1] not in originals or fields[1] in seen:
             raise ValueError('invalid or duplicate original import PID')
         seen.add(fields[1])
-        if len(fields) in (2, 3) and fields[0] == 'IMPORT_FAILED':
-            records.append({'original_pid': fields[1], 'status': 'failed', 'native_error_number': int(fields[2]) if len(fields) == 3 else None})
+        if len(fields) in (2, 3, 5) and fields[0] == 'IMPORT_FAILED':
+            records.append({'original_pid': fields[1], 'status': 'failed', 'native_error_number': int(fields[2]) if len(fields) >= 3 else None,
+                            'native_error_stage': fields[3] if len(fields) == 5 else None, 'native_error_text': fields[4] if len(fields) == 5 else None})
             continue
         if len(fields) != 6 or fields[0] != 'IMPORTED' or not PID.fullmatch(fields[2]) or fields[2] in native_seen:
             raise ValueError('invalid or duplicate native import PID')
