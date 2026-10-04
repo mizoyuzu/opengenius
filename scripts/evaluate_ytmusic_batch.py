@@ -169,12 +169,23 @@ def relation_distances(root_pid, edges):
     return distances
 
 
-def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=None, profile='without-compatible-genre'):
+def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=None, profile='without-compatible-genre', root_pids=None):
+    """Generate selected roots while retaining the full observed graph and ID space."""
     if not 1 <= limit <= 100:
         raise ValueError('Limit must be 1..100')
     if profile not in ('without-compatible-genre', 'relations-only', 'artist-album-minimum-one'):
         raise ValueError('Unsupported configuration profile')
     roots = merge_graphs(graphs)
+    selected_roots = roots
+    if root_pids is not None:
+        if not isinstance(root_pids, (list, tuple)) or not root_pids or any(not isinstance(pid, str) or not pid for pid in root_pids):
+            raise ValueError('Root subset must be a nonempty list of persistent IDs')
+        if len(set(root_pids)) != len(root_pids):
+            raise ValueError('Root subset contains duplicate IDs')
+        wanted = set(root_pids)
+        if wanted - {root['root_pid'] for root in roots}:
+            raise ValueError('Root subset contains an unobserved root')
+        selected_roots = [root for root in roots if root['root_pid'] in wanted]
     ids, metadata, similarities, mapping = shared_rows(roots, matcher)
     by_id = {identifier: pid for pid, identifier in ids.items()}
     tracks = {track['persistent_id']: track for track in matcher.tracks}
@@ -186,7 +197,7 @@ def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=
     core = None
     edges = {root['root_pid']: root['ordered_target_pids'] for root in roots}
     results = []
-    for root in roots:
+    for root in selected_roots:
         result = {**root, 'candidate_count': len(root['ordered_target_pids']), 'profile': profile}
         if not root['ordered_target_pids']:
             generated, playlist = {}, []

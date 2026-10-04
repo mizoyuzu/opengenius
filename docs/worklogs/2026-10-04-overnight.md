@@ -195,3 +195,22 @@ proof of a scheduler or of a running job.
   radio/related with existing r5 auth, 5s pacing, 28 HTTP cap, no retries. New
   output directory `data/ytmusic/coverage-outgoing-followup-20261005-v01`.
   Check live handle before any restart. Login remains deferred; deadline 07:00.
+
+## Concrete follow-up, 06:30 JST
+
+- Single-root evaluator implemented; shared metadata/all edges remain unchanged.
+  Real scoped benchmark verifies identical full result row/IDs/relations for
+  Sweden: standard 13.21s→2.05s, minimum-one 32.27s→4.41s. Full suite with
+  actual Music executable and HTTP passed **206 tests**, log
+  `data/overnight-suite-20261005-final.log`; session `79121` terminal exit 0.
+- Alias-only shadow finished: baseline 41 snapshots/39 roots reproduced;
+  one preferred album-supported PID and one directed edge replaced, all other
+  root orders unchanged. Active v04 map SHA unchanged. No adopted alias or
+  recording confirmation. Three private title-alias-yoimachi experiment artifacts.
+- New outgoing batch session `83758` terminal exit 0: 6/6 radio, 5/6 related,
+  26 HTTP, account verified, no retry. One optional related parser error retains
+  radio. Source/root selection evidence and exact execution recorded privately.
+- New graph before/after evaluation owned by review_ytmusic_batch, session
+  `28776`. Root new native-template build session `1826`, output
+  `data/real-library-experiment-v04-outgoing`; do not restart either while live.
+  Native-tested graph remains v03 until a later actual Music job is verified.

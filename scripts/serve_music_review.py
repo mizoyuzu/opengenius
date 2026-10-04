@@ -126,10 +126,8 @@ class ReviewSession:
             if root not in {graph['root_pid'] for graph in filtered}:
                 raise ValueError('Selected root has no observations in this scope')
         from evaluate_ytmusic_batch import evaluate_graphs
-        evaluated = evaluate_graphs(filtered, matcher, config, executable, profile=profile)
-        if root is not None:
-            evaluated['root_results'] = [row for row in evaluated['root_results'] if row['root_pid'] == root]
-            evaluated['root_overlaps'] = []
+        evaluated = evaluate_graphs(filtered, matcher, config, executable, profile=profile,
+                                    root_pids=[root] if root is not None else None)
         report = {'schema_version': 1, 'library_sha256': self.library_hash, 'library_input': self.provenance,
                   'cluster_config_sha256': self.config_hash(), 'cluster_config': copy.deepcopy(self.config),
                   'cluster_scope': scope,

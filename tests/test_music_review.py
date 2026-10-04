@@ -75,15 +75,28 @@ class ReviewTests(unittest.TestCase):
                   {'root_pid': pids[1], 'ordered_target_pids': [pids[2]]}]
         self.session.engine = (graphs, 'matcher', b'config', 'executable', {'fixture': True})
         with patch('evaluate_ytmusic_batch.evaluate_graphs') as evaluate:
-            evaluate.return_value = {'root_results': [{'root_pid': pids[0]}, {'root_pid': pids[1]}],
-                                     'root_overlaps': [{}]}
+            evaluate.return_value = {'root_results': [{'root_pid': pids[0]}], 'root_overlaps': []}
             result = self.session.evaluate({'tags': ['Game'], 'kind': 'bgm', 'root_pid': pids[0]})
         scoped = evaluate.call_args.args[0]
+        self.assertEqual(evaluate.call_args.kwargs['root_pids'], [pids[0]])
         self.assertEqual(len(scoped), 2)
         self.assertEqual(scoped[1]['ordered_target_pids'], [])
         self.assertEqual(result['evaluation']['root_results'], [{'root_pid': pids[0]}])
         self.assertEqual(result['evaluation']['cluster_config_sha256'], self.session.config_hash())
         self.assertTrue(Path(result['path']).exists())
+
+    def test_unobserved_or_scope_excluded_root_never_calls_evaluator(self):
+        pids = [t['persistent_id'] for t in self.tracks]
+        self.session.engine = ([{'root_pid': pids[0], 'ordered_target_pids': [pids[1]]}],
+                               'matcher', b'config', 'executable', {'fixture': True})
+        with patch('evaluate_ytmusic_batch.evaluate_graphs') as evaluate:
+            with self.assertRaisesRegex(ValueError, 'no observations'):
+                self.session.evaluate({'root_pid': pids[2]})
+            self.session.edit({'persistent_ids': [pids[1]], 'tags': ['Only']})
+            with self.assertRaises(ValueError):
+                self.session.evaluate({'root_pid': pids[0], 'tags': ['Only']})
+            evaluate.assert_not_called()
+        self.assertFalse((self.directory / 'output').exists())
 
     def test_excluding_off_vocal_preserves_unclassified_tracks_and_saved_config(self):
         pids = [t['persistent_id'] for t in self.tracks]
@@ -93,6 +106,7 @@ class ReviewTests(unittest.TestCase):
         with patch('evaluate_ytmusic_batch.evaluate_graphs') as evaluate:
             evaluate.return_value = {'root_results': [], 'root_overlaps': []}
             result = self.session.evaluate({'excluded_kinds': ['off_vocal']})
+        self.assertIsNone(evaluate.call_args.kwargs['root_pids'])
         self.assertEqual(evaluate.call_args.args[0][0]['ordered_target_pids'], [pids[2]])
         self.assertEqual(result['evaluation']['cluster_scope']['excluded_kinds'], ['off_vocal'])
         self.assertEqual(self.session.config, before)

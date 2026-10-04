@@ -109,6 +109,44 @@ class BatchEvaluationTests(unittest.TestCase):
         self.assertEqual(len(FakeCore.instances), 1)
         self.assertEqual(len(FakeCore.instances[0].calls), 2)
 
+    def test_root_subset_calls_only_selected_core_with_full_metadata_and_two_hops(self):
+        class ExpandedCore(FakeCore):
+            def generate(self, root, limit):
+                super().generate(root, limit)
+                return {'result_genius_ids': [f'{value:016X}' for value in sorted(self.metadata)]}
+        graphs = [self.graph(1, [2]), self.graph(2, [3]), self.graph(4, [1])]
+        report = evaluate_graphs(graphs, self.matcher, config(), 'unused', core_factory=ExpandedCore,
+                                 root_pids=[f'{1:016X}'])
+        core, = FakeCore.instances
+        self.assertEqual(len(core.calls), 1)
+        self.assertEqual(report['shared_metadata_count'], 4)
+        ids = {row['persistent_id']: int(row['temporary_genius_id'], 16) for row in report['temporary_id_mapping']}
+        self.assertEqual(core.calls, [ids[f'{1:016X}']])
+        self.assertEqual(parse_similarities(core.similarities[ids[f'{2:016X}']])[1], [ids[f'{3:016X}']])
+        self.assertEqual(len(report['relation_rows']), 3)
+        result, = report['root_results']
+        self.assertEqual(result['root_pid'], f'{1:016X}')
+        self.assertEqual([track['observed_relation_hops'] for track in result['playlist']], [0, 1, 2, None])
+        self.assertEqual(report['root_overlaps'], [])
+
+    def test_root_subset_overlaps_only_generated_roots(self):
+        report = evaluate_graphs([self.graph(1, [3]), self.graph(2, [3]), self.graph(4, [3])],
+                                 self.matcher, config(), 'unused', core_factory=FakeCore,
+                                 root_pids=[f'{4:016X}', f'{1:016X}'])
+        self.assertEqual([row['root_pid'] for row in report['root_results']], [f'{1:016X}', f'{4:016X}'])
+        self.assertEqual(len(FakeCore.instances[0].calls), 2)
+        self.assertEqual(len(report['root_overlaps']), 1)
+        self.assertEqual(report['root_overlaps'][0]['left_root_pid'], f'{1:016X}')
+        self.assertEqual(report['root_overlaps'][0]['right_root_pid'], f'{4:016X}')
+
+    def test_invalid_root_subsets_rejected_before_core_creation(self):
+        for subset in ([], '0000000000000001', {f'{1:016X}'}, [True], [None], [''],
+                       [f'{1:016X}', f'{1:016X}'], [f'{2:016X}']):
+            with self.subTest(subset=subset), self.assertRaises(ValueError):
+                evaluate_graphs([self.graph(1, [3])], self.matcher, config(), 'unused',
+                                core_factory=FakeCore, root_pids=subset)
+        self.assertEqual(FakeCore.instances, [])
+
     def test_generated_provenance_distinguishes_direct_indirect_and_unreachable(self):
         class ExpandedCore(FakeCore):
             def generate(self, root, limit):
