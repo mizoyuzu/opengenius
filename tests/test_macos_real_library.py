@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from probe_macos_real_library import (CORE, location_writable, parse_links, parse_playback, parse_playlists,
-                                    parse_selected_query, playback_script, probe, relink_script, selected_query_script, validate_inputs)
+                                    parse_selected_query, playback_script, probe, relink_script, selected_query_script, validate_inputs, validate_recommendation_plans, ordinary_playlist_creation_script, ordinary_playlist_query_script, parse_ordinary_playlists)
 
 P1, P2 = '0000000000000001', '0000000000000002'
 SDEF = '<dictionary><suite><class name="file track"><property name="location"/></class></suite></dictionary>'
@@ -101,6 +101,91 @@ class NativeRealTests(unittest.TestCase):
         for bad in (text.replace('\t200', '\tnan'), text.replace('GENIUS_COUNT\t1', 'GENIUS_COUNT\t33'), text.replace(f'GENIUS_TRACK\t{P2}\t{P1}', f'GENIUS_TRACK\t{P2}\tFFFFFFFFFFFFFFFF')):
             with self.assertRaises(ValueError):
                 parse_playlists(bad, {P1})
+
+    def test_ordinary_plan_is_explicit_bounded_and_uses_selected_unique_pids(self):
+        good = [{'name': '推薦・曲', 'persistent_ids': [P2, P1]}]
+        self.assertEqual(validate_recommendation_plans(good, {P1, P2}), good)
+        for bad in ([], [{'name': 'bad\nname', 'persistent_ids': [P1]}], [{'name': 'Plan', 'persistent_ids': [P1, P1]}], [{'name': 'Plan', 'persistent_ids': ['FFFFFFFFFFFFFFFF']}], [{'name': 'Plan', 'persistent_ids': [P1]}, {'name': 'PLAN', 'persistent_ids': [P2]}], good * 9):
+            with self.assertRaises(ValueError):
+                validate_recommendation_plans(bad, {P1, P2})
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'input'
+            manifest = create_input(source)
+            manifest['recommendation_playlists'] = good
+            (source / 'manifest.json').write_text(json.dumps(manifest))
+            self.assertEqual(validate_inputs(source)[0]['recommendation_playlists'], good)
+        script = ordinary_playlist_creation_script(good)
+        self.assertIn('make new user playlist', script)
+        self.assertLess(script.index('Recommendation PID not uniquely loaded'), script.index('make new user playlist'))
+        self.assertNotIn('set genius of', script)
+        self.assertNotIn('Turn On', script)
+        self.assertNotIn('delete ', script)
+
+    def test_ordinary_verification_detects_wrong_order_name_and_genius_flag(self):
+        plan = [{'name': '推薦・曲', 'persistent_ids': [P2, P1]}]
+        pid = 'ABCDEF0000000001'
+        native = f'ORDINARY_COUNT\t1\nORDINARY_PLAYLIST\t1\t{pid}\t推薦・曲\tfalse\nORDINARY_TRACK\t1\t{P2}\nORDINARY_TRACK\t1\t{P1}\n'
+        good = parse_ordinary_playlists(native, plan)
+        self.assertTrue(good[0]['ordinary_playlist_verified'])
+        query = ordinary_playlist_query_script(good)
+        self.assertIn(f'whose persistent ID is "{pid}"', query)
+        for changed in (native.replace('\tfalse', '\ttrue'), native.replace('推薦・曲', 'Different'), native.replace(f'ORDINARY_TRACK\t1\t{P2}\nORDINARY_TRACK\t1\t{P1}', f'ORDINARY_TRACK\t1\t{P1}\nORDINARY_TRACK\t1\t{P2}')):
+            self.assertFalse(parse_ordinary_playlists(changed, plan)[0]['ordinary_playlist_verified'])
+        for bad in (native.replace('ORDINARY_COUNT\t1', 'ORDINARY_COUNT\t2'), native.replace('\tfalse', '\tunknown'), native + 'garbage\n'):
+            with self.assertRaises(ValueError):
+                parse_ordinary_playlists(bad, plan)
+
+    def test_ordinary_plan_creation_quit_reopen_and_order_persistence(self):
+        class Process:
+            returncode = 0
+            def communicate(self, timeout):
+                return NATIVE, ''
+            def poll(self):
+                return 0
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / 'input'
+            manifest = create_input(source)
+            manifest['recommendation_playlists'] = [{'name': '推薦・曲', 'persistent_ids': [P2, P1]}]
+            (source / 'manifest.json').write_text(json.dumps(manifest))
+            playlist_pid = 'ABCDEF0000000001'
+            ordinary = f'ORDINARY_COUNT\t1\nORDINARY_PLAYLIST\t1\t{playlist_pid}\t推薦・曲\tfalse\nORDINARY_TRACK\t1\t{P2}\nORDINARY_TRACK\t1\t{P1}\n'
+            commands = []
+            def runner(command, **kwargs):
+                commands.append(command)
+                stdout = ''
+                if command[0] == 'osascript':
+                    script = command[-1]
+                    if 'ORDINARY_COUNT' in script:
+                        stdout = ordinary
+                    elif 'set location of t' in script:
+                        stdout = f'LINK\t{P1}\tOK\t{source}/media/one.m4a\nLINK\t{P2}\tOK\t{source}/media/two.m4a\n'
+                    elif 'set geniusLists' in script:
+                        stdout = 'GENIUS_COUNT\t0\n'
+                    elif 'PLAYBACK' in script:
+                        stdout = f'PLAYBACK\t{P1}\tplaying\t2\t{P1}\tplaying\t4'
+                    elif 'geniusItem' in script:
+                        stdout = 'DISABLED\n'
+                return subprocess.CompletedProcess(command, 1 if command[0] == 'pgrep' else 0, stdout, '')
+            original_read = Path.read_text
+            def fake_read(path, *args, **kwargs):
+                return SDEF if str(path).endswith('com.apple.Music.sdef') else original_read(path, *args, **kwargs)
+            def fake_is_file(path):
+                return str(path).endswith('com.apple.Music.sdef') or Path.exists(path) and not Path.is_dir(path)
+            with patch('probe_macos_real_library.platform.system', return_value='Darwin'), patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch('probe_macos_real_library.dismiss_music_promotion', return_value={'status': 'not_needed'}), patch.object(Path, 'read_text', fake_read), patch.object(Path, 'is_file', fake_is_file):
+                result = probe(source, base / 'out', home=base / 'home', runner=runner, popen=lambda *a, **kw: Process())
+            feature = result['ordinary_recommendation_playlists']
+            self.assertEqual(feature['status'], 'persisted_and_verified')
+            self.assertTrue(feature['music_exited_before_reopen'])
+            self.assertTrue(feature['reopen_membership_order_verified'])
+            self.assertEqual(feature['reopened'][0]['persistent_ids'], [P2, P1])
+            self.assertFalse(feature['reopened'][0]['genius'])
+            self.assertTrue(result['music_exited'])
+            self.assertFalse(result['actual_genius_generation_tested'])
+            self.assertEqual(len([c for c in commands if c[0] == 'open']), 2)
+            self.assertEqual({p.name for p in (base / 'out/after-creation').iterdir()}, set(CORE))
+            self.assertEqual(result['genius_playlists_after_ordinary_creation'], [])
+            self.assertEqual(result['genius_playlists_after_reopen'], [])
 
     def test_non_macos_and_existing_library_create_no_output(self):
         with tempfile.TemporaryDirectory() as directory:
