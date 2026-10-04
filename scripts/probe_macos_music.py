@@ -58,7 +58,7 @@ def apple_string(value):
 
 
 def import_script(paths):
-    lines = ['with timeout of 55 seconds', 'tell application "Music"']
+    lines = ['with timeout of 85 seconds', 'tell application "Music"']
     for index, path in enumerate(paths, 1):
         lines.extend([
             f'set importedTracks to add (POSIX file {apple_string(path)})',
@@ -74,27 +74,35 @@ def import_script(paths):
 
 def bootstrap_script():
     """Click only the observed Music automation prompt and welcome button."""
-    return '''with timeout of 22 seconds
+    return '''
 set observedButtons to {}
 set actionsTaken to {}
 set startedAt to current date
 tell application "System Events"
 repeat 36 times
     if ((current date) - startedAt) >= 20 then exit repeat
-    repeat with appProcess in application processes
+    repeat with candidateProcess in {"Music", "SecurityAgent", "UserNotificationCenter", "CoreServicesUIAgent", "NotificationCenter", "hosted-compute-agent", "osascript"}
+        if ((current date) - startedAt) >= 20 then exit repeat
         try
-            set processName to name of appProcess
-            set processWindows to windows of appProcess
+            with timeout of 2 seconds
+            set processName to candidateProcess as text
+            set processWindows to windows of process processName
             repeat with w in processWindows
+                if ((current date) - startedAt) >= 20 then exit repeat
                 set dialogText to ""
+                try
+                    set dialogText to name of w as text
+                end try
                 set uiItems to entire contents of w
                 repeat with uiItem in uiItems
+                    if ((current date) - startedAt) >= 20 then exit repeat
                     try
                         if class of uiItem is static text then set dialogText to dialogText & " " & (value of uiItem as text)
                     end try
                 end repeat
                 set matchingPermission to (dialogText contains "hosted-compute-agent") and (dialogText contains "Music")
                 repeat with uiItem in uiItems
+                    if ((current date) - startedAt) >= 20 then exit repeat
                     try
                         if class of uiItem is button then
                             set buttonName to name of uiItem as text
@@ -106,39 +114,43 @@ repeat 36 times
                             else if processName is "Music" and buttonName is "Start Listening" then
                                 click uiItem
                                 set end of actionsTaken to "dismissed Music welcome"
+                            else if processName is "Music" and dialogText contains "Hear About New Music First" and buttonName is "Not Now" then
+                                click uiItem
+                                set end of actionsTaken to "dismissed Music promotion"
                             end if
                         end if
                     end try
                 end repeat
             end repeat
+            end timeout
         end try
     end repeat
     delay 0.5
 end repeat
 end tell
-return {actionsTaken, observedButtons}
-end timeout'''
+return {actionsTaken, observedButtons}'''
 
 
-def bootstrap_music(runner=subprocess.run, popen=subprocess.Popen):
-    """Trigger Music automation concurrently so the permission UI can appear."""
-    trigger_command = ['osascript', '-e', 'with timeout of 30 seconds\ntell application "Music" to return version\nend timeout']
+def bootstrap_music(paths, runner=subprocess.run, popen=subprocess.Popen):
+    """Run the actual import once, handling prompts while its AppleEvents wait."""
+    trigger_command = ['osascript', '-e', import_script(paths)]
+    started = time.monotonic()
     results = {}
     try:
         process = popen(trigger_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except OSError as error:
-        return {'automation_trigger': {'status': 'unavailable', 'error_type': type(error).__name__}}
+        return {'import_synthetic_audio': {'status': 'unavailable', 'error_type': type(error).__name__}}
     try:
-        results['bootstrap_ui'] = run_step(['osascript', '-e', bootstrap_script()], 25, runner)
+        results['bootstrap_ui'] = run_step(['osascript', '-e', bootstrap_script()], 30, runner)
         try:
-            stdout, stderr = process.communicate(timeout=5)
-            results['automation_trigger'] = {'status': 'ok' if process.returncode == 0 else 'failed',
+            stdout, stderr = process.communicate(timeout=max(1, 90 - (time.monotonic() - started)))
+            results['import_synthetic_audio'] = {'status': 'ok' if process.returncode == 0 else 'failed',
                                               'returncode': process.returncode,
                                               'stdout': (stdout or '')[:12000], 'stderr': (stderr or '')[:12000]}
         except subprocess.TimeoutExpired:
             process.kill()
             process.communicate(timeout=5)
-            results['automation_trigger'] = {'status': 'timeout'}
+            results['import_synthetic_audio'] = {'status': 'timeout'}
     finally:
         if process.poll() is None:
             process.kill()
@@ -211,8 +223,7 @@ def probe(output, *, runner=subprocess.run, popen=subprocess.Popen, home=None):
             for path, frequency in zip(tones, (440, 660)):
                 make_tone(path, frequency)
             step('launch_music', ['open', '-a', str(app)])
-            steps.update(bootstrap_music(runner, popen))
-            step('import_synthetic_audio', ['osascript', '-e', import_script(tones)], 60)
+            steps.update(bootstrap_music(tones, runner, popen))
             report['import_status'] = steps['import_synthetic_audio']['status']
             # Ask Music to quit so copied DBs are more likely to be flushed.
             step('music_windows', ['osascript', '-e', 'with timeout of 10 seconds\ntell application "System Events"\nreturn {UI elements enabled, count of windows of process "Music"}\nend tell\nend timeout'], 15)

@@ -31,6 +31,23 @@ jobs:
         run: python3 -m unittest discover -s tests -p test_macos_music_probe.py
       - name: Inspect Music with synthetic audio
         run: python3 scripts/probe_macos_music.py --output data/macos-probe
+      - name: Summarize diagnostic results
+        if: always()
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          path = Path('data/macos-probe/report.json')
+          if path.exists():
+              report = json.loads(path.read_text())
+              lines = ['## Music diagnostic', '',
+                       'Diagnostic completion does not confirm Genius compatibility.', '',
+                       '| Operation | Result |', '|---|---|']
+              lines += [f"| {name} | {step['status']} |" for name, step in report['steps'].items()]
+              lines += ['', f"Synthetic import: **{report.get('import_status', 'unknown')}**"]
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write('\n'.join(lines) + '\n')
+          PYTHON
       - name: Collect report, screenshots and synthetic library
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

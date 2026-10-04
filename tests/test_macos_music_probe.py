@@ -16,7 +16,7 @@ class FinishedProcess:
     returncode = 0
 
     def communicate(self, timeout):
-        return ('1.6.6', '')
+        return ('synthetic import complete, 2', '')
 
     def poll(self):
         return self.returncode
@@ -47,7 +47,7 @@ class MacOSProbeTests(unittest.TestCase):
         script = import_script([Path('/tmp/a"b\\c.wav')])
         self.assertIn('a\\"b\\\\c.wav', script)
         self.assertIn('Synthetic Tone 1', script)
-        self.assertIn('with timeout of 55 seconds', script)
+        self.assertIn('with timeout of 85 seconds', script)
         self.assertIn('count of tracks of library playlist 1', script)
 
     def test_only_new_library_databases_copied(self):
@@ -115,10 +115,13 @@ class MacOSProbeTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 1, '', 'UI permission unavailable')
                 if command[0] == 'osascript' and 'to quit' in command[-1]:
                     (home / 'Music/Music/Music Library.musiclibrary/Library.musicdb').write_bytes(b'flushed db')
-                self.assertLessEqual(kwargs['timeout'], 60)
+                self.assertLessEqual(kwargs['timeout'], 90)
                 return subprocess.CompletedProcess(command, 0, '', '')
+            def popen(command, **kwargs):
+                runner(command, timeout=90)
+                return FinishedProcess()
             with patch('probe_macos_music.platform.system', return_value='Darwin'), patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}):
-                result = probe(home / 'output', runner=runner, popen=lambda *a, **kw: FinishedProcess(), home=home)
+                result = probe(home / 'output', runner=runner, popen=popen, home=home)
             self.assertEqual(result['import_status'], 'ok')
             self.assertEqual(result['probe_network_requests'], 0)
             self.assertFalse(result['music_app_network_activity_observed'])
@@ -129,6 +132,7 @@ class MacOSProbeTests(unittest.TestCase):
             self.assertEqual(copied_db.read_bytes(), b'flushed db')
             self.assertEqual(len(list((home / 'output/synthetic-media').glob('*.wav'))), 2)
             self.assertTrue(any(command[0] == 'screencapture' for command in commands))
+            self.assertEqual(sum(command[0] == 'osascript' and 'importedTracks' in command[-1] for command in commands), 1)
 
     def test_bootstrap_permission_whitelist_and_bounded_loop(self):
         script = bootstrap_script()
@@ -137,21 +141,24 @@ class MacOSProbeTests(unittest.TestCase):
         self.assertIn('processName is "Music" and buttonName is "Start Listening"', script)
         self.assertIn('>= 20 then exit repeat', script)
         self.assertIn('(count of observedButtons) < 30', script)
+        self.assertIn('dialogText contains "Hear About New Music First" and buttonName is "Not Now"', script)
+        self.assertIn('with timeout of 2 seconds', script)
+        self.assertNotIn('in application processes', script)
 
     def test_bootstrap_trigger_is_running_during_ui_probe(self):
         events = []
         def popen(command, **kwargs):
-            self.assertIn('tell application "Music" to return version', command[-1])
+            self.assertIn('set importedTracks to add', command[-1])
             events.append('trigger')
             return FinishedProcess()
         def runner(command, **kwargs):
             self.assertEqual(events, ['trigger'])
-            self.assertEqual(kwargs['timeout'], 25)
+            self.assertEqual(kwargs['timeout'], 30)
             events.append('ui')
             return subprocess.CompletedProcess(command, 1, '', 'permission unavailable')
-        result = bootstrap_music(runner, popen)
+        result = bootstrap_music([Path('/tmp/tone.wav')], runner, popen)
         self.assertEqual(result['bootstrap_ui']['status'], 'failed')
-        self.assertEqual(result['automation_trigger']['status'], 'ok')
+        self.assertEqual(result['import_synthetic_audio']['status'], 'ok')
 
     def test_bootstrap_kills_blocked_trigger(self):
         class BlockedProcess(FinishedProcess):
@@ -167,9 +174,9 @@ class MacOSProbeTests(unittest.TestCase):
                 self.killed = True
                 self.returncode = -9
         process = BlockedProcess()
-        result = bootstrap_music(lambda command, **kwargs: subprocess.CompletedProcess(command, 0, '', ''), lambda *a, **kw: process)
+        result = bootstrap_music([Path('/tmp/tone.wav')], lambda command, **kwargs: subprocess.CompletedProcess(command, 0, '', ''), lambda *a, **kw: process)
         self.assertTrue(process.killed)
-        self.assertEqual(result['automation_trigger']['status'], 'timeout')
+        self.assertEqual(result['import_synthetic_audio']['status'], 'timeout')
 
 
 if __name__ == '__main__':
