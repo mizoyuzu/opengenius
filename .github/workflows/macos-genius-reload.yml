@@ -4,9 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       fixture:
-        description: Compressed synthetic two-tone fixture
-        required: true
+        description: Compressed small synthetic fixture
+        required: false
         type: string
+
+      fixture_file:
+        description: Larger synthetic fixture stored in the probe branch
+        type: choice
+        default: none
+        options:
+          - none
+          - synthetic-128.json.gz
 
       explicit_library:
         description: Open the restored bundle explicitly
@@ -34,13 +42,21 @@ jobs:
       - name: Decode synthetic fixture
         env:
           FIXTURE_PAYLOAD: ${{ inputs.fixture }}
+          FIXTURE_FILE: ${{ inputs.fixture_file }}
         run: |
           python3 - <<'PYTHON'
           import json, os, sys
           from pathlib import Path
           sys.path.insert(0, 'scripts')
-          from probe_macos_genius_reload import decode_fixture_payload
-          fixture = decode_fixture_payload(os.environ['FIXTURE_PAYLOAD'])
+          from probe_macos_genius_reload import decode_fixture_payload, decode_fixture_gzip
+          payload = os.environ['FIXTURE_PAYLOAD']
+          filename = os.environ['FIXTURE_FILE']
+          if payload and filename in ('', 'none'):
+              fixture = decode_fixture_payload(payload)
+          elif not payload and filename == 'synthetic-128.json.gz':
+              fixture = decode_fixture_gzip((Path('fixtures/macos') / filename).read_bytes())
+          else:
+              raise ValueError('Choose exactly one known synthetic fixture source')
           Path('data').mkdir(exist_ok=True)
           Path('data/reload-fixture.json').write_text(json.dumps(fixture))
           PYTHON

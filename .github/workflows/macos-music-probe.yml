@@ -10,6 +10,10 @@ on:
         options:
           - macos-26
           - macos-26-intel
+      track_count:
+        description: Number of synthetic tracks, 2 to 128
+        type: string
+        default: '2'
   push:
     branches:
       - macos-probe
@@ -27,10 +31,21 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - name: Test probe helpers
         run: python3 -m unittest discover -s tests -p test_macos_music_probe.py
       - name: Inspect Music with synthetic audio
-        run: python3 scripts/probe_macos_music.py --output data/macos-probe
+        env:
+          TRACK_COUNT: ${{ inputs.track_count || '2' }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, subprocess, sys
+          sys.path.insert(0, 'scripts')
+          from probe_macos_music import validate_track_count
+          track_count = validate_track_count(int(os.environ['TRACK_COUNT']))
+          subprocess.run([sys.executable, 'scripts/probe_macos_music.py', '--output', 'data/macos-probe', '--track-count', str(track_count)], check=True)
+          PYTHON
       - name: Summarize diagnostic results
         if: always()
         run: |
@@ -44,7 +59,7 @@ jobs:
                        'Diagnostic completion does not confirm Genius compatibility.', '',
                        '| Operation | Result |', '|---|---|']
               lines += [f"| {name} | {step['status']} |" for name, step in report['steps'].items()]
-              lines += ['', f"Synthetic import: **{report.get('import_status', 'unknown')}**"]
+              lines += ['', f"Synthetic tracks: **{report.get('track_count', 2)}**", f"Synthetic import: **{report.get('import_status', 'unknown')}**"]
               with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
                   summary.write('\n'.join(lines) + '\n')
           PYTHON

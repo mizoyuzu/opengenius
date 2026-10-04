@@ -1,4 +1,4 @@
-"""Prepare a two-tone fixture for native Music reload, never a personal Library."""
+"""Prepare a bounded synthetic-tone fixture for native Music reload, never a personal Library."""
 import argparse
 import base64
 import gzip
@@ -22,9 +22,9 @@ def prepare(bundle, executable):
     source = files['Library.musicdb']
     expanded = decode_musicdb(source)
     tracks, _ = parse_tracks(expanded)
-    if (len(tracks) != 2 or {t.get('title') for t in tracks} != {'synthetic-tone-1', 'synthetic-tone-2'}
+    if (not 2 <= len(tracks) <= 128 or {t.get('title') for t in tracks} != {f'synthetic-tone-{i}' for i in range(1,len(tracks)+1)}
             or any(t.get('duration_ms') != 3000 or t.get('genius_id') != '0000000000000000' for t in tracks)):
-        raise ValueError('Only the verified two-tone zero-ID Library is supported')
+        raise ValueError('Only a 2..128 sequential synthetic-tone zero-ID Library is supported')
     if encode_library(expanded, source) != source:
         raise ValueError('Source Library encoding is not reproducible')
     assignments = [{'persistent_id': t['persistent_id'], 'genius_id': f'{0x70000001+i:016X}'}
@@ -37,7 +37,8 @@ def prepare(bundle, executable):
     # Test-only relation graph: two generated tones link to each other.
     identifiers = [int(a['genius_id'], 16) for a in assignments]
     metadata = {gid: struct.pack('<4Q', 0, 1, 1, index + 1) for index, gid in enumerate(identifiers)}
-    relations = {gid: pack_similarities(0, [other for other in identifiers if other != gid]) for gid in identifiers}
+    relations = {gid: pack_similarities(0, [identifiers[(i + step) % len(identifiers)]
+                  for step in range(1, min(32, len(identifiers)-1) + 1)]) for i, gid in enumerate(identifiers)}
     config = pack_config({'version': 2, 'filters': [{'type': 1, 'parameters': [20, 50, 10, 10]}],
                           'flags': 0, 'result_words': [1, 25]})
     with sqlite3.connect(':memory:') as c:
@@ -62,8 +63,10 @@ def prepare(bundle, executable):
             raise ValueError('Encrypted fixture did not preserve rows')
     files['Genius.itdb'] = encrypted
     native = MusicCore(executable, config, metadata, relations).generate(identifiers[0], 25)
-    if {int(g, 16) for g in native['result_genius_ids']} != set(identifiers):
-        raise ValueError('Music core did not select the two-tone relation fixture')
+    selected = [int(g, 16) for g in native['result_genius_ids']]
+    if not (2 <= len(selected) <= min(25, len(identifiers)) and len(set(selected)) == len(selected)
+            and identifiers[0] in selected and set(selected) <= set(identifiers)):
+        raise ValueError('Music core did not select valid synthetic fixture relations')
     expected_tracks = [{**t, 'genius_id': next(a['genius_id'] for a in assignments if a['persistent_id'] == t['persistent_id'])}
                        for t in tracks]
     fixture = {'schema_version': 1, 'fixture_kind': 'synthetic-tone-only', 'app_template_version': '1.6.6',
@@ -74,7 +77,8 @@ def prepare(bundle, executable):
               'fixture_file_sha256': {name: row['sha256'] for name, row in fixture['files'].items()},
               'table_counts': counts, 'encryption_roundtrip_verified': True,
               'emulated_selection_genius_ids': native['result_genius_ids'],
-              'relation_source': 'Deliberate two-tone fixture, not observed music recommendations',
+              'track_count': len(tracks), 'relation_edges': sum(min(32,len(identifiers)-1) for _ in identifiers),
+              'relation_source': 'Deliberate bounded ring graph, not observed music recommendations',
               'music_app_acceptance_verified': False, 'ipod_acceptance_verified': False}
     return fixture, report
 
@@ -90,10 +94,12 @@ def main():
         parser.error('Output must be new and separate from inputs')
     fixture, report = prepare(args.bundle, args.executable)
     payload = base64.b64encode(gzip.compress(json.dumps(fixture, ensure_ascii=False).encode(), mtime=0)).decode()
-    if len(payload) > 60000:
-        raise ValueError('Fixture exceeds dispatch payload budget')
     output.mkdir(parents=True)
-    for name, doc in [('fixture.json', fixture), ('report.json', report), ('dispatch.json', {'fixture': payload})]:
+    (output / 'fixture.json.gz').write_bytes(gzip.compress(json.dumps(fixture, ensure_ascii=False).encode(),mtime=0))
+    documents = [('fixture.json', fixture), ('report.json', report)]
+    if len(payload) <= 60000:
+        documents.append(('dispatch.json', {'fixture': payload}))
+    for name, doc in documents:
         (output / name).write_text(json.dumps(doc, ensure_ascii=False, indent=2) + '\n')
     print(json.dumps({'output': str(output), 'payload_characters': len(payload), 'table_counts': report['table_counts']}))
 
