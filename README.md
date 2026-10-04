@@ -108,3 +108,17 @@ artifactアクションを公式v6の固定SHAへ更新し、実操作の成否�
 現在の結論: VNCなしでMusicの起動・初回操作許可・2曲取り込み・DB回収が可能。
 Genius DBはまだ関係を持たない空DBで、推薦生成や互換DBの受理は未検証。
 次はこの新規Libraryに2曲の関係とID対応を与えて再読み込みを調べる。
+
+## 合成Genius DBの再読み込み結果
+
+[run 37190774520](https://github.com/mizoyuzu/opengenius/actions/runs/37190774520)で、
+2つの人工音源にGenius IDを割り当て、相互関係を入れたDBをMusic1.6.6へ読み込ませた。
+bundleを明示して開くと2曲のPID・曲名・長さが一致し、正常終了後も割り当てIDと
+Genius全テーブルが保持された。既存ライブラリやアカウントは持ち込んでいない。
+
+Genius Playlistメニューは無効だったため、アプリでの生成やiPod動作はまだ未検証。
+候補の有効化byteだけを変えた別の合成試験では曲とDBが空になった。
+この単純な変更は採用せず、保存データとGenius有効化状態を区別して調べる。
+
+初回案内はVision OCRで既知タイトルとNot Nowを特定し、CoreGraphicsの実マウスイベントで
+閉じる。新規合成bundleだけを回収し、Music終了確認を別項目で記録する。
