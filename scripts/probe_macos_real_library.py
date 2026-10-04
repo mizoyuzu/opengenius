@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 
 from probe_macos_music import apple_string, bootstrap_script, dismiss_music_promotion, library_roots
@@ -31,7 +32,8 @@ def validate_inputs(directory):
     if manifest_path.stat().st_size > 1024 * 1024:
         raise ValueError('manifest exceeds limit')
     manifest = json.loads(manifest_path.read_text())
-    if not isinstance(manifest, dict) or set(manifest) != {'schema_version', 'expected_library_track_count', 'tracks', 'seeds'}:
+    required = {'schema_version', 'expected_library_track_count', 'tracks', 'seeds'}
+    if not isinstance(manifest, dict) or not required <= set(manifest) or set(manifest) - required - {'recommendation_playlists'}:
         raise ValueError('unsupported real Library manifest')
     if type(manifest['schema_version']) is not int or manifest['schema_version'] != 1:
         raise ValueError('unsupported manifest version')
@@ -73,6 +75,8 @@ def validate_inputs(directory):
     seeds = manifest['seeds']
     if not isinstance(seeds, list) or not 1 <= len(seeds) <= 8 or any(not isinstance(p, str) or p not in seen for p in seeds) or len(set(seeds)) != len(seeds):
         raise ValueError('seeds must refer to unique selected media PIDs')
+    if 'recommendation_playlists' in manifest:
+        validate_recommendation_plans(manifest['recommendation_playlists'], seen)
     bundle = directory / 'Music Library.musiclibrary'
     if not bundle.is_dir() or bundle.is_symlink():
         raise ValueError('missing real Library bundle')
@@ -81,6 +85,105 @@ def validate_inputs(directory):
             raise ValueError('missing core Library file')
     inventory_bundle(bundle)
     return manifest, bundle, media_paths
+
+
+def validate_recommendation_plans(plans, known_pids):
+    if not isinstance(plans, list) or not 1 <= len(plans) <= 8:
+        raise ValueError('recommendation plans must contain 1 to 8 playlists')
+    names = set()
+    for plan in plans:
+        if not isinstance(plan, dict) or set(plan) != {'name', 'persistent_ids'}:
+            raise ValueError('unsupported recommendation playlist plan')
+        name = plan['name']
+        if not isinstance(name, str) or not name.strip() or len(name) > 256 or any(c in name for c in '\t\r\n\x00'):
+            raise ValueError('invalid recommendation playlist name')
+        key = unicodedata.normalize('NFC', name).casefold()
+        if key in names:
+            raise ValueError('duplicate recommendation playlist name')
+        names.add(key)
+        pids = plan['persistent_ids']
+        if (not isinstance(pids, list) or not 1 <= len(pids) <= 100
+                or any(not isinstance(p, str) or not PID.fullmatch(p) or p not in known_pids for p in pids)
+                or len(set(pids)) != len(pids)):
+            raise ValueError('recommendation playlist needs unique selected media PIDs')
+    return plans
+
+
+def ordinary_playlist_creation_script(plans):
+    """Create ordinary playlists only after all names and selected PIDs pass checks."""
+    lines = ['with timeout of 100 seconds', 'tell application "Music"']
+    for plan in plans:
+        lines += [f'if (count of (every user playlist whose name is {apple_string(plan["name"])})) is not 0 then error "Recommendation playlist name already exists" number -2701']
+        for pid in plan['persistent_ids']:
+            lines += [f'if (count of (every track of library playlist 1 whose persistent ID is "{pid}")) is not 1 then error "Recommendation PID not uniquely loaded" number -2702']
+    lines += [f'set outputText to "ORDINARY_COUNT" & tab & {len(plans)} & linefeed']
+    for index, plan in enumerate(plans, 1):
+        lines += [f'set createdPlaylist to make new user playlist with properties {{name:{apple_string(plan["name"])}}}']
+        for pid in plan['persistent_ids']:
+            lines += [f'set selectedTrack to item 1 of (every track of library playlist 1 whose persistent ID is "{pid}")', 'duplicate selectedTrack to createdPlaylist']
+        lines += ['set playlistPID to (get persistent ID of createdPlaylist)',
+                  'set playlistName to (get name of createdPlaylist)', 'set geniusValue to (get genius of createdPlaylist)',
+                  f'set outputText to outputText & "ORDINARY_PLAYLIST" & tab & {index} & tab & playlistPID & tab & playlistName & tab & (geniusValue as text) & linefeed',
+                  'repeat with t in tracks of createdPlaylist', 'set trackPID to (get persistent ID of t)',
+                  f'set outputText to outputText & "ORDINARY_TRACK" & tab & {index} & tab & trackPID & linefeed', 'end repeat']
+    return '\n'.join(lines + ['end tell', 'return outputText', 'end timeout'])
+
+
+def ordinary_playlist_query_script(created):
+    lines = ['with timeout of 60 seconds', 'tell application "Music"',
+             f'set outputText to "ORDINARY_COUNT" & tab & {len(created)} & linefeed']
+    for index, playlist in enumerate(created, 1):
+        pid = playlist['playlist_pid']
+        if not isinstance(pid, str) or not PID.fullmatch(pid):
+            raise ValueError('invalid created playlist PID')
+        lines += [f'set selectedLists to every user playlist whose persistent ID is "{pid}"',
+                  'if (count of selectedLists) is not 1 then error "Created recommendation playlist missing" number -2703',
+                  'set p to item 1 of selectedLists', 'set playlistPID to (get persistent ID of p)',
+                  'set playlistName to (get name of p)', 'set geniusValue to (get genius of p)',
+                  f'set outputText to outputText & "ORDINARY_PLAYLIST" & tab & {index} & tab & playlistPID & tab & playlistName & tab & (geniusValue as text) & linefeed',
+                  'repeat with t in tracks of p', 'set trackPID to (get persistent ID of t)',
+                  f'set outputText to outputText & "ORDINARY_TRACK" & tab & {index} & tab & trackPID & linefeed', 'end repeat']
+    return '\n'.join(lines + ['end tell', 'return outputText', 'end timeout'])
+
+
+def parse_ordinary_playlists(stdout, plans):
+    lines = stdout.strip().splitlines()
+    header = lines[0].split('\t') if lines else []
+    if header != ['ORDINARY_COUNT', str(len(plans))]:
+        raise ValueError('ordinary playlist count differs from plan')
+    playlists, seen = [], set()
+    for line in lines[1:]:
+        fields = line.split('\t')
+        if len(fields) == 5 and fields[0] == 'ORDINARY_PLAYLIST':
+            index = len(playlists) + 1
+            if fields[1] != str(index) or index > len(plans) or not PID.fullmatch(fields[2]) or fields[2] in seen or fields[4] not in ('true', 'false'):
+                raise ValueError('invalid ordinary playlist identity or flag')
+            seen.add(fields[2])
+            playlists.append({'playlist_pid': fields[2], 'name': fields[3], 'genius': fields[4] == 'true', 'persistent_ids': []})
+        elif len(fields) == 3 and fields[0] == 'ORDINARY_TRACK' and playlists and fields[1] == str(len(playlists)):
+            if not PID.fullmatch(fields[2]) or len(playlists[-1]['persistent_ids']) >= 100:
+                raise ValueError('invalid ordinary playlist track')
+            playlists[-1]['persistent_ids'].append(fields[2])
+        else:
+            raise ValueError('invalid ordinary playlist native response')
+    if len(playlists) != len(plans):
+        raise ValueError('ordinary playlists incomplete')
+    for playlist, plan in zip(playlists, plans):
+        playlist['name_matches_plan'] = playlist['name'] == plan['name']
+        playlist['membership_and_order_match_plan'] = playlist['persistent_ids'] == plan['persistent_ids']
+        playlist['ordinary_playlist_verified'] = (not playlist['genius'] and playlist['name_matches_plan'] and playlist['membership_and_order_match_plan'])
+    return playlists
+
+
+def wait_music_exit(runner=subprocess.run):
+    for _ in range(40):
+        check = private_step(['pgrep', '-x', 'Music'], 5, runner)
+        if check.get('returncode') == 1:
+            return True
+        if check.get('returncode') not in (0, 1):
+            return False
+        time.sleep(.5)
+    return False
 
 
 def inventory_bundle(bundle):
@@ -411,6 +514,47 @@ def probe(input_directory, output, *, runner=subprocess.run, popen=subprocess.Po
                     existing.update(p['playlist_pid'] for p in playlists or [])
                 step(f'screenshot_seed_{index}', ['screencapture', '-x', str(output / f'music-seed-{index}.png')], 15)
                 report['seed_results'].append(seed)
+            if 'recommendation_playlists' in manifest:
+                plans = manifest['recommendation_playlists']
+                ordinary = {'requested_plans': plans, 'status': 'creating', 'creation_verified': False,
+                            'reopen_membership_order_verified': False}
+                report['ordinary_recommendation_playlists'] = ordinary
+                created = parsed_step('create_ordinary_recommendation_playlists',
+                                      ['osascript', '-e', ordinary_playlist_creation_script(plans)],
+                                      lambda text: parse_ordinary_playlists(text, plans), 110)
+                ordinary['creation'] = created
+                ordinary['creation_verified'] = created is not None and all(p['ordinary_playlist_verified'] for p in created)
+                if created is None:
+                    ordinary['status'] = 'creation_not_verified'
+                else:
+                    report['genius_playlists_after_ordinary_creation'] = parsed_step(
+                        'genius_playlists_after_ordinary_creation', ['osascript', '-e', playlists_script()],
+                        lambda text: parse_playlists(text, known_pids), 70)
+                    step('quit_for_ordinary_persistence_check', ['osascript', '-e', 'with timeout of 15 seconds\ntell application "Music" to quit\nend timeout'], 20)
+                    ordinary['music_exited_before_reopen'] = wait_music_exit(runner)
+                    if not ordinary['music_exited_before_reopen']:
+                        ordinary['status'] = 'quit_before_reopen_not_verified'
+                    else:
+                        launched = False
+                        try:
+                            report['after_creation_files'] = snapshot_bundle(bundle, output / 'after-creation')
+                        except (ValueError, OSError):
+                            report['after_creation_copy_status'] = 'failed_or_exceeded_limit'
+                        step('reopen_for_ordinary_persistence_check', ['open', '-a', '/System/Applications/Music.app', str(bundle)])
+                        launched = True
+                        reopened = parsed_step('ordinary_recommendation_playlists_after_reopen',
+                                               ['osascript', '-e', ordinary_playlist_query_script(created)],
+                                               lambda text: parse_ordinary_playlists(text, plans), 70)
+                        ordinary['reopened'] = reopened
+                        ordinary['reopen_membership_order_verified'] = (
+                            ordinary['creation_verified'] and reopened is not None
+                            and all(p['ordinary_playlist_verified'] for p in reopened)
+                            and [p['playlist_pid'] for p in reopened] == [p['playlist_pid'] for p in created])
+                        ordinary['status'] = 'persisted_and_verified' if ordinary['reopen_membership_order_verified'] else 'reopen_not_verified'
+                        report['genius_playlists_after_reopen'] = parsed_step(
+                            'genius_playlists_after_ordinary_reopen', ['osascript', '-e', playlists_script()],
+                            lambda text: parse_playlists(text, known_pids), 70)
+                        step('screenshot_ordinary_after_reopen', ['screencapture', '-x', str(output / 'music-ordinary-after-reopen.png')], 15)
     finally:
         if launched:
             step('stop_playback', ['osascript', '-e', 'with timeout of 5 seconds\ntell application "Music" to stop\nend timeout'], 10)
