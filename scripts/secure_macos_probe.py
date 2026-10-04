@@ -3,6 +3,7 @@
 import argparse
 import io
 import os
+import shutil
 from pathlib import Path, PurePosixPath
 import subprocess
 import sys
@@ -69,7 +70,12 @@ def open_directory(source, target, key):
             path.write_bytes(archive.read(entry))
             path.chmod(0o600)
 
-def run_private(input_archive, output_archive):
+def run_private(input_archive, output_archive, collector="library", bundle_overlay="none"):
+    if collector not in ("library", "import"):
+        raise ValueError("unknown collector")
+    if bundle_overlay not in ("none", "original", "rebased") or (bundle_overlay != "none" and collector != "library"):
+        raise ValueError("original bundle requires library collector")
+    collector_script = "scripts/probe_macos_real_library.py" if collector == "library" else "scripts/probe_macos_real_import.py"
     key = key_bytes()
     root = Path('data/private-native')
     root.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -80,8 +86,16 @@ def run_private(input_archive, output_archive):
     child_env.pop('MACOS_PROBE_KEY', None)
     try:
         open_directory(input_archive, source, key)
+        if bundle_overlay != "none":
+            control = root / 'control'
+            overlay_file = 'fixtures/macos/private-original-bundle.enc' if bundle_overlay == 'original' else 'fixtures/macos/private-rebased-bundle.enc'
+            open_directory(overlay_file, control, key)
+            shutil.rmtree(source / 'Music Library.musiclibrary')
+            shutil.copytree(control / 'Music Library.musiclibrary', source / 'Music Library.musiclibrary')
+            if bundle_overlay == 'rebased':
+                shutil.copyfile(control / 'manifest.json', source / 'manifest.json')
         with (output / 'collector.log').open('wb') as log:
-            result = subprocess.run([sys.executable, 'scripts/probe_macos_real_library.py',
+            result = subprocess.run([sys.executable, collector_script,
                                      '--input-directory', str(source.resolve()), '--output', str((output / 'probe').resolve())],
                                     stdout=log, stderr=log, timeout=900, check=False, env=child_env)
             status = result.returncode
@@ -99,9 +113,11 @@ def main():
     parser.add_argument('source')
     parser.add_argument('target')
     parser.add_argument('--key-file')
+    parser.add_argument('--collector', choices=['library', 'import'], default='library')
+    parser.add_argument('--bundle-overlay', choices=['none', 'original', 'rebased'], default='none')
     args = parser.parse_args()
     if args.operation == 'run':
-        return run_private(args.source, args.target)
+        return run_private(args.source, args.target, args.collector, args.bundle_overlay)
     operation = seal_directory if args.operation == 'seal' else open_directory
     operation(args.source, args.target, key_bytes(args.key_file))
     return 0
