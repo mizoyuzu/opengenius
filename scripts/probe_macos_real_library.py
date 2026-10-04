@@ -127,9 +127,13 @@ def private_step(command, timeout=30, runner=subprocess.run):
 
 def selected_query_script(tracks):
     lines = ['with timeout of 100 seconds', 'set outputText to ""', 'tell application "Music"',
-             'set allPIDs to persistent ID of every track of library playlist 1',
-             'if (count of allPIDs) > 10000 then error "Library count exceeds probe limit"',
-             'set outputText to "LIBRARY_COUNT" & tab & (count of allPIDs) & linefeed',
+             'set nativeCount to count of tracks of library playlist 1',
+             'if nativeCount > 10000 then error "Library count exceeds probe limit"',
+             'set outputText to "LIBRARY_COUNT" & tab & nativeCount & linefeed',
+             'if nativeCount is 0 then return outputText',
+             'try', 'set allPIDs to persistent ID of every track of library playlist 1',
+             'on error', 'set allPIDs to {}', 'repeat with t in tracks of library playlist 1',
+             'set end of allPIDs to persistent ID of t', 'end repeat', 'end try',
              'repeat with pid in allPIDs', 'set outputText to outputText & "LIBRARY_PID" & tab & pid & linefeed', 'end repeat']
     for track in tracks:
         pid = track['persistent_id']
@@ -321,12 +325,14 @@ def probe(input_directory, output, *, runner=subprocess.run, popen=subprocess.Po
         raise ValueError('refusing pre-existing Music Library')
     manifest, source_bundle, media_paths = validate_inputs(source)
     output.mkdir(parents=True, mode=0o700)
-    bundle = output / 'working-library/Music Library.musiclibrary'
-    bundle.parent.mkdir()
+    bundle = music / 'Music/Music Library.musiclibrary'
+    if bundle.parent.is_symlink():
+        raise ValueError('refusing symlink Music destination')
+    bundle.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source_bundle, bundle)
     report = {'schema_version': 1, 'private_real_library_probe': True, 'probe_network_requests': 0,
               'music_app_network_activity_observed': False, 'expected_library_track_count': manifest['expected_library_track_count'],
-              'selected_media_count': len(manifest['tracks']), 'seed_count': len(manifest['seeds']), 'steps': {}, 'seed_results': [],
+              'restored_bundle_path': str(bundle), 'selected_media_count': len(manifest['tracks']), 'seed_count': len(manifest['seeds']), 'steps': {}, 'seed_results': [],
               'actual_genius_generation_tested': False, 'actual_genius_generation_observed': False}
     steps = report['steps']
     launched = False
@@ -418,6 +424,16 @@ def probe(input_directory, output, *, runner=subprocess.run, popen=subprocess.Po
             if not report['music_exited']:
                 step('screenshot_quit_pending', ['screencapture', '-x', str(output / 'music-quit-pending.png')], 15)
         report['after_copy_consistent_exit'] = report.get('music_exited', False)
+        report['music_library_locations'] = []
+        for index, other in enumerate(library_roots(music)):
+            info = {'path': str(other), 'is_restored_bundle': other == bundle}
+            if other != bundle:
+                try:
+                    info['files'] = snapshot_bundle(other, output / 'other-libraries' / str(index))
+                except (ValueError, OSError):
+                    info['copy_status'] = 'failed_or_exceeded_limit'
+            report['music_library_locations'].append(info)
+        step('music_defaults', ['defaults', 'read', 'com.apple.Music'], 15)
         try:
             report['after_files'] = snapshot_bundle(bundle, output / 'after')
         except (ValueError, OSError):

@@ -66,6 +66,10 @@ class NativeRealTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parse_selected_query(bad, manifest)
             self.assertNotIn('add ', selected_query_script(manifest['tracks']))
+            self.assertIn('if nativeCount is 0 then return outputText', selected_query_script(manifest['tracks']))
+            empty = parse_selected_query('LIBRARY_COUNT\t0\n', manifest)
+            self.assertFalse(empty['expected_library_count_loaded'])
+            self.assertFalse(empty['selected_tracks_loaded'])
 
     def test_relink_only_selected_file_tracks_after_sdef_writability(self):
         self.assertTrue(location_writable(SDEF))
@@ -147,6 +151,12 @@ class NativeRealTests(unittest.TestCase):
             with patch('probe_macos_real_library.platform.system', return_value='Darwin'), patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch('probe_macos_real_library.dismiss_music_promotion', return_value={'status': 'not_needed'}), patch.object(Path, 'is_file', fake_is_file), patch.object(Path, 'read_text', fake_read):
                 result = probe(source, base / 'out', home=base / 'home', runner=runner, popen=lambda *a, **kw: Process())
             self.assertEqual(result['status'], 'library_loaded')
+            restored = base / 'home/Music/Music/Music Library.musiclibrary'
+            self.assertEqual(result['restored_bundle_path'], str(restored))
+            self.assertTrue(restored.is_dir())
+            launch = next(c for c in commands if c[0] == 'open')
+            self.assertEqual(launch[-1], str(restored))
+            self.assertTrue(result['music_library_locations'][0]['is_restored_bundle'])
             self.assertTrue(result['seed_results'][0]['playback']['position_advanced'])
             self.assertEqual(result['seed_results'][0]['genius_menu_status'], 'disabled')
             self.assertFalse(result['actual_genius_generation_tested'])
