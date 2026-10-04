@@ -428,3 +428,18 @@ GitHub ActionsのmacOS 26でも、Music.appへの合成音源2曲の取り込み
 Library/Genius DBの回収を確認した。GUI操作許可と初回画面はSystem Eventsで処理する。
 本番LibraryやMediaを送らずに互換性検証の環境を用意できる。
 [macOS実験の起動・結果・GUIの制約](docs/research/2026-10-04-macos-actions.md)
+
+## 実Libraryのコピーと試聴用プレイリスト
+
+`build_real_library_experiment.py`は本番Libraryのバイナリから曲とhashを確認し、
+保存済みradio/relatedを共有グラフにまとめ、別のLibrary/Genius DBへ実験用IDと関係を保存する。
+この経路は元の全Genius IDが0・元Genius DBが空の場合だけ使用する。
+元Library・参加状態・CUIDは変更せず、キーはRAM内だけで扱う。
+
+2,974曲の実Libraryで29起点・214関連曲・723有向辺を保存し、ID/BLOB/暗号化の整合性を確認した。
+`export_real_playlists.py`はHDD上の実音源を参照するM3U8を出力する。
+29リストの全参照が解決し、代表21曲の最初の1秒もデコードできた。
+Music.app全体での実曲Genius生成・iPod生成は未確認。
+
+[コマンドと実曲の結果](docs/research/2026-10-04-real-library-experiment.md)、
+[iPodへ渡す経路と読み取り監査器](docs/research/2026-10-04-ipod-genius-path.md)。
