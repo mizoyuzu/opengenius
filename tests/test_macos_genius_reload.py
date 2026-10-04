@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from probe_macos_genius_reload import decode_fixture_payload, menu_script, parse_query, probe, query_script, validate_fixture
+from probe_macos_genius_reload import decode_fixture_payload, menu_script, parse_query, probe, query_script, validate_fixture, generate_script, genius_playlists_script, parse_genius_playlists, try_genius_playlist
 
 
 def fixture_document():
@@ -81,6 +81,43 @@ class ReloadTests(unittest.TestCase):
         self.assertNotIn('click', menu_script())
         self.assertNotIn('add ', query_script())
 
+    def test_generation_only_selects_fixture_pid_and_whitelisted_menu(self):
+        script = generate_script('0000000000000001')
+        self.assertIn('whose persistent ID is "0000000000000001"', script)
+        self.assertIn('menu item "Genius Playlist"', script)
+        self.assertIn('menu item "New"', script)
+        self.assertIn('if not (enabled of geniusItem) then return "DISABLED"', script)
+        self.assertNotIn('Turn On', script)
+        self.assertNotIn('Update', script)
+        self.assertNotIn('sign', script.lower())
+        with self.assertRaises(ValueError):
+            generate_script('" invalid injection')
+
+    def test_disabled_generation_does_not_query_or_claim_generation(self):
+        commands = []
+        def runner(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, 'DISABLED\n', '')
+        result = try_genius_playlist(fixture_document()['expected_tracks'], runner)
+        self.assertEqual(result['status'], 'disabled')
+        self.assertFalse(result['generation_attempted'])
+        self.assertFalse(result['generation_observed'])
+        self.assertEqual(len(commands), 1)
+
+    def test_generation_result_checks_all_native_playlist_metadata(self):
+        native = 'PLAYLIST_COUNT\t1\nPLAYLIST\t1\t2\nTRACK\t0000000000000001\tsynthetic-tone-1\t3\nTRACK\t0000000000000002\tsynthetic-tone-2\t3\n'
+        expected = fixture_document()['expected_tracks']
+        self.assertEqual(len(parse_genius_playlists(native, expected)[0]['tracks']), 2)
+        for malformed in (native.replace('PLAYLIST_COUNT\t1', 'PLAYLIST_COUNT\t5'), native.replace('PLAYLIST\t1', 'PLAYLIST\t2'), native.replace('0000000000000002', 'FFFFFFFFFFFFFFFF'), native.replace('\t3\n', '\t6\n'), native + 'garbage\n'):
+            with self.assertRaises(ValueError):
+                parse_genius_playlists(malformed, expected)
+        def runner(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, native if command[-1] == genius_playlists_script() else 'CLICKED', '')
+        with patch('probe_macos_genius_reload.time.sleep'):
+            result = try_genius_playlist(expected, runner)
+        self.assertTrue(result['generation_attempted'])
+        self.assertTrue(result['generation_observed'])
+
     def test_non_actions_prevents_all_writes(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'out'
@@ -121,9 +158,10 @@ class ReloadTests(unittest.TestCase):
                     (bundle / 'Preferences.plist').write_bytes(b'synthetic settings')
                     (bundle / 'sentinel').touch()
                 return subprocess.CompletedProcess(command, 1 if command[0] == 'pgrep' else 0, '', '')
-            with patch('probe_macos_genius_reload.platform.system', return_value='Darwin'), patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch('probe_macos_genius_reload.Path.cwd', return_value=home):
+            with patch('probe_macos_genius_reload.platform.system', return_value='Darwin'), patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch('probe_macos_genius_reload.Path.cwd', return_value=home), patch('probe_macos_music.dismiss_music_promotion', return_value={'status': 'not_needed'}, create=True):
                 report = probe(fixture, home / 'out', runner=runner, popen=lambda *a, **kw: Process(), home=home)
             self.assertTrue(report['expected_tracks_loaded'])
+            self.assertEqual(report['steps']['dismiss_music_promotion']['status'], 'not_needed')
             self.assertTrue(report['after_copy_consistent_exit'])
             self.assertFalse(report['explicit_library'])
             self.assertEqual(len(report['support_files']), 4)

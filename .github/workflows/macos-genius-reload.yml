@@ -13,6 +13,11 @@ on:
         type: boolean
         default: false
 
+      try_genius_playlist:
+        description: Try an enabled Genius Playlist action for the synthetic seed
+        type: boolean
+        default: false
+
 permissions:
   contents: read
 
@@ -42,12 +47,17 @@ jobs:
       - name: Restore synthetic library and reopen Music
         env:
           EXPLICIT_LIBRARY: ${{ inputs.explicit_library }}
+          TRY_GENIUS_PLAYLIST: ${{ inputs.try_genius_playlist }}
         run: |
-          if [ "$EXPLICIT_LIBRARY" = true ]; then
-            python3 scripts/probe_macos_genius_reload.py --fixture data/reload-fixture.json --output data/macos-reload --explicit-library
-          else
-            python3 scripts/probe_macos_genius_reload.py --fixture data/reload-fixture.json --output data/macos-reload
-          fi
+          python3 - <<'PYTHON'
+          import os, subprocess, sys
+          command = [sys.executable, 'scripts/probe_macos_genius_reload.py', '--fixture', 'data/reload-fixture.json', '--output', 'data/macos-reload']
+          if os.environ['EXPLICIT_LIBRARY'] == 'true':
+              command.append('--explicit-library')
+          if os.environ['TRY_GENIUS_PLAYLIST'] == 'true':
+              command.append('--try-genius-playlist')
+          subprocess.run(command, check=True)
+          PYTHON
       - name: Collect reload results
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

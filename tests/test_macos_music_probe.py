@@ -1,5 +1,6 @@
 """Test macOS probe isolation, bounded commands, and real synthetic PCM data."""
 from pathlib import Path
+import json
 import struct
 import subprocess
 import sys
@@ -9,7 +10,7 @@ from unittest.mock import patch
 import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from probe_macos_music import bootstrap_music, bootstrap_script, collect_libraries, import_script, make_tone, probe, run_step
+from probe_macos_music import bootstrap_music, bootstrap_script, collect_libraries, dismiss_music_promotion, import_script, make_tone, probe, run_step
 
 
 class FinishedProcess:
@@ -23,6 +24,27 @@ class FinishedProcess:
 
 
 class MacOSProbeTests(unittest.TestCase):
+    def test_ocr_promotion_requires_unique_known_title_and_not_now(self):
+        known = [{'text': 'Hear About New Music First', 'x': 500, 'y': 380},
+                 {'text': 'Not Now', 'x': 325, 'y': 671}]
+        for rows, should_click in ((known, True), (known[1:], False),
+                                   (known + [known[1]], False),
+                                   ([known[0], {**known[1], 'x': float('nan')}], False)):
+            commands = []
+            def runner(command, **kwargs):
+                commands.append(command)
+                stdout = json.dumps(rows) if command[0] == 'swift' else ''
+                return subprocess.CompletedProcess(command, 0, stdout, '')
+            with tempfile.TemporaryDirectory() as directory:
+                result = dismiss_music_promotion(Path(directory), runner)
+            clicks = [c for c in commands if c[0] == 'osascript']
+            self.assertEqual(bool(clicks), should_click)
+            if should_click:
+                self.assertIn('click at {325, 671}', clicks[0][-1])
+                self.assertEqual(result['status'], 'ok')
+            else:
+                self.assertEqual(result['status'], 'skipped')
+
     def test_tone_has_expected_duration_amplitude_and_fades(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'tone.wav'
