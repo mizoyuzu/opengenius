@@ -73,7 +73,7 @@ def import_script(paths):
 
 
 def bootstrap_script():
-    """Click only the observed Music automation prompt and welcome button."""
+    """Dismiss only observed automation, welcome, and Music promotion prompts."""
     return '''
 set observedButtons to {}
 set actionsTaken to {}
@@ -96,14 +96,38 @@ repeat 36 times
                 set uiItems to entire contents of w
                 repeat with uiItem in uiItems
                     if ((current date) - startedAt) >= 20 then exit repeat
-                    try
-                        if class of uiItem is static text then set dialogText to dialogText & " " & (value of uiItem as text)
-                    end try
+                    -- Music promotion text can expose AXTitle/AXDescription rather than AXValue.
+                    repeat with textAttribute in {"AXTitle", "AXDescription", "AXValue"}
+                        if ((current date) - startedAt) >= 20 then exit repeat
+                        try
+                            set textValue to value of attribute (textAttribute as text) of uiItem
+                            if textValue is not missing value then set dialogText to dialogText & " " & (textValue as text)
+                        end try
+                    end repeat
                 end repeat
                 set matchingPermission to (dialogText contains "hosted-compute-agent") and (dialogText contains "Music")
                 repeat with uiItem in uiItems
                     if ((current date) - startedAt) >= 20 then exit repeat
                     try
+                        -- Not Now may be an AXLink or AXStaticText, not an AXButton.
+                        if processName is "Music" and dialogText contains "Hear About New Music First" then
+                            set isNotNow to false
+                            repeat with labelAttribute in {"AXTitle", "AXDescription", "AXValue"}
+                                try
+                                    if (value of attribute (labelAttribute as text) of uiItem as text) is "Not Now" then set isNotNow to true
+                                end try
+                            end repeat
+                            set itemRole to value of attribute "AXRole" of uiItem as text
+                            if isNotNow and itemRole is in {"AXButton", "AXLink", "AXStaticText"} then
+                                try
+                                    perform action "AXPress" of uiItem
+                                on error
+                                    click uiItem
+                                end try
+                                set end of actionsTaken to "dismissed Music promotion"
+                                exit repeat
+                            end if
+                        end if
                         if class of uiItem is button then
                             set buttonName to name of uiItem as text
                             set buttonLabel to processName & ": " & buttonName
@@ -114,9 +138,6 @@ repeat 36 times
                             else if processName is "Music" and buttonName is "Start Listening" then
                                 click uiItem
                                 set end of actionsTaken to "dismissed Music welcome"
-                            else if processName is "Music" and dialogText contains "Hear About New Music First" and buttonName is "Not Now" then
-                                click uiItem
-                                set end of actionsTaken to "dismissed Music promotion"
                             end if
                         end if
                     end try
@@ -166,24 +187,26 @@ def library_roots(music_directory):
 
 
 def collect_libraries(music_directory, output, preexisting):
-    """Inventory bundle files and copy DBs only from newly created bundles."""
+    """Inventory bundle files and copy bounded files only from newly created bundles."""
     records = []
     for root in library_roots(music_directory):
         fresh = root not in preexisting
         bundle_record = {'path': str(root.relative_to(music_directory)),
                          'created_by_probe': fresh, 'files': []}
+        copied_bytes = 0
         for path in sorted(root.rglob('*')):
             if not path.is_file() or path.is_symlink():
                 continue
             info = {'path': str(path.relative_to(root)), 'size': path.stat().st_size}
-            # Large media never need to be read, hashed, or copied here.
-            if path.name in ('Library.musicdb', 'Genius.itdb', 'Library Preferences.musicdb'):
-                if fresh:
-                    info['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
-                    destination = output / 'generated-library' / root.relative_to(music_directory) / path.relative_to(root)
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(path, destination)
-                    info['copy'] = str(destination.relative_to(output))
+            # Fresh bundles contain only this probe's synthetic input. Preserve
+            # support files needed to reopen them, with individual and total limits.
+            if fresh and info['size'] <= 1024 * 1024 and copied_bytes + info['size'] <= 10 * 1024 * 1024:
+                info['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+                destination = output / 'generated-library' / root.relative_to(music_directory) / path.relative_to(root)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, destination)
+                info['copy'] = str(destination.relative_to(output))
+                copied_bytes += info['size']
             bundle_record['files'].append(info)
         records.append(bundle_record)
     return records
@@ -229,6 +252,16 @@ def probe(output, *, runner=subprocess.run, popen=subprocess.Popen, home=None):
             step('music_windows', ['osascript', '-e', 'with timeout of 10 seconds\ntell application "System Events"\nreturn {UI elements enabled, count of windows of process "Music"}\nend tell\nend timeout'], 15)
             step('screenshot', ['screencapture', '-x', str(output / 'music-screen.png')], 15)
             step('quit_music', ['osascript', '-e', 'with timeout of 15 seconds\ntell application "Music" to quit\nend timeout'], 20)
+            report['music_exited'] = False
+            for attempt in range(40):
+                check = run_step(['pgrep', '-x', 'Music'], 5, runner)
+                if check.get('returncode') == 1:
+                    report['music_exited'] = True
+                    break
+                time.sleep(.5)
+            if not report['music_exited']:
+                step('screenshot_quit_pending', ['screencapture', '-x', str(output / 'music-quit-pending.png')], 15)
+            report['after_copy_consistent_exit'] = report['music_exited']
             report['libraries'] = collect_libraries(music_directory, output, preexisting)
         report['actual_genius_generation_tested'] = False
     finally:

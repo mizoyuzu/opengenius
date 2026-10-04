@@ -62,14 +62,19 @@ class MacOSProbeTests(unittest.TestCase):
             (new / 'Library.musicdb').write_bytes(b'new')
             (new / 'Genius.itdb').write_bytes(b'genius')
             (new / 'Library Preferences.musicdb').write_bytes(b'fresh preferences')
-            (new / 'Preferences.plist').write_bytes(b'do not copy')
+            (new / 'Preferences.plist').write_bytes(b'synthetic bundle support')
+            (new / 'oversized-media.wav').write_bytes(b'0' * (1024 * 1024 + 1))
             output = root / 'out'
             output.mkdir()
             records = collect_libraries(music, output, {old})
             copied = list((output / 'generated-library').rglob('*'))
-            self.assertEqual(sorted(path.name for path in copied if path.is_file()), ['Genius.itdb', 'Library Preferences.musicdb', 'Library.musicdb'])
+            self.assertEqual(sorted(path.name for path in copied if path.is_file()), ['Genius.itdb', 'Library Preferences.musicdb', 'Library.musicdb', 'Preferences.plist'])
             old_record = next(record for record in records if not record['created_by_probe'])
             self.assertNotIn('sha256', old_record['files'][0])
+            new_record = next(record for record in records if record['created_by_probe'])
+            large = next(record for record in new_record['files'] if record['path'] == 'oversized-media.wav')
+            self.assertNotIn('sha256', large)
+            self.assertNotIn('copy', large)
 
     def test_existing_library_prevents_launch_import_and_screenshot(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -116,13 +121,15 @@ class MacOSProbeTests(unittest.TestCase):
                 if command[0] == 'osascript' and 'to quit' in command[-1]:
                     (home / 'Music/Music/Music Library.musiclibrary/Library.musicdb').write_bytes(b'flushed db')
                 self.assertLessEqual(kwargs['timeout'], 90)
-                return subprocess.CompletedProcess(command, 0, '', '')
+                return subprocess.CompletedProcess(command, 1 if command[0] == 'pgrep' else 0, '', '')
             def popen(command, **kwargs):
                 runner(command, timeout=90)
                 return FinishedProcess()
             with patch('probe_macos_music.platform.system', return_value='Darwin'), patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}):
                 result = probe(home / 'output', runner=runner, popen=popen, home=home)
             self.assertEqual(result['import_status'], 'ok')
+            self.assertTrue(result['music_exited'])
+            self.assertTrue(result['after_copy_consistent_exit'])
             self.assertEqual(result['probe_network_requests'], 0)
             self.assertFalse(result['music_app_network_activity_observed'])
             self.assertNotIn('network_requests', result)
@@ -141,7 +148,12 @@ class MacOSProbeTests(unittest.TestCase):
         self.assertIn('processName is "Music" and buttonName is "Start Listening"', script)
         self.assertIn('>= 20 then exit repeat', script)
         self.assertIn('(count of observedButtons) < 30', script)
-        self.assertIn('dialogText contains "Hear About New Music First" and buttonName is "Not Now"', script)
+        self.assertIn('processName is "Music" and dialogText contains "Hear About New Music First"', script)
+        self.assertIn('is "Not Now" then set isNotNow to true', script)
+        self.assertIn('itemRole is in {"AXButton", "AXLink", "AXStaticText"}', script)
+        self.assertIn('perform action "AXPress" of uiItem', script)
+        self.assertIn('{"AXTitle", "AXDescription", "AXValue"}', script)
+        self.assertNotIn('is "Continue"', script)
         self.assertIn('with timeout of 2 seconds', script)
         self.assertNotIn('in application processes', script)
 
