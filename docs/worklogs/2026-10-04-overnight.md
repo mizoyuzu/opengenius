@@ -174,3 +174,24 @@ proof of a scheduler or of a running job.
   the same Off Vocal-excluded 270-node/825-edge scope and per-filter ablations.
   Check live agent/session state before restarting. No Actions jobs or transport
   secrets are live; Apple login remains deferred. Goal remains active to 07:00 JST.
+
+## Resumed after usage interruption, 06:23 JST
+
+- Both active agents hit the usage limit. Old ablation session `51063` was
+  missing, no exact driver process remained and no final report existed.
+  Root restarted once with per-profile checkpoints. Session `5968` completed
+  all five core profiles then exited 1 in diagnostic artist-missing handling.
+  Root fixed that diagnostic and reused completed profile results; session
+  `65493` exited 0, final private bottleneck report and driver backup saved.
+- Standard total 509 with seven seed-only roots; both artist/album minimum-one
+  total 649 with zero seed-only roots. Relations-only total also 649 but distinct
+  chosen PIDs/order and adjacency; no general quality improvement claimed.
+- Local commits `441b538` (matching/UI/checkpoint) and `f9415e4` (README accuracy)
+  already complete; no public push. Native accepted dataset remains v03 270/825.
+- `auxiliary_metadata` resumed separate one-alias shadow experiment; existing
+  decision JSON was present, map/result absent before resuming.
+- `review_ytmusic_batch` asked to select six candidate-only outgoing roots,
+  non-IMAS / distinct canonical artists where possible, and obtain bounded actual
+  radio/related with existing r5 auth, 5s pacing, 28 HTTP cap, no retries. New
+  output directory `data/ytmusic/coverage-outgoing-followup-20261005-v01`.
+  Check live handle before any restart. Login remains deferred; deadline 07:00.
