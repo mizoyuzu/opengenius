@@ -59,3 +59,52 @@ Music.appが読み込むか・更新時に上書きするかを検証する。
 
 戻った`/mnt/temp-hdd`には本番とGeniused Libraryがある。
 初回実験には不要なのでMediaの圧縮・アップロードはしていない。
+
+## 初回実測結果
+
+[Actions run 37186278435](https://github.com/mizoyuzu/opengenius/actions/runs/37186278435)、
+検証コードのみの独立`macos-probe`ブランチで実行。ジョブは1分6秒で完了。
+
+- OS: macOS 26.6.2 (25G83)、ARM64。Music 1.6.6。
+- GUI console userあり。System EventsのUI有効、Music window 1。
+- スクリーンショット成功。
+- 音源取り込みは55秒でAppleEvent timeout。画像にはhosted-compute-agentによる
+  Music操作の許可ダイアログ（Allow）とMusic初回画面（Start Listening）が表示された。
+- 新規LibraryとGenius.itdb、Library Preferences.musicdbを回収。
+  Libraryを既存パーサで読むと曲数0で、取り込みの成功は確認できない。
+- Genius.itdbは32,768 bytes、8ページ、reserve 12。Music 1.7.0.146の既存鍵導出を
+  用いたオフライン復号でSQLite integrity_check成功。5テーブルすべて0行。
+  Geniusの5テーブルのSQL定義は提供済み1.7由来DBと一致した。
+  鍵導出コードのビルド間互換の一例であり、全ビルド対応を保証する結果ではない。
+- ローカルartifact: `data/macos-actions/run-37186278435/`。
+  復号コピーは`data/macos-actions/run-37186278435-decrypted.itdb`。鍵は保存・表示していない。
+
+戻った本番LibraryのSHA-256も保存済み曲一覧と一致した。読み取り確認のみ。
+
+## GUI処理の修正と取り込み成功
+
+2回目 [run 37186554307](https://github.com/mizoyuzu/opengenius/actions/runs/37186554307)では
+Start Listeningを押せたが、Music version取得は取り込みの操作許可を先に出す方法として
+不十分だった。GUI探索は25秒で打ち切られ、実際のadd時に許可ダイアログが出て
+取り込みは再び失敗した。背後には「Hear About New Music First」の案内も表示された。
+
+3回目 [run 37186864359](https://github.com/mizoyuzu/opengenius/actions/runs/37186864359)では
+実際のimportを非同期で1回だけ開始し、その待機中にGUIを処理する形へ変更した。
+ジョブは32秒で完了。操作許可とStart Listeningが成功し、importの返値も
+`synthetic import complete, 2`になった。回収Libraryを既存パーサで読むと
+2曲、各3,000ms、異なるPID、Genius IDは両方0だった。
+パーサが読む曲名はsynthetic-tone-1/2で、設定した追加ラベルの保存は確認していない。
+
+GUI探索は既知7プロセスに限定し、各AppleEventに2秒上限、探索全体を時間制限する。
+hosted-compute-agentとMusicの両方を含むダイアログのAllowだけを許可する。
+Start ListeningもMusicプロセスに限定。Musicの既知案内のNot Nowを操作する処理も
+あるが、3回目の画像ではその案内は残っており、通過できたとは判断しない。
+画像取得だけでなく、実際の取り込みとDB生成が成功した点を区別する。
+
+3回目のartifactは`data/macos-actions/run-37186864359/`。
+11関連テストがローカルとmacOS Actionsの両方で成功。
+artifactアクションを公式v6の固定SHAへ更新し、実操作の成否をジョブ概要へ表示する。
+
+現在の結論: VNCなしでMusicの起動・初回操作許可・2曲取り込み・DB回収が可能。
+Genius DBはまだ関係を持たない空DBで、推薦生成や互換DBの受理は未検証。
+次はこの新規Libraryに2曲の関係とID対応を与えて再読み込みを調べる。

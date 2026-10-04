@@ -423,3 +423,8 @@ BGM向け比較条件は`--profile artist-album-minimum-one`で明示指定す�
 `serve_music_review.py`で曲一覧を開き、アルバム一括タグ付けと曲ごとの種類訂正、
 新規設定ファイルへの保存、保存済み関係からの推薦再生成を行う。
 [起動方法・保存場所・検証範囲](docs/research/2026-10-03-music-review-ui.md)
+
+GitHub ActionsのmacOS 26でも、Music.appへの合成音源2曲の取り込みと
+Library/Genius DBの回収を確認した。GUI操作許可と初回画面はSystem Eventsで処理する。
+本番LibraryやMediaを送らずに互換性検証の環境を用意できる。
+[macOS実験の起動・結果・GUIの制約](docs/research/2026-10-04-macos-actions.md)
