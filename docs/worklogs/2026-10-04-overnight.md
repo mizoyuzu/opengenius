@@ -214,3 +214,53 @@ proof of a scheduler or of a running job.
   `28776`. Root new native-template build session `1826`, output
   `data/real-library-experiment-v04-outgoing`; do not restart either while live.
   Native-tested graph remains v03 until a later actual Music job is verified.
+
+## New native job dispatched, 06:33 JST
+
+- v04-outgoing native-template build session `1826` terminal exit 0:
+  2,974 Library tracks, 45 roots, 286 assigned IDs, 885 directed edges.
+  Independent graph evaluation and saved-DB builder match every ordered
+  playlist across all 45 roots (841 entries); private crosscheck saved.
+- Only encrypted `data/native-outgoing-overlay-v01.enc` published via isolated
+  branch commit `5273aacb242e7090e36024a95b722535c9597eab`. Existing 47 audio
+  fixture reused, no additional audio. The three ordinary playlist plans are
+  the prior frozen plans, not newly expanded recommendations.
+- GitHub run `37236418696`, job `111536303437`, in progress at native step;
+  publication/dispatch session `41214` terminal exit 0. Poll this exact run,
+  do not redispatch. Transport secret MACOS_PROBE_KEY currently registered.
+- On terminal completion: download encrypted private-native artifact into
+  `data/macos-actions/run-37236418696`, open with local mode0600 key, perform
+  independent audit with `data/native-outgoing-overlay-v01/manifest.json`,
+  compare before snapshot core bytes to this input, check original HDD hashes,
+  remove secret and verify its absence. Deadline still 07:00 JST.
+
+## Native follow-up terminal, 06:36 JST
+
+- Run `37236418696` and job `111536303437` terminal success. Encrypted artifact
+  downloaded (session `22324` exit 0); opened and independently audited (session
+  `4390` exit 0) under `data/macos-actions/run-37236418696/private/probe`.
+- Native audit: all2,974 PIDs,286 Genius IDs,all SQL tables,885 edges preserved;
+  zero dangling/missing/unsupported records; expected input bytes match before,
+  native Off Vocal assignments0, original HDD core hashes unchanged.
+  All47 locations,3 advancing playbacks,3 frozen ordinary playlists retained.
+- Actual native Genius generation/iPod acceptance remain false/unverified.
+- Secret deletion session `89857` terminal exit 0, secret list[] verified.
+  No native job or transport secret remains live from this task.
+- Classification file hash vs semantic JSON mismatch fixed by separate semantic
+  field; legacy raw provenance retained.11 review tests + real8rootCLI passed.
+  New UI files awaiting root final review/commit; no source file changes.
+
+## Final integration checks, 06:45 JST
+
+- Full suite after classification/source sync: **212 tests passed**, actual
+  Music core + HTTP, session31863 terminal exit0; log
+  `data/overnight-suite-20261005-completion.log`.
+- Final45root browser smoke passed: old39root cache changedcue without false
+  classifiercue; standard1/minimumone18 (13direct+4indirect), prior result and
+  conflict retention, reload restore,390px/zero browsererrors. Browser closed.
+- Dedicated final server45047 session22710 stopped viaPTY SIGINT, exit0.
+  Original classifier SHA matches prior builder evidence after this smoke.
+- Upcoming last improvement owned by minimal_review_ui: disclose deterministic
+  observed shortest relation path on demand in existing detail dialog. No new
+  recommendation edges/core behavior; not a Music execution trace. Finish and
+  verify before07:00, or leave bounded explicit checkpoint if not completed.

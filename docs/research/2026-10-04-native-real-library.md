@@ -107,3 +107,13 @@ Musicが実際に開いて保存した1.6.6.4（hfma @12=0x1f000c）のコピー
 実行後のネイティブ曲数・終了・ファイルSHAを要求し、Persistent ID集合が一致する場合に限って適用する。参加状態・アカウント設定を変えず、Geniusキーは保存しない。元のMusic保存済みLibraryも書き換えない。試験に使ったLibraryのバイト列と、暗号化前Geniusテーブルをこの保存済みツールで再現できることも確認した。
 
 全ジョブ終了後、GitHub Actionsの一時secret `MACOS_PROBE_KEY`を削除し、secret一覧が空であることを確認した。元HDD Libraryは初期SHAに一致する。新規テストはコード検証であり、Musicの生成成功やiPod実機互換の証拠としては扱わない。
+
+## 45起点の出方向追加版も実Musicで確認
+
+2026-10-05のActions run [37236418696](https://github.com/mizoyuzu/opengenius/actions/runs/37236418696)は、実際のradio/relatedを6起点分追加したコピーを検証した。送信済み47音源を再利用し、追加転送は暗号化DBのみ。公開branchは暗号文fixtureだけを変更した`5273aac`で、元の個人用main履歴は送っていない。
+
+独立した前後監査で、全2,974曲のPID、286件の非zero Genius ID、全SQLテーブルと885本の有向関係の保持を確認した。参照先metadata欠落、起点metadata欠落、未対応関係BLOBは各0件。投入したcore3ファイルとrunnerのbeforeコピーはbyte一致し、HDD原本3ファイルのhashも生成前の記録と一致した。明示的にOff Vocal分類された曲へのID割当は0件。
+
+47音源のlocation一致と3曲の再生位置の進行を確認した。今回の通常プレイリスト計画は以前に凍結した3件49項目を再利用したもので、新しい45起点の全推薦を試聴した結果ではない。3件は終了・再起動後も同じ名前、ID、曲順を保持した。
+
+Geniusメニューは引き続きdisabledで、Music自身のGenius生成とiPod動作は未確認。結果は暗号化artifactからローカル回収して独立監査した。一時Actions secretはジョブ終了後に削除し、一覧が空であることを確認した。
