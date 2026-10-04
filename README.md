@@ -59,3 +59,24 @@ Music.appが読み込むか・更新時に上書きするかを検証する。
 
 戻った`/mnt/temp-hdd`には本番とGeniused Libraryがある。
 初回実験には不要なのでMediaの圧縮・アップロードはしていない。
+
+## 初回実測結果
+
+[Actions run 37186278435](https://github.com/mizoyuzu/opengenius/actions/runs/37186278435)、
+検証コードのみの独立`macos-probe`ブランチで実行。ジョブは1分6秒で完了。
+
+- OS: macOS 26.6.2 (25G83)、ARM64。Music 1.6.6。
+- GUI console userあり。System EventsのUI有効、Music window 1。
+- スクリーンショット成功。
+- 音源取り込みは55秒でAppleEvent timeout。画像にはhosted-compute-agentによる
+  Music操作の許可ダイアログ（Allow）とMusic初回画面（Start Listening）が表示された。
+- 新規LibraryとGenius.itdb、Library Preferences.musicdbを回収。
+  Libraryを既存パーサで読むと曲数0で、取り込みの成功は確認できない。
+- Genius.itdbは32,768 bytes、8ページ、reserve 12。Music 1.7.0.146の既存鍵導出を
+  用いたオフライン復号でSQLite integrity_check成功。5テーブルすべて0行。
+  Geniusの5テーブルのSQL定義は提供済み1.7由来DBと一致した。
+  鍵導出コードのビルド間互換の一例であり、全ビルド対応を保証する結果ではない。
+- ローカルartifact: `data/macos-actions/run-37186278435/`。
+  復号コピーは`data/macos-actions/run-37186278435-decrypted.itdb`。鍵は保存・表示していない。
+
+戻った本番LibraryのSHA-256も保存済み曲一覧と一致した。読み取り確認のみ。

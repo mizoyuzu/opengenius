@@ -33,7 +33,7 @@ jobs:
         run: python3 scripts/probe_macos_music.py --output data/macos-probe
       - name: Collect report, screenshots and synthetic library
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: macos-music-probe-${{ runner.arch }}-${{ github.run_id }}
           path: data/macos-probe/

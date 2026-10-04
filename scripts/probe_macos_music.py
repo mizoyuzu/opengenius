@@ -72,6 +72,80 @@ def import_script(paths):
     return '\n'.join(lines)
 
 
+def bootstrap_script():
+    """Click only the observed Music automation prompt and welcome button."""
+    return '''with timeout of 22 seconds
+set observedButtons to {}
+set actionsTaken to {}
+set startedAt to current date
+tell application "System Events"
+repeat 36 times
+    if ((current date) - startedAt) >= 20 then exit repeat
+    repeat with appProcess in application processes
+        try
+            set processName to name of appProcess
+            set processWindows to windows of appProcess
+            repeat with w in processWindows
+                set dialogText to ""
+                set uiItems to entire contents of w
+                repeat with uiItem in uiItems
+                    try
+                        if class of uiItem is static text then set dialogText to dialogText & " " & (value of uiItem as text)
+                    end try
+                end repeat
+                set matchingPermission to (dialogText contains "hosted-compute-agent") and (dialogText contains "Music")
+                repeat with uiItem in uiItems
+                    try
+                        if class of uiItem is button then
+                            set buttonName to name of uiItem as text
+                            set buttonLabel to processName & ": " & buttonName
+                            if (count of observedButtons) < 30 and observedButtons does not contain buttonLabel then set end of observedButtons to buttonLabel
+                            if matchingPermission and buttonName is "Allow" then
+                                click uiItem
+                                set end of actionsTaken to "allowed hosted-compute-agent to control Music"
+                            else if processName is "Music" and buttonName is "Start Listening" then
+                                click uiItem
+                                set end of actionsTaken to "dismissed Music welcome"
+                            end if
+                        end if
+                    end try
+                end repeat
+            end repeat
+        end try
+    end repeat
+    delay 0.5
+end repeat
+end tell
+return {actionsTaken, observedButtons}
+end timeout'''
+
+
+def bootstrap_music(runner=subprocess.run, popen=subprocess.Popen):
+    """Trigger Music automation concurrently so the permission UI can appear."""
+    trigger_command = ['osascript', '-e', 'with timeout of 30 seconds\ntell application "Music" to return version\nend timeout']
+    results = {}
+    try:
+        process = popen(trigger_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except OSError as error:
+        return {'automation_trigger': {'status': 'unavailable', 'error_type': type(error).__name__}}
+    try:
+        results['bootstrap_ui'] = run_step(['osascript', '-e', bootstrap_script()], 25, runner)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+            results['automation_trigger'] = {'status': 'ok' if process.returncode == 0 else 'failed',
+                                              'returncode': process.returncode,
+                                              'stdout': (stdout or '')[:12000], 'stderr': (stderr or '')[:12000]}
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=5)
+            results['automation_trigger'] = {'status': 'timeout'}
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
+    return results
+
+
 def library_roots(music_directory):
     if not music_directory.exists():
         return []
@@ -103,7 +177,7 @@ def collect_libraries(music_directory, output, preexisting):
     return records
 
 
-def probe(output, *, runner=subprocess.run, home=None):
+def probe(output, *, runner=subprocess.run, popen=subprocess.Popen, home=None):
     if platform.system() != 'Darwin':
         raise ValueError('this probe requires macOS')
     if os.environ.get('GITHUB_ACTIONS') != 'true':
@@ -137,6 +211,7 @@ def probe(output, *, runner=subprocess.run, home=None):
             for path, frequency in zip(tones, (440, 660)):
                 make_tone(path, frequency)
             step('launch_music', ['open', '-a', str(app)])
+            steps.update(bootstrap_music(runner, popen))
             step('import_synthetic_audio', ['osascript', '-e', import_script(tones)], 60)
             report['import_status'] = steps['import_synthetic_audio']['status']
             # Ask Music to quit so copied DBs are more likely to be flushed.
