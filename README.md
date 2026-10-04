@@ -452,5 +452,6 @@ Musicが保存した形式を使うと2,974曲・214件のGenius ID・関連性7
 
 追加検証では、実観測から作った通常プレイリスト3件・計49項目がMusicの終了・再起動後も
 同じ曲順で保持された。Genius IDと関連性の全SQLテーブルも一致した。
+39起点に拡張した検証でも、Off Vocal除外後の270曲・825本を保持し、全参照の整合性を確認した。
 旧1.5.6.11形式は直接書き直さず、Musicで開いて保存したコピーを土台にする。
 [`prepare_macos_real_rebase.py`による全Library／取り込み後PIDへの適用と実行結果](docs/research/2026-10-04-native-real-library.md)。

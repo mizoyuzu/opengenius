@@ -21,6 +21,25 @@ collector内の成功フラグだけでは合格にしない。
 `audit_macos_real_library.py --manifest <input-manifest>`が再起動後の保存を監査する。
 作成前、最初の終了後、再起動して終了した後のDBは暗号化結果内で回収する。
 
+## 拡張観測と曲種フィルターの適用
+
+Actions run `37210984228`では、追加した10起点を含む39起点の実観測を使用した。
+全体の271曲候補・826本から、明示的なOff Vocal除外で270曲・825本をDBへ保存した。
+Musicで2,974曲を読み込み、正常終了後も全PID・Genius ID・全SQLテーブルが一致した。
+825本の参照は全てmetadata内で解決し、欠落先・欠落起点・未対応BLOBは0件だった。
+通常プレイリスト3件・49項目の曲順、47音源のlocation、3起点の再生進行も確認した。
+
+入力した3コアファイルとrunnerの読み込み前snapshotはバイト単位で一致した。
+終了後のLibraryにはOff Vocal分類の曲へのGenius ID割当が0件で、HDD原本の
+3コアファイルのSHAも作成元の記録と一致した。結果回収後に一時secretは削除した。
+
+`build_real_library_experiment.py --native-template <verified-after-directory>`で、
+原本のSHAに結び付いた照合と分類を維持しながら、Musicが保存した空の
+Genius DBとLibrary形式を出力用に使える。読み込み・正常終了のreport、全PID、
+解析済みmetadata、保存ファイルSHAを照合する。`--cluster-config`と
+`--exclude-kind off_vocal`は共有グラフとDBの作成前に適用する。
+この検証も、Geniusメニューによるネイティブ生成やiPodでの受け入れを証明しない。
+
 GitHub ActionsのmacOS上でMusic.appそのものを動かした。Musicが保存した形式を使うと、実ライブラリ2,974曲・214曲分のGenius ID・関連性723本を読み込み、終了後も保持できた。音源47曲を接続し、3曲の再生進行も確認した。未サインイン環境ではGenius Playlistメニューは無効であり、実際のGenius生成は未確認。
 
 入力は実ライブラリの実験コピー2,974曲、214曲のGenius ID、723本の関連性、3種のシードに対応する実音源47曲。元ライブラリは変更しない。選んだシードはSweden、only my railgun、星の声。

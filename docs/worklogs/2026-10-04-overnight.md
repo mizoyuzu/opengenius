@@ -119,3 +119,30 @@ proof of a scheduler or of a running job.
 - Native-template builder and cluster/exclusion propagation are being implemented
   by `native_fixture_probe`; do not run its unfinished draft before readiness.
 - Paired iPod inventory comparison is being implemented by `library_identity`.
+
+## Completed second batch and native run, 23:58 JST
+
+- Batch v02 completed exit 0, session `25051` terminal: 32 HTTP requests,
+  10/10 actual radio/related observations, no retries/cache hits. Exact argv and
+  summary persisted in its private `execution-provenance.json`.
+- Old and new observations combine to 39 roots, 271 metadata candidates and
+  826 directed edges. Off Vocal exclusion creates 270 assignments / 825 edges.
+- Native-template builder implemented and eight targeted tests passed. Actual
+  full Library generated in `data/real-library-experiment-v03`; source/native
+  provenance kept separate. Paired iPod comparison and capture note completed.
+- Full suite with actual Music executable integration: **197 tests passed**,
+  no skips; log `data/overnight-suite-20261004.log`. Later relation-envelope
+  audit extension has three additional targeted passing tests.
+- Published ciphertext-only overlay commit `d48a270`; native Actions run
+  `37210984228` terminal success, job `111461967664`. Result recovered locally
+  under its run directory, no native job remains live from this batch.
+- Independent audit: 2,974 tracks, 270 Genius IDs, all SQL tables, 825 edges
+  preserved; zero dangling targets, missing sources or unsupported BLOBs.
+  Requested three playlists persist in exact order; 47 locations/three advancing
+  playback positions verified. Expected input core bytes match runner's before
+  snapshot, final Off Vocal assignments zero, source core hashes unchanged.
+- Temporary Actions secret deleted again and empty secret list verified.
+- Apple Account login and actual native Genius/iPod generation remain deferred
+  or unverified. The overnight goal is active; next useful work includes actual
+  UI smoke testing with the expanded dataset and reviewing remaining identity
+  ambiguities. Do not rerun completed batches/jobs merely from old checkpoints.
