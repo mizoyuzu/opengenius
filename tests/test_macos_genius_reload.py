@@ -171,7 +171,7 @@ class ReloadTests(unittest.TestCase):
                     (bundle / 'Preferences.plist').write_bytes(b'synthetic settings')
                     (bundle / 'sentinel').touch()
                 return subprocess.CompletedProcess(command, 1 if command[0] == 'pgrep' else 0, '', '')
-            with patch('probe_macos_genius_reload.platform.system', return_value='Darwin'), patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch('probe_macos_genius_reload.Path.cwd', return_value=home), patch('probe_macos_music.dismiss_music_promotion', return_value={'status': 'not_needed'}, create=True):
+            with patch('probe_macos_genius_reload.platform.system', return_value='Darwin'), patch.dict('os.environ', {'GITHUB_ACTIONS': 'true'}), patch('probe_macos_genius_reload.Path.cwd', return_value=home), patch('probe_macos_music.dismiss_music_promotion', return_value={'status': 'not_needed'}, create=True), patch('summarize_macos_genius_log.summarize_macos_genius_log', return_value={'status': 'ok','counts':{}}):
                 report = probe(fixture, home / 'out', runner=runner, popen=lambda *a, **kw: Process(), home=home)
             self.assertTrue(report['expected_tracks_loaded'])
             self.assertEqual(report['steps']['dismiss_music_promotion']['status'], 'not_needed')

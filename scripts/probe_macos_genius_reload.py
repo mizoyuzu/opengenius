@@ -404,6 +404,8 @@ def probe(fixture, output, *, runner=subprocess.run, popen=subprocess.Popen, hom
                     total += size
                 report['support_files'].append(info)
         report['after_copy_consistent_exit'] = report.get('music_exited', False)
+        from summarize_macos_genius_log import summarize_macos_genius_log
+        report['genius_log_summary'] = summarize_macos_genius_log()
         (output / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
     return report
 
