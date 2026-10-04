@@ -109,7 +109,7 @@ class ReviewSession:
     def evaluate(self, payload):
         if self.engine is None:
             raise ValueError('Offline evaluation inputs were not configured')
-        if not isinstance(payload, dict) or set(payload) - {'tags', 'kind', 'profile', 'root_pid'}:
+        if not isinstance(payload, dict) or set(payload) - {'tags', 'kind', 'excluded_kinds', 'profile', 'root_pid'}:
             raise ValueError('Invalid evaluation fields')
         tags, kind = payload.get('tags', []), payload.get('kind')
         profile = payload.get('profile', PROFILES[0])
@@ -117,7 +117,7 @@ class ReviewSession:
             raise ValueError('Unsupported profile')
         graphs, matcher, config, executable, provenance = self.engine
         labels = classify_tracks(self.config, self.tracks, self.library_hash)
-        filtered, scope = scope_graphs(graphs, labels, tags, kind)
+        filtered, scope = scope_graphs(graphs, labels, tags, kind, excluded_kinds=payload.get('excluded_kinds', []))
         root = payload.get('root_pid')
         if root is not None:
             if not isinstance(root, str):
@@ -204,6 +204,7 @@ def make_handler(session, token):
                     'Selected root has no observations in this scope': '選んだ起点が範囲外です。条件を見直してください。',
                     'Duplicate tags': '同じタグが重複しています。',
                     'Tags must be nonempty strings': 'タグ名を確認してください。',
+                    'Requested kind is also excluded': '対象の種類と除外の種類が同じです。',
                 }
                 self.send(400, {'error': messages.get(str(error), str(error))})
             except Exception:

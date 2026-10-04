@@ -85,6 +85,19 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(result['evaluation']['cluster_config_sha256'], self.session.config_hash())
         self.assertTrue(Path(result['path']).exists())
 
+    def test_excluding_off_vocal_preserves_unclassified_tracks_and_saved_config(self):
+        pids = [t['persistent_id'] for t in self.tracks]
+        before = copy.deepcopy(self.session.config)
+        self.session.engine = ([{'root_pid': pids[0], 'ordered_target_pids': pids[1:]}],
+                               'matcher', b'config', 'executable', {'fixture': True})
+        with patch('evaluate_ytmusic_batch.evaluate_graphs') as evaluate:
+            evaluate.return_value = {'root_results': [], 'root_overlaps': []}
+            result = self.session.evaluate({'excluded_kinds': ['off_vocal']})
+        self.assertEqual(evaluate.call_args.args[0][0]['ordered_target_pids'], [pids[2]])
+        self.assertEqual(result['evaluation']['cluster_scope']['excluded_kinds'], ['off_vocal'])
+        self.assertEqual(self.session.config, before)
+        self.assertEqual(self.snapshot.read_bytes(), self.original_bytes)
+
     def test_http_blocks_cross_origin_and_serves_local_edits(self):
         server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(self.session, 'test-token'))
         thread = threading.Thread(target=server.serve_forever, daemon=True)

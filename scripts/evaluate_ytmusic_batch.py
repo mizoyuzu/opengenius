@@ -255,10 +255,11 @@ def main():
     parser.add_argument('--cluster-config', type=Path)
     parser.add_argument('--cluster-tag', action='append', default=[])
     parser.add_argument('--track-kind', choices=('vocal', 'bgm', 'off_vocal', 'unknown'))
+    parser.add_argument('--exclude-kind', action='append', default=[], choices=('vocal', 'bgm', 'off_vocal', 'unknown'))
     parser.add_argument('--profile', choices=('without-compatible-genre', 'relations-only', 'artist-album-minimum-one'),
                         default='without-compatible-genre')
     args = parser.parse_args()
-    if (args.cluster_tag or args.track_kind) and not args.cluster_config:
+    if (args.cluster_tag or args.track_kind or args.exclude_kind) and not args.cluster_config:
         parser.error('Cluster scope requires --cluster-config')
     if not 1 <= args.limit <= 100:
         parser.error('Limit must be 1..100')
@@ -281,8 +282,9 @@ def main():
         cluster_bytes = args.cluster_config.read_bytes()
         classifications = classify_tracks(json.loads(cluster_bytes, object_pairs_hook=_unique_keys), tracks, library_hash)
         cluster_config_hash = hashlib.sha256(cluster_bytes).hexdigest()
-        if args.cluster_tag or args.track_kind:
-            graphs, cluster_scope = scope_graphs(graphs, classifications, args.cluster_tag, args.track_kind)
+        if args.cluster_tag or args.track_kind or args.exclude_kind:
+            graphs, cluster_scope = scope_graphs(graphs, classifications, args.cluster_tag, args.track_kind,
+                                                excluded_kinds=args.exclude_kind)
     reference = paths['genius_reference'].read_bytes()
     from emulate_genius import database_rows
     config, _, _ = database_rows(reference)

@@ -173,6 +173,31 @@ class ClusterTests(unittest.TestCase):
         self.assertIsNot(filtered[0], graphs[0])
         self.assertEqual(summary['removed_target_count'], 0)
 
+    def test_off_vocal_exclusion_keeps_unknown_without_claiming_vocal(self):
+        classifications = {
+            'A': {'tags': [], 'kind': 'unknown'},
+            'B': {'tags': [], 'kind': 'off_vocal'},
+            'C': {'tags': [], 'kind': 'bgm'},
+        }
+        graphs = [{'root_pid': 'A', 'ordered_target_pids': ['B', 'C'], 'observations': [{'source': 'original'}]},
+                  {'root_pid': 'B', 'ordered_target_pids': ['A'], 'observations': []}]
+        before = copy.deepcopy((graphs, classifications))
+        filtered, summary = scope_graphs(graphs, classifications, excluded_kinds=['off_vocal'])
+        self.assertEqual([g['root_pid'] for g in filtered], ['A'])
+        self.assertEqual(filtered[0]['ordered_target_pids'], ['C'])
+        self.assertEqual(summary['excluded_kinds'], ['off_vocal'])
+        self.assertEqual(summary['removed_target_count'], 2)
+        self.assertEqual((graphs, classifications), before)
+
+    def test_exclusions_reject_conflicts_and_unsupported_kinds(self):
+        labels = {'A': {'tags': [], 'kind': 'unknown'}}
+        graphs = [{'root_pid': 'A', 'ordered_target_pids': []}]
+        for kinds in ('off_vocal', ['karaoke'], [None], ['bgm', 'bgm']):
+            with self.subTest(kinds=kinds), self.assertRaises(ValueError):
+                scope_graphs(graphs, labels, excluded_kinds=kinds)
+        with self.assertRaisesRegex(ValueError, 'also excluded'):
+            scope_graphs(graphs, labels, kind='unknown', excluded_kinds=['unknown'])
+
 
 if __name__ == '__main__':
     unittest.main()

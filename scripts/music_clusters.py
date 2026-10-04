@@ -147,7 +147,7 @@ def classify_tracks(config, tracks, library_hash):
     return result
 
 
-def scope_graphs(graphs, classifications, tags=(), kind=None):
+def scope_graphs(graphs, classifications, tags=(), kind=None, excluded_kinds=()):
     """Restrict all root edges before emulation; retain original observations.
 
     removed_target_count includes every edge removed with an excluded root.
@@ -161,6 +161,14 @@ def scope_graphs(graphs, classifications, tags=(), kind=None):
     requested = [normalize(tag) for tag in tags]
     if kind is not None:
         _kind(kind)
+    if not isinstance(excluded_kinds, (list, tuple)):
+        raise ValueError('Excluded kinds must be a list or tuple')
+    for excluded_kind in excluded_kinds:
+        _kind(excluded_kind)
+    if len(set(excluded_kinds)) != len(excluded_kinds):
+        raise ValueError('Duplicate excluded kinds')
+    if kind in excluded_kinds:
+        raise ValueError('Requested kind is also excluded')
     known_tags, normalized = set(), {}
     for pid, classification in classifications.items():
         if not isinstance(classification, dict):
@@ -181,7 +189,8 @@ def scope_graphs(graphs, classifications, tags=(), kind=None):
             raise ValueError('Graph PID has no classification')
     def accepts(pid):
         current_tags, current_kind = normalized[pid]
-        return set(requested) <= current_tags and (kind is None or current_kind == kind)
+        return (set(requested) <= current_tags and (kind is None or current_kind == kind)
+                and current_kind not in excluded_kinds)
     filtered, excluded, removed = [], [], 0
     for graph in graphs:
         root = graph['root_pid']
@@ -198,7 +207,7 @@ def scope_graphs(graphs, classifications, tags=(), kind=None):
     if not filtered:
         raise ValueError('No roots remain in the requested cluster scope')
     return filtered, {'excluded_root_pids': excluded, 'removed_target_count': removed,
-                      'tags': requested, 'kind': kind}
+                      'tags': requested, 'kind': kind, 'excluded_kinds': list(excluded_kinds)}
 
 
 def _unique_keys(pairs):

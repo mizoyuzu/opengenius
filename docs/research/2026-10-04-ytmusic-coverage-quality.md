@@ -26,3 +26,11 @@
 全て `metadata_match_unverified_recording`。録音の同一性、Musicアプリへの実DB受け入れ、iPodへの反映はいずれも未確認。オフライン評価でネットワーク通信、Library書き込み、ネイティブDB書き込みは行っていない。今回の実行ファイルSHA-256は `a8ddce118ebe19132a26d8b4d7efab7020fa38386aadedeb5f9ce629e6981f6a`。
 
 再評価は `scripts/evaluate_ytmusic_batch.py` の `--profile without-compatible-genre` と `--profile artist-album-minimum-one` を同じ観測集合で実行する。作品範囲の比較では `--cluster-config`、`--cluster-tag`、`--track-kind bgm` を併用する。入力のSHA、起点別曲数、元観測、生成PID列は非公開の実験レポートに保存している。
+
+## Off Vocalの明示的な除外
+
+追加した`--exclude-kind off_vocal`は、明示マーカーまたはユーザー指定で
+Off Vocalとされた曲を起点・関連先から除く。未分類曲は未分類のまま残し、
+歌唱/BGMの推測は増やさない。レビュー画面では「条件」の「除外」で選べる。
+既存29起点の同じ観測で再評価すると、関連辺1本を除き、延べ生成曲数が535→534に
+なった。新しい関係は作らず、元観測を保持したまま選曲候補だけを制限する。

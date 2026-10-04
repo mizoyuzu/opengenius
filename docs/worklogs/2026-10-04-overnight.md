@@ -103,3 +103,19 @@ proof of a scheduler or of a running job.
 - Fresh Nightly auth file prepared locally, but primary signing/session cookies
   are unchanged. Login validity unproven. Account-response diagnostic is being
   implemented offline to distinguish SDK shape errors; no further requests yet.
+
+## Continued work
+
+- Privacy-safe account diagnostic implemented and 12 tests passed. One explicit
+  diagnostic with refreshed local auth returned expected header/name/photo
+  structures and SDK parser success; account validity was actually confirmed.
+- Fresh bounded 10-seed non-IMAS batch `coverage-nightly-nonimas-20261004-v02`
+  now collecting, interval 5 seconds and 40-request cap, no retries. v01 failure
+  preserved. Ask `review_ytmusic_batch` for its live process handle before restart.
+- Optional Off Vocal exclusion implemented in graph scope, evaluator and review
+  API/UI; unknown tracks remain unknown. Ten cluster tests, seven review tests
+  (including HTTP socket) and JavaScript syntax check passed. Existing observed
+  graph loses exactly one edge; generated entries 535→534 across 29 roots.
+- Native-template builder and cluster/exclusion propagation are being implemented
+  by `native_fixture_probe`; do not run its unfinished draft before readiness.
+- Paired iPod inventory comparison is being implemented by `library_identity`.
