@@ -11,6 +11,8 @@ LOG_TIMEOUT_SECONDS = 20
 PREDICATE = ('process == "Music" AND '
              '(eventMessage CONTAINS[c] "genius" OR eventMessage CONTAINS[c] "corrupt")')
 KNOWN_MESSAGES = {
+    'genius_opt_in_operation': 'DoGeniusOptIn',
+    'genius_opt_out_operation': 'DoGeniusOptOut',
     'genius_database_deleted_as_corrupt': 'genius corruption detected; deleting db',
     'genius_cluster_creation_error': 'GeniusCreateClusterContext err',
     'genius_track_list_creation_error': 'GeniusCreateTracksListFromClusterContext err',

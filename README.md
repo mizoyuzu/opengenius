@@ -122,3 +122,15 @@ Genius Playlistメニューは無効だったため、アプリでの生成やiP
 
 初回案内はVision OCRで既知タイトルとNot Nowを特定し、CoreGraphicsの実マウスイベントで
 閉じる。新規合成bundleだけを回収し、Music終了確認を別項目で記録する。
+
+## 128曲へ拡大
+
+[run37192872815](https://github.com/mizoyuzu/opengenius/actions/runs/37192872815)で
+128曲・4,096関係・20ページの合成Genius DBを検証した。
+全曲を読み込め、正常終了後もPID/GID/曲名/長さと全Geniusテーブルを保持した。
+`synthetic-128.json.gz`は新規合成音源だけの再実行用fixture。
+Genius Playlistは無効のままで、生成や推薦品質の検証は別段階。
+
+参加状態1の2曲再試験では曲を読み込めたが、終了後Genius IDと関係DBが消え、
+状態は0へ戻った。前回のCOUNT0は再現せず、曲消失とGeniusデータ消去を区別する。
+統合ログは既知メッセージ件数だけを返し、生ログや値は保存しない。
