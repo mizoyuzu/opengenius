@@ -1,0 +1,58 @@
+name: macOS Genius reload
+
+on:
+  workflow_dispatch:
+    inputs:
+      fixture:
+        description: Compressed synthetic two-tone fixture
+        required: true
+        type: string
+
+      explicit_library:
+        description: Open the restored bundle explicitly
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  reload:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Test fixture protections
+        run: python3 -m unittest discover -s tests -p test_macos_genius_reload.py
+      - name: Decode synthetic fixture
+        env:
+          FIXTURE_PAYLOAD: ${{ inputs.fixture }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from probe_macos_genius_reload import decode_fixture_payload
+          fixture = decode_fixture_payload(os.environ['FIXTURE_PAYLOAD'])
+          Path('data').mkdir(exist_ok=True)
+          Path('data/reload-fixture.json').write_text(json.dumps(fixture))
+          PYTHON
+      - name: Restore synthetic library and reopen Music
+        env:
+          EXPLICIT_LIBRARY: ${{ inputs.explicit_library }}
+        run: |
+          if [ "$EXPLICIT_LIBRARY" = true ]; then
+            python3 scripts/probe_macos_genius_reload.py --fixture data/reload-fixture.json --output data/macos-reload --explicit-library
+          else
+            python3 scripts/probe_macos_genius_reload.py --fixture data/reload-fixture.json --output data/macos-reload
+          fi
+      - name: Collect reload results
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: macos-genius-reload-${{ github.run_id }}
+          path: data/macos-reload/
+          retention-days: 3
+          if-no-files-found: warn
