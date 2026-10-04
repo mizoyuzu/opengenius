@@ -1,0 +1,41 @@
+name: macOS Music probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: macOS runner
+        type: choice
+        default: macos-26
+        options:
+          - macos-26
+          - macos-26-intel
+  push:
+    branches:
+      - macos-probe
+    paths:
+      - .github/workflows/macos-music-probe.yml
+      - scripts/probe_macos_music.py
+      - tests/test_macos_music_probe.py
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Test probe helpers
+        run: python3 -m unittest discover -s tests -p test_macos_music_probe.py
+      - name: Inspect Music with synthetic audio
+        run: python3 scripts/probe_macos_music.py --output data/macos-probe
+      - name: Collect report, screenshots and synthetic library
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-music-probe-${{ runner.arch }}-${{ github.run_id }}
+          path: data/macos-probe/
+          retention-days: 3
+          if-no-files-found: warn
