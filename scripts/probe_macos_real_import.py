@@ -51,7 +51,7 @@ def real_import_script(media_paths):
         if not isinstance(pid, str) or not PID.fullmatch(pid):
             raise ValueError('invalid original PID')
         lines += ['try', 'set probeStage to "beforePIDs"', 'set beforePIDs to my currentLibraryPIDs()',
-                  'set probeStage to "add"', f'add {{(POSIX file {apple_string(path)})}}',
+                  'set probeStage to "add"', f'add {{(POSIX file {apple_string(path)})}}', 'delay 0.2',
                   'set probeStage to "afterPIDs"', 'set afterPIDs to my currentLibraryPIDs()',
                   'set probeStage to "resolving"', 'set newPIDs to {}',
                   'repeat with candidatePID in afterPIDs', 'set candidateText to candidatePID as text',
@@ -62,9 +62,12 @@ def real_import_script(media_paths):
                   'set probeStage to "getduration"', 'set nativeDuration to (get duration of t)',
                   'set durationText to nativeDuration as text',
                   'set probeStage to "getname"', 'set nativeTitle to (get name of t)',
+                  'set nativePath to "-"', 'try',
                   'set probeStage to "getlocation"', 'set nativeLocation to (get location of t)',
                   'set probeStage to "coerceLocation"', 'set nativePath to POSIX path of nativeLocation',
-                  'set probeStage to "formatting"',
+                  'on error locationErrorText number locationErrorNumber',
+                  f'set outputText to outputText & "IMPORT_LOCATION_FAILED" & tab & "{pid}" & tab & (locationErrorNumber as text) & tab & probeStage & tab & (my sanitizedDiagnostic(locationErrorText)) & linefeed',
+                  'end try', 'set probeStage to "formatting"',
                   f'set outputText to outputText & "IMPORTED" & tab & "{pid}" & tab & nativePID & tab & durationText & tab & nativeTitle & tab & nativePath & linefeed',
                   'on error errorText number errorNumber',
                   f'set outputText to outputText & "IMPORT_FAILED" & tab & "{pid}" & tab & (errorNumber as text) & tab & probeStage & tab & (my sanitizedDiagnostic(errorText)) & linefeed', 'end try']
@@ -82,8 +85,12 @@ def parse_import(stdout, manifest):
         raise ValueError('native import count exceeds selected media limit')
     originals = {t['persistent_id']: t for t in manifest['tracks']}
     seen, native_seen, records = set(), set(), []
+    location_errors = {}
     for line in lines[1:]:
         fields = line.split('\t')
+        if len(fields) == 5 and fields[0] == 'IMPORT_LOCATION_FAILED' and fields[1] in originals and fields[1] not in location_errors:
+            location_errors[fields[1]] = {'native_error_number': int(fields[2]), 'native_error_stage': fields[3], 'native_error_text': fields[4]}
+            continue
         if len(fields) not in (2, 3, 5, 6) or fields[1] not in originals or fields[1] in seen:
             raise ValueError('invalid or duplicate original import PID')
         seen.add(fields[1])
@@ -94,12 +101,12 @@ def parse_import(stdout, manifest):
         if len(fields) != 6 or fields[0] != 'IMPORTED' or not PID.fullmatch(fields[2]) or fields[2] in native_seen:
             raise ValueError('invalid or duplicate native import PID')
         duration = float(fields[3])
-        if not math.isfinite(duration) or not 0 <= duration <= 86400 or not fields[4] or not Path(fields[5]).is_absolute():
+        if not math.isfinite(duration) or not 0 <= duration <= 86400 or not fields[4] or (fields[5] != '-' and not Path(fields[5]).is_absolute()):
             raise ValueError('invalid native imported metadata')
         native_seen.add(fields[2])
         records.append({'original_pid': fields[1], 'persistent_id': fields[2], 'duration_seconds': duration,
                         'duration_ms': round(duration * 1000), 'relative_media_path': originals[fields[1]]['relative_media_path'],
-                        'title': fields[4], 'native_location': fields[5], 'status': 'imported'})
+                        'title': fields[4], 'native_location': fields[5] if fields[5] != '-' else None, 'location_diagnostic': location_errors.get(fields[1]), 'status': 'imported'})
     if seen != set(originals) or count < len(native_seen):
         raise ValueError('native import rows and Library count inconsistent')
     return {'native_library_count': count, 'tracks': records, 'all_selected_media_imported': len(native_seen) == len(originals) == count, 'native_tracks_without_mapping': count - len(native_seen)}

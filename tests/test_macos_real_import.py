@@ -48,6 +48,10 @@ class RealImportTests(unittest.TestCase):
         self.assertIn('beforePIDs does not contain', script)
         self.assertIn('if (count of newPIDs) is not 1', script)
         self.assertIn('on error errorText number errorNumber', script)
+        self.assertIn('set nativeDuration to (get duration of t)', script)
+        self.assertIn('set nativeLocation to (get location of t)', script)
+        self.assertIn('IMPORT_LOCATION_FAILED', script)
+        self.assertIn('sanitizedDiagnostic', script)
         self.assertNotIn('addedResult', script)
 
     def test_partial_import_is_reported_and_ambiguous_native_ids_rejected(self):
@@ -59,6 +63,14 @@ class RealImportTests(unittest.TestCase):
         self.assertEqual(diagnostics['native_tracks_without_mapping'], 2)
         self.assertEqual(diagnostics['tracks'][0]['native_error_number'], -1728)
         self.assertFalse(diagnostics['all_selected_media_imported'])
+        staged = parse_import(f'IMPORT_LIBRARY_COUNT\t2\nIMPORT_FAILED\t{P1}\t-1700\tgetduration\tCannot coerce value\nIMPORT_FAILED\t{P2}\t-1700\tgetname\tCannot get name\n', MANIFEST)
+        self.assertEqual(staged['tracks'][0]['native_error_stage'], 'getduration')
+        self.assertEqual(staged['tracks'][0]['native_error_text'], 'Cannot coerce value')
+        optional_location = NATIVE.replace(f'IMPORTED\t{P1}', f'IMPORT_LOCATION_FAILED\t{P1}\t-1700\tcoerceLocation\tCannot coerce missing value\nIMPORTED\t{P1}').replace('/tmp/native/one.m4a', '-')
+        mapped = parse_import(optional_location, MANIFEST)
+        self.assertTrue(mapped['all_selected_media_imported'])
+        self.assertIsNone(mapped['tracks'][0]['native_location'])
+        self.assertEqual(mapped['tracks'][0]['location_diagnostic']['native_error_stage'], 'coerceLocation')
         for bad in (NATIVE.replace(N2, N1), NATIVE.replace('\t200\t', '\tnan\t'), NATIVE.replace('IMPORT_LIBRARY_COUNT\t2', 'IMPORT_LIBRARY_COUNT\t1'), NATIVE.replace(P2, 'FFFFFFFFFFFFFFFF')):
             with self.assertRaises(ValueError):
                 parse_import(bad, MANIFEST)

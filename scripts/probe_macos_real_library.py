@@ -189,7 +189,8 @@ def relink_script(media_paths):
         lines += [f'set selectedTracks to every file track of library playlist 1 whose persistent ID is "{pid}"',
                   'if (count of selectedTracks) is 1 then', 'set t to item 1 of selectedTracks', 'try',
                   f'set location of t to (POSIX file {apple_string(path)})',
-                  'set outputText to outputText & "LINK" & tab & (persistent ID of t) & tab & "OK" & tab & (POSIX path of location of t) & linefeed',
+                  'set linkedLocation to (get location of t)', 'set linkedPath to POSIX path of linkedLocation',
+                  'set outputText to outputText & "LINK" & tab & (persistent ID of t) & tab & "OK" & tab & linkedPath & linefeed',
                   'on error', f'set outputText to outputText & "LINK" & tab & "{pid}" & tab & "FAILED" & linefeed', 'end try',
                   'else', f'set outputText to outputText & "LINK" & tab & "{pid}" & tab & "NOT_FILE_TRACK" & linefeed', 'end if']
     return '\n'.join(lines + ['end tell', 'return outputText', 'end timeout'])
