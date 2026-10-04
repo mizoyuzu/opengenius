@@ -302,3 +302,22 @@ proof of a scheduler or of a running job.
 - On resume, inspect service21595 and delivery-health.json before starting a new
   service. Retained data/driver inputs allow cached/offline rebuilds; do not
   repeat the26-request outgoing collection or completed macOS runs gratuitously.
+
+## Completion audit for the overnight scope
+
+| User requirement | Authoritative evidence | Outcome |
+| --- | --- | --- |
+| Defer Apple login | All native menu states disabled; no login/account creation | Preserved |
+| Use actual available songs/data for useful validation | Native run37236418696, audited286IDs/885edges/47locations/3advancing playbacks | Verified |
+| Advance source/recommendation validation | Six actual outgoing observations,26HTTP; fixed-input39→45root comparison | Verified |
+| Parallel delegation where useful | All eight known child agents terminal; reviewed outputs integrated | Verified |
+| Continue development | Credit evidence, root-subset generation, input/config sync, shortest-path detail,214tests | Verified |
+| Preserve enough state after interruption | Checkpoint, immutable inputs, driver backups, exact run/session IDs; resumed once | Verified |
+| Preserve original Library | Core hashes match pre-build source; classifier/map SHA unchanged | Verified |
+| Keep results concrete/reviewable | Local commits through ea07734;45root localhost64430 UI tested byHTTP/browser | Verified |
+| Finish native transport safely | Run terminal success; downloaded encrypted result; secret list[] | Verified |
+
+This audit covers time-boxed work with login deferred. It does not certify the
+whole OpenGenius product: genuine native Genius generation, recording identity,
+Apple rank compatibility and physical iPod acceptance remain explicitly open.
+All experimental services stopped; the intentional localhost delivery UI remains.
