@@ -209,7 +209,7 @@ class MacOSProbeTests(unittest.TestCase):
                 result = probe(home / 'out', runner=runner, popen=popen, home=home, track_count=128)
             self.assertEqual(result['track_count'], 128)
             self.assertEqual(make_audio.call_count, 128)
-            self.assertEqual(make_audio.call_args_list[-1].args, (home / 'out/synthetic-media/synthetic-tone-128.wav', tone_frequency(128)))
+            self.assertEqual(make_audio.call_args_list[-1].args, ((home / 'out/synthetic-media/synthetic-tone-128.wav').resolve(), tone_frequency(128)))
             self.assertEqual(triggered[0].count('(POSIX file'), 128)
 
     def test_bootstrap_permission_whitelist_and_bounded_loop(self):
