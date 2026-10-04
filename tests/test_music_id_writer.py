@@ -50,6 +50,17 @@ class MusicIDWriterTests(unittest.TestCase):
         self.assertEqual(changed[12 + 0xD0:], expanded[12 + 0xD0:])
         self.assertEqual(len(records), 1)
 
+    def test_zero_secondary_length_profile_is_preserved(self):
+        expanded, original = library_fixture()
+        template = bytearray(original)
+        struct.pack_into('<I', template, 128, 0)
+        self.assertEqual(encode_library(expanded, bytes(template)), bytes(template))
+        changed, _ = patch_ids(expanded, [self.assignment()])
+        output = encode_library(changed, bytes(template))
+        self.assertEqual(struct.unpack_from('<I', output, 128)[0], 0)
+        self.assertEqual(struct.unpack_from('<I', output, 8)[0], len(output))
+        self.assertEqual(decode_musicdb(output), changed)
+
     def test_rejects_existing_missing_duplicate_and_unrepresentable_ids(self):
         expanded, encoded = library_fixture()
         for assignments in [[self.assignment(34, 51)], [self.assignment(99, 51)],

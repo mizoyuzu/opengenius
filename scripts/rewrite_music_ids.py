@@ -18,7 +18,7 @@ from inspect_music_library import decode_musicdb, parse_tracks, u32
 
 def encode_library(expanded, template):
     if (len(template) < 160 or template[:4] != b'hfma' or u32(template, 4) != 160
-            or u32(template, 8) != len(template) or u32(template, 128) != len(template)
+            or u32(template, 8) != len(template) or u32(template, 128) not in (0, len(template))
             or u32(template, 84) != 102400):
         raise ValueError('Unsupported Library hfma header profile')
     parse_tracks(expanded)
@@ -28,7 +28,9 @@ def encode_library(expanded, template):
         raise ValueError('Library exceeds uint32 length')
     header = bytearray(template[:160])
     struct.pack_into('<I', header, 8, length)
-    struct.pack_into('<I', header, 128, length)
+    # Music 1.6.6 writes zero here; the supplied 1.7 sample repeats length.
+    if u32(template, 128):
+        struct.pack_into('<I', header, 128, length)
     encrypted_size = min(u32(header, 84), len(compressed)) // 16 * 16
     cipher = Cipher(algorithms.AES(b'BHUILuilfghuila3'), modes.ECB()).encryptor()
     payload = cipher.update(compressed[:encrypted_size]) + cipher.finalize() + compressed[encrypted_size:]
