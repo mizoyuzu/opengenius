@@ -225,11 +225,29 @@ print(String(data: data, encoding: .utf8)!)
             raise ValueError('Invalid OCR coordinates')
     except (ValueError, TypeError, KeyError, AttributeError):
         return {'status': 'skipped', 'reason': 'invalid_ocr_result'}
-    click = run_step(['osascript', '-e',
-        'with timeout of 10 seconds\ntell application "System Events"\n'
-        'set frontmost of process "Music" to true\n'
-        f'click at {{{round(x)}, {round(y)}}}\nend tell\nend timeout'], 15, runner)
-    return {'status': click['status'], 'action': 'clicked_ocr_verified_music_not_now', 'click': click}
+    activate = run_step(['osascript', '-e',
+        'with timeout of 10 seconds\ntell application "System Events" to set frontmost of process "Music" to true\nend timeout'], 15, runner)
+    if activate.get('status') != 'ok':
+        return {'status': 'skipped', 'reason': 'music_activation_failed', 'activate': activate}
+    # System Events click-at resolves AXStaticText here but does not press its
+    # enclosing web control. Post the real mouse down/up at the OCR target.
+    mouse = output / 'click-promotion.swift'
+    mouse.write_text(r'''import Foundation
+import CoreGraphics
+let x = Double(CommandLine.arguments[1])!
+let y = Double(CommandLine.arguments[2])!
+let point = CGPoint(x: x, y: y)
+guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
+                        mouseCursorPosition: point, mouseButton: .left),
+      let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp,
+                      mouseCursorPosition: point, mouseButton: .left) else { exit(2) }
+down.post(tap: .cghidEventTap)
+Thread.sleep(forTimeInterval: 0.1)
+up.post(tap: .cghidEventTap)
+''')
+    click = run_step(['swift', str(mouse), str(round(x)), str(round(y))], 45, runner)
+    return {'status': click['status'], 'action': 'posted_mouse_click_on_ocr_verified_music_not_now', 'click': click}
+
 
 
 def library_roots(music_directory):

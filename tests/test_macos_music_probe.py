@@ -40,7 +40,8 @@ class MacOSProbeTests(unittest.TestCase):
             clicks = [c for c in commands if c[0] == 'osascript']
             self.assertEqual(bool(clicks), should_click)
             if should_click:
-                self.assertIn('click at {325, 671}', clicks[0][-1])
+                self.assertIn('frontmost', clicks[0][-1])
+                self.assertEqual(commands[-1][-2:], ['325', '671'])
                 self.assertEqual(result['status'], 'ok')
             else:
                 self.assertEqual(result['status'], 'skipped')
