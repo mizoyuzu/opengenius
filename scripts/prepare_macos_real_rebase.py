@@ -13,12 +13,23 @@ from genius_format import pack_similarities, parse_similarities, unsigned_id
 from inspect_music_library import decode_musicdb, parse_tracks
 from rewrite_genius import encrypt_pages, table_snapshot
 from rewrite_music_ids import encode_library, patch_ids
+from prepare_music_genius_state import inspect_state_pair, prepare_state_blobs
 
 CORE = ('Library.musicdb', 'Genius.itdb', 'Library Preferences.musicdb')
 SUPPORT = ('Application.musicdb', 'Extras.itdb', 'Preferences.plist', 'sentinel')
 
 
-def prepare(native, mapping_path, original, input_manifest, executable, output):
+def prepare_output_state(blobs, library, genius, requested):
+    prepared = {**blobs, 'Library.musicdb': library, 'Genius.itdb': genius}
+    before = inspect_state_pair(blobs)
+    changes = None
+    if requested:
+        prepared, changes = prepare_state_blobs(prepared)
+    return prepared, {'requested': requested, 'before': before,
+                      'after': inspect_state_pair(prepared), 'changes': changes}
+
+
+def prepare(native, mapping_path, original, input_manifest, executable, output, *, local_genius_opt_in=False):
     native, original, output = Path(native).resolve(), Path(original).resolve(), Path(output).resolve()
     if output.exists() or any(output.is_relative_to(p) or p.is_relative_to(output) for p in (native, original)):
         raise ValueError('output must be new and separate')
@@ -78,25 +89,26 @@ def prepare(native, mapping_path, original, input_manifest, executable, output):
             raise ValueError('encrypted dataset did not roundtrip')
     patched, changes = patch_ids(decode_musicdb(blobs['Library.musicdb']), assignments)
     library = encode_library(patched, blobs['Library.musicdb'])
+    prepared, local_state = prepare_output_state(blobs, library, encrypted, local_genius_opt_in)
     output.mkdir(parents=True, mode=0o700)
     bundle = output / 'Music Library.musiclibrary'; bundle.mkdir()
     for name in CORE + SUPPORT:
         if (native / name).is_file() and not (native / name).is_symlink():
             shutil.copyfile(native / name, bundle / name)
-    (bundle / 'Library.musicdb').write_bytes(library)
-    (bundle / 'Genius.itdb').write_bytes(encrypted)
+    for name, raw in prepared.items():
+        (bundle / name).write_bytes(raw)
     rebased_manifest = {'schema_version': 1, 'expected_library_track_count': len(imported),
                         'tracks': [{'persistent_id': t['persistent_id'], 'title': t['title'], 'relative_media_path': t['relative_media_path']} for t in imported],
                         'seeds': [by_original[p]['persistent_id'] for p in manifest['seeds']]}
     (output / 'manifest.json').write_text(json.dumps(rebased_manifest, ensure_ascii=False))
     summary = {'native_tracks': len(imported), 'genius_ids_patched': len(changes), 'observed_edges_retained': edge_count,
-               'account_preferences_changed': False, 'native_reload_verified': False}
+               'account_preferences_changed': False, 'local_genius_state': local_state, 'native_reload_verified': False}
     (output / 'preparation-report.json').write_text(json.dumps(summary, indent=2))
     return summary
 
 
 
-def prepare_full(native, original, input_manifest, executable, output):
+def prepare_full(native, original, input_manifest, executable, output, *, local_genius_opt_in=False):
     """Keep all native PIDs while adding the original observed Genius dataset."""
     native, original, output = Path(native).resolve(), Path(original).resolve(), Path(output).resolve()
     if output.exists() or any(output.is_relative_to(p) or p.is_relative_to(output) for p in (native, original)):
@@ -144,17 +156,18 @@ def prepare_full(native, original, input_manifest, executable, output):
     by_pid = {t['persistent_id']: t for t in native_tracks}
     if any(t['persistent_id'] not in by_pid or by_pid[t['persistent_id']].get('title') != t['title'] for t in manifest['tracks']):
         raise ValueError('selected native tracks differ from manifest')
+    prepared, local_state = prepare_output_state(blobs, library, encrypted, local_genius_opt_in)
     output.mkdir(parents=True, mode=0o700)
     bundle = output / 'Music Library.musiclibrary'; bundle.mkdir()
     for name in CORE + SUPPORT:
         if (native / name).is_file() and not (native / name).is_symlink():
             shutil.copyfile(native / name, bundle / name)
-    (bundle / 'Library.musicdb').write_bytes(library)
-    (bundle / 'Genius.itdb').write_bytes(encrypted)
+    for name, raw in prepared.items():
+        (bundle / name).write_bytes(raw)
     (output / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False))
     summary = {'native_tracks': len(native_tracks), 'genius_ids_patched': len(changes),
                'observed_edges_retained': sum(len(parse_similarities(blob)[1]) for blob in relations.values()),
-               'account_preferences_changed': False, 'native_reload_verified': False}
+               'account_preferences_changed': False, 'local_genius_state': local_state, 'native_reload_verified': False}
     (output / 'preparation-report.json').write_text(json.dumps(summary, indent=2))
     return summary
 
@@ -165,13 +178,15 @@ def main():
         p.add_argument('--' + name, type=Path, required=True)
     p.add_argument('--mapping', type=Path)
     p.add_argument('--full-library', action='store_true')
+    p.add_argument('--local-genius-opt-in', action='store_true',
+                   help='Set both local Genius state bytes in the output copy; no Apple activation')
     a = p.parse_args()
     if a.full_library:
-        result = prepare_full(a.native, a.original, a.manifest, a.executable, a.output)
+        result = prepare_full(a.native, a.original, a.manifest, a.executable, a.output, local_genius_opt_in=a.local_genius_opt_in)
     else:
         if not a.mapping:
             p.error('--mapping is required for imported subset rebasing')
-        result = prepare(a.native, a.mapping, a.original, a.manifest, a.executable, a.output)
+        result = prepare(a.native, a.mapping, a.original, a.manifest, a.executable, a.output, local_genius_opt_in=a.local_genius_opt_in)
     print(json.dumps(result))
 
 if __name__ == '__main__':

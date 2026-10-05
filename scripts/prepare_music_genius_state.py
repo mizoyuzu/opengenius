@@ -18,7 +18,7 @@ from inspect_music_library import decode_musicdb, u32
 from rewrite_music_ids import encode_library
 
 
-def patch_state(raw):
+def inspect_state(raw):
     expanded = decode_musicdb(raw)
     position = expanded.find(b"plma")
     if (position < 0 or expanded.find(b"plma", position + 1) >= 0
@@ -26,6 +26,11 @@ def patch_state(raw):
             or position + 194 > len(expanded)):
         raise ValueError("Unsupported or ambiguous plma profile")
     offset = position + 12
+    return expanded, offset
+
+
+def patch_state(raw):
+    expanded, offset = inspect_state(raw)
     if expanded[offset] not in (0, 1):
         raise ValueError("Refusing to overwrite a transitional Genius state")
     changed = bytearray(expanded)
@@ -50,13 +55,26 @@ def encode_preferences(expanded, template):
             + cipher.finalize() + compressed[encrypted_size:])
 
 
-def prepare_pair(source, output, *, allow_unverified_profile=False):
-    source, output = Path(source), Path(output)
-    if output.exists():
-        raise ValueError("Output must be a new directory")
-    prepared, report, key_headers = {}, {}, []
-    for name in ("Library.musicdb", "Library Preferences.musicdb"):
-        raw = (source / name).read_bytes()
+STATE_FILES = ("Library.musicdb", "Library Preferences.musicdb")
+
+
+def inspect_state_pair(blobs):
+    """Report local persisted state without exposing Genius account/key values."""
+    states, headers = {}, []
+    for name in STATE_FILES:
+        expanded, offset = inspect_state(blobs[name])
+        states[name] = expanded[offset]
+        headers.append(extract_key_header(blobs[name]))
+    return {"states": states, "states_match": len(set(states.values())) == 1,
+            "locally_enabled": all(value == 1 for value in states.values()),
+            "key_headers_match": headers[0] == headers[1]}
+
+
+def prepare_state_blobs(blobs, *, allow_unverified_profile=False):
+    """Prepare both state bytes in memory; preserve every other expanded byte."""
+    prepared, report, key_headers = dict(blobs), {}, []
+    for name in STATE_FILES:
+        raw = blobs[name]
         original, expanded, offset = patch_state(raw)
         if name == "Library.musicdb":
             encoded = encode_library(expanded, raw,
@@ -82,6 +100,15 @@ def prepare_pair(source, output, *, allow_unverified_profile=False):
         }
     if key_headers[0] != key_headers[1]:
         raise ValueError("Source DBs have different Genius key headers")
+    return prepared, report
+
+
+def prepare_pair(source, output, *, allow_unverified_profile=False):
+    source, output = Path(source), Path(output)
+    if output.exists():
+        raise ValueError("Output must be a new directory")
+    blobs = {name: (source / name).read_bytes() for name in STATE_FILES}
+    prepared, report = prepare_state_blobs(blobs, allow_unverified_profile=allow_unverified_profile)
     output.mkdir(parents=True)
     for name, raw in prepared.items():
         (output / name).write_bytes(raw)

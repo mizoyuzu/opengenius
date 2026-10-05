@@ -1,7 +1,8 @@
 """Build a local experimental Library copy from real YTMusic radio/related edges.
 
-Requires an empty target Genius DB and zero source Genius IDs. Never opts into
-Genius, edits source files, uploads data, or claims native Music/iPod acceptance.
+Requires an empty target Genius DB and zero source Genius IDs. Local state
+preparation requires --local-genius-opt-in. Never activates Apple Genius, edits
+source files, uploads data, or claims native Music/iPod acceptance.
 """
 import argparse
 import hashlib
@@ -17,11 +18,12 @@ from decrypt_genius import derive_key, decrypt_pages, extract_key_header, valida
 from emulate_genius import MusicCore, database_rows
 from evaluate_ytmusic_batch import collect_graphs, merge_graphs, observation_paths, relation_distances, shared_rows
 from genius_dataset import append_dataset
-from genius_profiles import distance_profiles
+from genius_profiles import distance_profiles, artist_preference_config
 from inspect_music_library import decode_musicdb, parse_tracks
 from music_identity_map import IdentityMap, load_library
 from rewrite_genius import encrypt_pages, table_snapshot
 from rewrite_music_ids import encode_library, patch_ids
+from prepare_music_genius_state import inspect_state_pair, prepare_state_blobs
 
 CORE_FILES = ('Library.musicdb', 'Genius.itdb', 'Library Preferences.musicdb')
 SUPPORT_FILES = ('Application.musicdb', 'Extras.itdb', 'Preferences.plist', 'sentinel')
@@ -137,7 +139,7 @@ def initialize_empty_database(clear, config, metadata, similarities, limit):
 
 
 def build(bundle, identity_map, directories, extras, reference, executable, profile, limit, *,
-          native_template=None, cluster_config=None, cluster_tags=(), track_kind=None, excluded_kinds=()):
+          native_template=None, cluster_config=None, cluster_tags=(), track_kind=None, excluded_kinds=(), local_genius_opt_in=False, artist_preference='neutral'):
     if not 1 <= limit <= 100:
         raise ValueError('Playlist limit must be 1..100')
     source_core = {name: (bundle / name).read_bytes() for name in CORE_FILES}
@@ -164,7 +166,7 @@ def build(bundle, identity_map, directories, extras, reference, executable, prof
     variants = distance_profiles(config)
     if profile not in variants:
         raise ValueError('Unsupported distance profile')
-    config = variants[profile]
+    config = artist_preference_config(variants[profile], artist_preference)
     header = extract_key_header(source['Library Preferences.musicdb'])
     key, _ = derive_key(executable, header)
     clear = decrypt_pages(source['Genius.itdb'], key)
@@ -213,6 +215,14 @@ def build(bundle, identity_map, directories, extras, reference, executable, prof
                                       'title': by_pid[pid].get('title'), 'artist': by_pid[pid].get('artist'),
                                       'duration_ms': by_pid[pid].get('duration_ms'),
                                       'observed_relation_hops': distances[pid], 'identity_status': 'metadata_match_unverified_recording'} for pid in selected]})
+    output_files = {**source, 'Library.musicdb': encoded, 'Genius.itdb': encrypted}
+    input_state = inspect_state_pair(source)
+    state_changes = None
+    if local_genius_opt_in:
+        if not ids or not similarities:
+            raise ValueError('Local Genius opt-in requires a populated relation dataset')
+        output_files, state_changes = prepare_state_blobs(output_files)
+    output_state = inspect_state_pair(output_files)
     report = {'schema_version': 1, 'source_library_sha256': library_hash, 'library_input': provenance,
               'source_core_sha256': {name: sha(blob) for name, blob in source_core.items()},
               'native_template_provenance': template_provenance, 'cluster_classification': cluster_provenance,
@@ -221,14 +231,15 @@ def build(bundle, identity_map, directories, extras, reference, executable, prof
               'identity_map_sha256': sha(identity_map.read_bytes()), 'observation_inputs': inputs,
               'seed_manifests': manifests, 'skipped_snapshots': skipped, 'library_track_count': len(tracks),
               'related_track_count': len(ids), 'seed_count': len(roots), 'directed_relation_count': sum(len(v) for v in edges.values()),
-              'profile': profile, 'genius_table_counts': counts, 'codec_roundtrip_verified': True,
-              'library_track_metadata_preserved': True, 'genius_preferences_unchanged': True,
-              'genius_opt_in_attempted': False, 'network_requests': 0, 'uploaded_personal_data': False,
+              'profile': profile, 'artist_preference': artist_preference, 'genius_table_counts': counts, 'codec_roundtrip_verified': True,
+              'library_track_metadata_preserved': True, 'genius_preferences_unchanged': output_files['Library Preferences.musicdb'] == source['Library Preferences.musicdb'],
+              'local_genius_state': {'requested': local_genius_opt_in, 'before': input_state, 'after': output_state, 'changes': state_changes},
+              'genius_opt_in_attempted': local_genius_opt_in, 'official_genius_opt_in_attempted': False, 'network_requests': 0, 'uploaded_personal_data': False,
               'native_music_app_acceptance_verified': False, 'ipod_acceptance_verified': False,
               'identity_status': 'metadata_match_unverified_recording', 'results': results}
     provenance_edges = [{'root_pid': g['root_pid'], 'ordered_target_pids': g['ordered_target_pids'],
                          'input': g['input'], 'observations': g['observations'], 'candidate_groups': g['candidate_groups']} for g in graphs]
-    return {**source, 'Library.musicdb': encoded, 'Genius.itdb': encrypted}, report, assignments, changes, provenance_edges
+    return output_files, report, assignments, changes, provenance_edges
 
 
 def main():
@@ -239,7 +250,10 @@ def main():
     p.add_argument('--extra-observation', type=Path, action='append', default=[])
     p.add_argument('--profile', default='artist-album-minimum-one', choices=('baseline', 'artist-album-minimum-one', 'relations-only'))
     p.add_argument('--limit', type=int, default=25)
+    p.add_argument('--artist-preference', choices=('neutral', 'slight', 'moderate'), default='neutral')
     p.add_argument('--native-template', type=Path)
+    p.add_argument('--local-genius-opt-in', action='store_true',
+                   help='Set both local Genius state bytes in the output copy; no Apple activation')
     p.add_argument('--cluster-config', type=Path)
     p.add_argument('--cluster-tag', action='append', default=[])
     p.add_argument('--track-kind', choices=('vocal','bgm','off_vocal','unknown'))
@@ -257,7 +271,7 @@ def main():
     files, report, assignments, changes, edges = build(source, a.identity_map, a.observations_directory,
                                                       a.extra_observation, a.genius_reference, a.executable, a.profile, a.limit,
                                                       native_template=a.native_template, cluster_config=a.cluster_config,
-                                                      cluster_tags=a.cluster_tag, track_kind=a.track_kind, excluded_kinds=a.exclude_kind)
+                                                      cluster_tags=a.cluster_tag, track_kind=a.track_kind, excluded_kinds=a.exclude_kind, local_genius_opt_in=a.local_genius_opt_in, artist_preference=a.artist_preference)
     # Check inputs again before writing the independent experimental bundle.
     if any(sha((source / name).read_bytes()) != report['source_core_sha256'][name] for name in CORE_FILES):
         raise ValueError('Source Library changed during the experiment')

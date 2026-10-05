@@ -9,6 +9,7 @@ from decrypt_genius import derive_key, decrypt_pages, extract_key_header, valida
 from inspect_music_library import decode_musicdb, parse_tracks
 from genius_format import parse_similarities, unsigned_id
 from rewrite_genius import table_snapshot
+from prepare_music_genius_state import inspect_state_pair
 
 
 def audit_ordinary_playlists(report, manifest):
@@ -57,13 +58,17 @@ def audit_relation_graph(connection):
 def audit(directory, executable, manifest=None):
     directory = Path(directory)
     report = json.loads((directory / 'report.json').read_text())
-    counts, snapshots, tracks, graphs = {}, {}, {}, {}
+    counts, snapshots, tracks, graphs, states, state_headers = {}, {}, {}, {}, {}, {}
     for stage in ('before', 'after'):
         root = directory / stage
         recorded = {entry['path']: entry for entry in report[f'{stage}_files']}
         for name in ('Library.musicdb', 'Genius.itdb', 'Library Preferences.musicdb'):
             if name not in recorded or hashlib.sha256((root / name).read_bytes()).hexdigest() != recorded[name]['sha256']:
                 raise ValueError('native snapshot differs from recorded hash')
+        states[stage] = inspect_state_pair({name: (root / name).read_bytes()
+                                            for name in ('Library.musicdb', 'Library Preferences.musicdb')})
+        state_headers[stage] = tuple(extract_key_header((root / name).read_bytes())
+                                    for name in ('Library.musicdb', 'Library Preferences.musicdb'))
         tracks[stage], _ = parse_tracks(decode_musicdb((root / 'Library.musicdb').read_bytes()))
         key, _ = derive_key(executable, extract_key_header((root / 'Library Preferences.musicdb').read_bytes()))
         clear = decrypt_pages((root / 'Genius.itdb').read_bytes(), key)
@@ -77,8 +82,13 @@ def audit(directory, executable, manifest=None):
     gids_preserved = same_ids and all(by_pid['before'][pid]['genius_id'] == by_pid['after'][pid]['genius_id'] for pid in by_pid['before'])
     result = {'schema_version': 1, 'track_counts': {s: len(t) for s, t in tracks.items()},
             'persistent_ids_preserved': same_ids, 'genius_ids_preserved': gids_preserved,
+            'parsed_track_metadata_preserved': same_ids and by_pid['before'] == by_pid['after'],
             'genius_logical_tables_preserved': snapshots['before'] == snapshots['after'],
-            'table_counts': counts, 'genius_relation_graphs': graphs,
+            'table_counts': counts, 'local_genius_states': states,
+            'local_genius_state_preserved': states['before'] == states['after'],
+            'genius_key_headers_preserved': state_headers['before'] == state_headers['after'],
+            'local_genius_enabled_after_native_exit': (states['after']['locally_enabled']
+                and states['after']['key_headers_match'] and report.get('after_copy_consistent_exit') is True), 'genius_relation_graphs': graphs,
             'native_library_loaded': report.get('status') == 'library_loaded',
             'native_exit_verified': report.get('after_copy_consistent_exit', False),
             'media_locations_verified': sum(r.get('location_verified', False) for r in report.get('relink_results') or []),
