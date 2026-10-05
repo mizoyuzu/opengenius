@@ -5,13 +5,15 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from evaluate_ytmusic_batch import (InvalidObservation, collect_graphs, evaluate_graphs, jaccard,
+from evaluate_ytmusic_batch import (InvalidObservation, collect_graphs, evaluate_graph_comparison, evaluate_graphs, jaccard,
                                     merge_graphs, observation_paths, relation_paths, relation_distances, shared_rows, validate_observations)
 from emulate_ytmusic_candidates import candidate_graph
 from genius_format import pack_config, parse_similarities
 from music_identity_map import IdentityMap, build_map
+import evaluate_ytmusic_batch as batch
 
 EXECUTABLE = os.environ.get('OPENGENIUS_MUSIC_EXECUTABLE')
 
@@ -149,6 +151,104 @@ class BatchEvaluationTests(unittest.TestCase):
                 evaluate_graphs([self.graph(1, [3])], self.matcher, config(), 'unused',
                                 core_factory=FakeCore, root_pids=subset)
         self.assertEqual(FakeCore.instances, [])
+
+    def test_comparison_fixes_ids_and_groups_without_leaking_new_outgoing_edges(self):
+        # A new PID sorts before old nodes; its new artist/album also sorts
+        # before old groups. Standalone reconstruction renumbers both.
+        self.tracks[0].update(artist='0 New Artist', album='0 New Album')
+        self.matcher = IdentityMap(build_map(self.tracks, 'hash'), self.tracks, 'hash')
+        old = [self.graph(2, [3])]
+        expanded = [self.graph(1, [4]), self.graph(3, [4]), self.graph(2, [3])]
+        standalone_ids, standalone_metadata, _, _ = shared_rows(merge_graphs(old), self.matcher)
+        report = evaluate_graph_comparison(old, expanded, self.matcher, config(), 'unused', core_factory=FakeCore)
+        before, after = FakeCore.instances
+        self.assertEqual(before.metadata, after.metadata)
+        mapping = report['baseline']['temporary_id_mapping']
+        self.assertEqual(mapping, report['expanded']['temporary_id_mapping'])
+        ids = {row['persistent_id']: int(row['temporary_genius_id'], 16) for row in mapping}
+        self.assertNotEqual(standalone_ids[f'{2:016X}'], ids[f'{2:016X}'])
+        self.assertNotEqual(standalone_metadata[standalone_ids[f'{2:016X}']], before.metadata[ids[f'{2:016X}']])
+        self.assertEqual(parse_similarities(before.similarities[ids[f'{1:016X}']])[1], [])
+        self.assertEqual(parse_similarities(before.similarities[ids[f'{3:016X}']])[1], [])
+        self.assertEqual(parse_similarities(after.similarities[ids[f'{1:016X}']])[1], [ids[f'{4:016X}']])
+        self.assertEqual(parse_similarities(after.similarities[ids[f'{3:016X}']])[1], [ids[f'{4:016X}']])
+        self.assertEqual(before.calls, after.calls)
+        change, = report['root_changes']
+        self.assertEqual(change['baseline_reachable_nonroot_count'], 1)
+        self.assertEqual(change['expanded_reachable_nonroot_count'], 2)
+        self.assertTrue(change['playlist_order_unchanged'])
+        self.assertTrue(report['controls']['temporary_ids_and_metadata_identical'])
+        self.assertEqual(report['controls']['baseline_directed_edges'], 1)
+        self.assertEqual(report['controls']['expanded_directed_edges'], 3)
+        self.assertFalse(report['music_app_acceptance_verified'])
+
+    def test_comparison_selects_shared_old_roots_and_preserves_requested_order(self):
+        old = [self.graph(1, [3]), self.graph(2, [3])]
+        new = [self.graph(4, [3]), self.graph(2, [3]), self.graph(1, [3])]
+        selected = [f'{2:016X}', f'{1:016X}']
+        report = evaluate_graph_comparison(old, new, self.matcher, config(), 'unused',
+                                           core_factory=FakeCore, root_pids=selected)
+        self.assertEqual([row['root_pid'] for row in report['baseline']['root_results']], selected)
+        self.assertEqual([row['root_pid'] for row in report['expanded']['root_results']], selected)
+        self.assertEqual([row['root_pid'] for row in report['root_changes']], selected)
+        self.assertEqual(len(FakeCore.instances[0].calls), 2)
+        self.assertEqual(len(FakeCore.instances[1].calls), 2)
+        self.assertTrue(all(row['playlist_order_unchanged'] for row in report['root_changes']))
+
+    def test_comparison_rejects_missing_roots_and_incomplete_id_space_before_core(self):
+        for subset in ([], [f'{4:016X}'], [f'{1:016X}', f'{1:016X}'], 'root', [True]):
+            with self.subTest(subset=subset), self.assertRaises(ValueError):
+                evaluate_graph_comparison([self.graph(1, [3])], [self.graph(1, [3])],
+                                           self.matcher, config(), 'unused', core_factory=FakeCore,
+                                           root_pids=subset)
+        with self.assertRaisesRegex(ValueError, 'both sides'):
+            evaluate_graph_comparison([self.graph(1, [3])], [self.graph(2, [3])], self.matcher,
+                                       config(), 'unused', core_factory=FakeCore)
+        with self.assertRaisesRegex(ValueError, 'omits observed'):
+            shared_rows(merge_graphs([self.graph(1, [3])]), self.matcher,
+                        merge_graphs([self.graph(1, [2])]))
+        self.assertEqual(FakeCore.instances, [])
+
+    def test_comparison_cli_loads_both_batches_and_protects_baseline_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            before, after = root / 'before', root / 'after'
+            before.mkdir(); after.mkdir()
+            executable = root / 'app' / 'Music'
+            executable.parent.mkdir(); executable.write_bytes(b'fixture executable')
+            track_path, map_path, reference = root / 'tracks.json', root / 'map.json', root / 'reference.sqlite'
+            digest = 'a' * 64
+            track_path.write_text(json.dumps(dict(source_sha256=digest, tracks=self.tracks)))
+            map_path.write_text(json.dumps(build_map(self.tracks, digest)))
+            reference.write_bytes(b'fixture config supplied below')
+            for directory, spec in ((before, [(2, [3])]), (after, [(2, [3]), (3, [4])])):
+                seeds = []
+                for number, targets in spec:
+                    pid = f'{number:016X}'
+                    seeds.append(dict(persistent_id=pid))
+                    snapshot = self.snapshot(number, targets)
+                    snapshot['library_sha256'] = digest
+                    (directory / (pid + '.json')).write_text(json.dumps(snapshot))
+                (directory / 'seeds.json').write_text(json.dumps(dict(library_sha256=digest, seeds=seeds)))
+            sources = {path: path.read_bytes() for directory in (before, after) for path in directory.iterdir()}
+            args = ['evaluate', '--track-snapshot', str(track_path), '--identity-map', str(map_path),
+                    '--genius-reference', str(reference), '--executable', str(executable),
+                    '--observations-directory', str(after), '--baseline-observations-directory', str(before),
+                    '--output', str(root / 'result.json')]
+            with patch.object(sys, 'argv', args), patch('emulate_genius.database_rows', return_value=(config(), {}, {})), \
+                    patch('emulate_genius.MusicCore', FakeCore), patch('builtins.print'):
+                batch.main()
+            report = json.loads((root / 'result.json').read_text())
+            self.assertEqual(len(report['root_results']), 1)
+            self.assertEqual(report['graph_comparison']['controls']['baseline_directed_edges'], 1)
+            self.assertEqual(report['graph_comparison']['controls']['expanded_directed_edges'], 2)
+            self.assertTrue(report['graph_comparison']['controls']['temporary_ids_and_metadata_identical'])
+            self.assertEqual({path: path.read_bytes() for path in sources}, sources)
+            args[-1] = str(before / 'report.json')
+            with patch.object(sys, 'argv', args), patch('sys.stderr'), self.assertRaises(SystemExit) as error:
+                batch.main()
+            self.assertEqual(error.exception.code, 2)
+            self.assertFalse((before / 'report.json').exists())
 
     def test_observed_paths_are_shortest_deterministic_and_cycle_safe(self):
         edges = {'root': ['left', 'right'], 'left': ['target', 'root'],

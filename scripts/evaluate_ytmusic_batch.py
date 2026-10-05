@@ -138,10 +138,14 @@ def merge_graphs(graphs):
     return list(roots.values())
 
 
-def shared_rows(roots, matcher):
+def shared_rows(roots, matcher, id_space_roots=None):
     if not roots:
         raise ValueError('Need at least one root')
-    all_pids = {pid for root in roots for pid in (root['root_pid'], *root['ordered_target_pids'])}
+    observed_pids = {pid for root in roots for pid in (root['root_pid'], *root['ordered_target_pids'])}
+    universe = roots if id_space_roots is None else id_space_roots
+    all_pids = {pid for root in universe for pid in (root['root_pid'], *root['ordered_target_pids'])}
+    if observed_pids - all_pids:
+        raise ValueError('Shared ID space omits observed nodes')
     joint = {'root_pid': roots[0]['root_pid'], 'ordered_target_pids': sorted(all_pids - {roots[0]['root_pid']})}
     ids, metadata, similarities, mapping = synthetic_rows(joint, matcher)
     # Reset synthetic_rows' one-root edges, then assign only observed root directions.
@@ -191,7 +195,7 @@ def relation_distances(root_pid, edges):
     return _relation_tree(root_pid, edges)[0]
 
 
-def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=None, profile='without-compatible-genre', root_pids=None, artist_preference='neutral'):
+def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=None, profile='without-compatible-genre', root_pids=None, artist_preference='neutral', id_space_roots=None):
     """Generate selected roots while retaining the full observed graph and ID space."""
     if not 1 <= limit <= 100:
         raise ValueError('Limit must be 1..100')
@@ -208,7 +212,7 @@ def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=
         if wanted - {root['root_pid'] for root in roots}:
             raise ValueError('Root subset contains an unobserved root')
         selected_roots = [root for root in roots if root['root_pid'] in wanted]
-    ids, metadata, similarities, mapping = shared_rows(roots, matcher)
+    ids, metadata, similarities, mapping = shared_rows(roots, matcher, id_space_roots)
     by_id = {identifier: pid for pid, identifier in ids.items()}
     tracks = {track['persistent_id']: track for track in matcher.tracks}
     if profile == 'artist-album-minimum-one':
@@ -268,6 +272,64 @@ def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=
             'shared_metadata_count': len(metadata), 'total_instructions': core.steps if core is not None else 0}
 
 
+def evaluate_graph_comparison(baseline_graphs, expanded_graphs, matcher, config, executable,
+                              limit=25, core_factory=None, profile='without-compatible-genre',
+                              root_pids=None, artist_preference='neutral'):
+    """Hold IDs and metadata groups fixed; each side retains only its own edges.
+
+    Both sides use the union of observed nodes, including empty relation rows
+    for nodes without outgoing observations on that side. This isolates graph
+    changes from temporary-ID and metadata-group renumbering; it is not the
+    baseline's original standalone evaluation or a Music.app acceptance test.
+    """
+    baseline_roots, expanded_roots = merge_graphs(baseline_graphs), merge_graphs(expanded_graphs)
+    selected = root_pids if root_pids is not None else [root['root_pid'] for root in baseline_roots]
+    if (not isinstance(selected, (list, tuple)) or not selected
+            or any(not isinstance(pid, str) or not pid for pid in selected)
+            or len(set(selected)) != len(selected)):
+        raise ValueError('Comparison requires a nonempty unique root subset')
+    wanted = set(selected)
+    if any(wanted - {root['root_pid'] for root in roots} for roots in (baseline_roots, expanded_roots)):
+        raise ValueError('Comparison root subset must be observed on both sides')
+    universe = [*baseline_roots, *expanded_roots]
+    options = dict(limit=limit, core_factory=core_factory, profile=profile, root_pids=selected,
+                   artist_preference=artist_preference, id_space_roots=universe)
+    baseline = evaluate_graphs(baseline_graphs, matcher, config, executable, **options)
+    expanded = evaluate_graphs(expanded_graphs, matcher, config, executable, **options)
+    if (baseline['temporary_id_mapping'] != expanded['temporary_id_mapping']
+            or baseline['controlled_config_sha256'] != expanded['controlled_config_sha256']):
+        raise ValueError('Comparison controls differ')
+    before = {row['root_pid']: row for row in baseline['root_results']}
+    after = {row['root_pid']: row for row in expanded['root_results']}
+    # Preserve the caller's comparison order even if the two input batches
+    # enumerate their roots differently.
+    baseline['root_results'] = [before[pid] for pid in selected]
+    expanded['root_results'] = [after[pid] for pid in selected]
+    baseline_edges = {row['root_pid']: row['ordered_target_pids'] for row in baseline_roots}
+    expanded_edges = {row['root_pid']: row['ordered_target_pids'] for row in expanded_roots}
+    changes = []
+    for pid in selected:
+        left, right = before[pid], after[pid]
+        changes.append(dict(root_pid=pid,
+                            playlist_order_unchanged=left['playlist_pids'] == right['playlist_pids'],
+                            playlist_pid_jaccard=jaccard(left['playlist_pids'], right['playlist_pids']),
+                            baseline_reachable_nonroot_count=len(relation_distances(pid, baseline_edges)) - 1,
+                            expanded_reachable_nonroot_count=len(relation_distances(pid, expanded_edges)) - 1,
+                            generated_count_delta=right['generated_count'] - left['generated_count'],
+                            indirect_candidate_count_delta=right['indirect_candidate_count'] - left['indirect_candidate_count']))
+    mapping_hash = hashlib.sha256(json.dumps(baseline['temporary_id_mapping'], sort_keys=True,
+                                            ensure_ascii=False).encode()).hexdigest()
+    return dict(comparison='observed_graphs_in_common_metadata_space', baseline=baseline, expanded=expanded,
+                root_changes=changes, controls=dict(
+                    temporary_ids_and_metadata_identical=True, controlled_config_identical=True,
+                    common_mapping_sha256=mapping_hash, shared_metadata_count=baseline['shared_metadata_count'],
+                    baseline_directed_edges=sum(len(row['ordered_target_pids']) for row in baseline_roots),
+                    expanded_directed_edges=sum(len(row['ordered_target_pids']) for row in expanded_roots),
+                    baseline_relations='baseline observations only; new outgoing rows stay empty',
+                    interpretation='Fixed universe graph comparison; baseline standalone result may differ'),
+                network_requests=0, music_app_acceptance_verified=False, ipod_acceptance_verified=False)
+
+
 def observation_paths(directory, extras, library_hash):
     manifest_data = (directory / 'seeds.json').read_bytes()
     manifest = json.loads(manifest_data)
@@ -289,6 +351,10 @@ def main():
     for name in ('track-snapshot', 'identity-map', 'observations-directory', 'genius-reference', 'executable', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--extra-observation', type=Path, action='append', default=[])
+    parser.add_argument('--baseline-observations-directory', type=Path,
+                        help='compare old observations with this batch in a common metadata/ID space')
+    parser.add_argument('--baseline-extra-observation', type=Path, action='append', default=[])
+    parser.add_argument('--root-pid', action='append', help='generate only these observed roots on both sides')
     parser.add_argument('--limit', type=int, default=25)
     parser.add_argument('--cluster-config', type=Path)
     parser.add_argument('--cluster-tag', action='append', default=[])
@@ -300,20 +366,30 @@ def main():
     args = parser.parse_args()
     if (args.cluster_tag or args.track_kind or args.exclude_kind) and not args.cluster_config:
         parser.error('Cluster scope requires --cluster-config')
+    if args.baseline_extra_observation and not args.baseline_observations_directory:
+        parser.error('Baseline extra observations require --baseline-observations-directory')
     if not 1 <= args.limit <= 100:
         parser.error('Limit must be 1..100')
     paths = {name: getattr(args, name).resolve() for name in ('track_snapshot', 'identity_map', 'genius_reference', 'executable')}
     directory, output = args.observations_directory.resolve(), args.output.resolve()
     extras = [path.resolve() for path in args.extra_observation]
+    baseline_directory = args.baseline_observations_directory.resolve() if args.baseline_observations_directory else None
+    baseline_extras = [path.resolve() for path in args.baseline_extra_observation]
     if args.cluster_config and output == args.cluster_config.resolve():
         parser.error('Output must differ from cluster config')
     if output.exists() or output in {*paths.values(), *extras} or output.is_relative_to(directory) or output.is_relative_to(paths['executable'].parent):
         parser.error('Output must be new and outside observation inputs and executable directory')
+    if output in baseline_extras or (baseline_directory and output.is_relative_to(baseline_directory)):
+        parser.error('Output must be outside baseline observation inputs')
     tracks, library_hash, provenance = load_library(track_snapshot=paths['track_snapshot'])
     map_data = paths['identity_map'].read_bytes()
     matcher = IdentityMap(json.loads(map_data), tracks, library_hash)
     observations, manifest_hash = observation_paths(directory, extras, library_hash)
     graphs, skipped, observation_inputs = collect_graphs(observations, matcher, library_hash)
+    baseline_graphs = baseline_inputs = baseline_skipped = baseline_manifest_hash = baseline_scope = None
+    if baseline_directory:
+        baseline_paths, baseline_manifest_hash = observation_paths(baseline_directory, baseline_extras, library_hash)
+        baseline_graphs, baseline_skipped, baseline_inputs = collect_graphs(baseline_paths, matcher, library_hash)
     cluster_scope = None
     cluster_config_hash = None
     cluster_config_semantic_hash = None
@@ -327,9 +403,21 @@ def main():
         if args.cluster_tag or args.track_kind or args.exclude_kind:
             graphs, cluster_scope = scope_graphs(graphs, classifications, args.cluster_tag, args.track_kind,
                                                 excluded_kinds=args.exclude_kind)
+            if baseline_graphs is not None:
+                baseline_graphs, baseline_scope = scope_graphs(baseline_graphs, classifications, args.cluster_tag,
+                                                              args.track_kind, excluded_kinds=args.exclude_kind)
     reference = paths['genius_reference'].read_bytes()
     from emulate_genius import database_rows
     config, _, _ = database_rows(reference)
+    comparison = None
+    if baseline_graphs is not None:
+        comparison = evaluate_graph_comparison(baseline_graphs, graphs, matcher, config, paths['executable'],
+                                               args.limit, profile=args.profile, root_pids=args.root_pid,
+                                               artist_preference=args.artist_preference)
+        evaluation = comparison['expanded']
+    else:
+        evaluation = evaluate_graphs(graphs, matcher, config, paths['executable'], args.limit, profile=args.profile,
+                                     root_pids=args.root_pid, artist_preference=args.artist_preference)
     report = {'schema_version': 1, 'library_sha256': library_hash, 'library_input': provenance,
               'input_sha256': {'track_snapshot': provenance['snapshot_sha256'], 'identity_map': hashlib.sha256(map_data).hexdigest(),
                                'seed_manifest': manifest_hash, 'genius_reference': hashlib.sha256(reference).hexdigest(),
@@ -337,8 +425,7 @@ def main():
               'observation_inputs': observation_inputs, 'skipped_snapshots': skipped, 'snapshot_graphs': graphs,
               'cluster_scope': cluster_scope, 'cluster_config_sha256': cluster_config_hash,
               'cluster_config_semantic_sha256': cluster_config_semantic_hash,
-              **evaluate_graphs(graphs, matcher, config, paths['executable'], args.limit, profile=args.profile,
-                                artist_preference=args.artist_preference),
+              **evaluation,
               'grouping_policy': {'ids': 'Sorted local PIDs in one shared temporary uint32 ID space',
                                   'metadata': 'genre 0; canonical artist credits; normalized album; credits plus original title song groups',
                                   'relations': 'Actual radio/related targets only; per-root ordered PID union; no reverse edges',
@@ -348,6 +435,11 @@ def main():
                                   'overlap': 'PID set Jaccard; empty union is null; nonroot overlap excludes all batch roots'},
               'network_requests': 0, 'account_authentication_rechecked': False, 'identity_status': 'unverified', 'verified_recordings': 0,
               'music_app_acceptance_verified': False, 'ipod_acceptance_verified': False}
+    if comparison is not None:
+        report['graph_comparison'] = comparison
+        report['baseline_inputs'] = dict(observation_inputs=baseline_inputs, skipped_snapshots=baseline_skipped,
+                                         seed_manifest_sha256=baseline_manifest_hash, cluster_scope=baseline_scope)
+        report['grouping_policy']['ids'] = 'Sorted union of both input node sets; identical temporary IDs and metadata groups on both sides'
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open('x', encoding='utf-8') as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)
