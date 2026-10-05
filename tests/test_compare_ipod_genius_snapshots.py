@@ -159,6 +159,38 @@ class SnapshotComparisonTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'report_size_limit'):
                     compare.read_report(path)
 
+    def test_optional_anomaly_counts_compare_without_rejecting_older_reports(self):
+        old = sqlite_db()
+        before = sqlite_db()
+        before['relations']['anomalies'] = dict(
+            interpretation='counts_only_permissibility_unverified',
+            **{name: 0 for name in compare.ANOMALY_METRICS})
+        after = json.loads(json.dumps(before))
+        after['relations']['anomalies']['self_edges'] = 3
+        after['relations']['anomalies']['private_seed_id'] = 'PRIVATE_SEED'
+        result = compare.compare_reports(report({'Genius.itdb': before}), report({'Genius.itdb': after}))
+        anomalies = result['files']['Genius.itdb']['sqlite_relation_anomalies']
+        self.assertEqual(anomalies['metrics']['self_edges']['delta'], 3)
+        self.assertFalse(result['device_acceptance_proven'])
+        self.assertNotIn('PRIVATE_SEED', json.dumps(result))
+        legacy = compare.compare_reports(report({'Genius.itdb': old}), report({'Genius.itdb': after}))
+        self.assertEqual(legacy['files']['Genius.itdb']['sqlite_relation_anomalies']
+                         ['metrics']['self_edges']['status'], 'not_comparable')
+        self.assertEqual(legacy['files']['Genius.itdb']['sqlite_relation_envelope']
+                         ['metrics']['examined_edges']['status'], 'unchanged')
+        self.assertFalse(legacy['comparison_partial'])
+
+    def test_malformed_anomaly_counts_are_not_echoed_or_compared(self):
+        before = sqlite_db()
+        before['relations']['anomalies'] = dict(
+            interpretation='counts_only_permissibility_unverified',
+            **{name: 0 for name in compare.ANOMALY_METRICS})
+        before['relations']['anomalies']['self_edges'] = 'PRIVATE_ID'
+        result = compare.compare_reports(report({'Genius.itdb': before}), report({'Genius.itdb': before}))
+        self.assertNotIn('PRIVATE_ID', json.dumps(result))
+        self.assertEqual(result['files']['Genius.itdb']['sqlite_relation_anomalies']
+                         ['metrics']['self_edges']['status'], 'not_comparable')
+
     def test_cli_writes_only_a_new_file(self):
         script = Path(compare.__file__)
         with tempfile.TemporaryDirectory() as temporary:

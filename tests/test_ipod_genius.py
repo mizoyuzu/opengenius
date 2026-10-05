@@ -186,6 +186,31 @@ class IPodAuditTests(unittest.TestCase):
         self.assertEqual(report['relations']['unsupported_rows'], 1)
         self.assertEqual(report['relations']['seeds_missing_metadata'], 1)
 
+    def test_graph_anomaly_counts_do_not_reject_observed_envelope_or_expose_ids(self):
+        private_id = 0x7f234a9911023301
+        connection = sqlite3.connect(':memory:')
+        connection.executescript('CREATE TABLE genius_metadata(genius_id INTEGER);'
+                                'CREATE TABLE genius_similarities(genius_id INTEGER,version INTEGER,data BLOB);')
+        connection.executemany('INSERT INTO genius_metadata VALUES(?)',
+                               [(0,), (private_id,), (private_id,), (-1,)])
+        targets = (private_id, private_id, 0, (1 << 64) - 1)
+        blob = struct.pack('<III', 0, 4 + len(targets) * 8, len(targets)) + struct.pack('<4Q', *targets)
+        empty = struct.pack('<III', 0, 4, 0)
+        connection.executemany('INSERT INTO genius_similarities VALUES(?,1,?)',
+                               [(private_id, blob), (private_id, empty), (0, empty)])
+        connection.commit()
+        report = audit.inspect_sqlite(connection.serialize())
+        connection.close()
+        self.assertTrue(report['relations']['complete'])
+        self.assertEqual(report['relations']['dangling_edges'], 0)
+        self.assertEqual(report['relations']['anomalies'], dict(
+            interpretation='counts_only_permissibility_unverified',
+            metadata_duplicate_records=1, zero_metadata_records=1,
+            duplicate_seed_records=1, zero_seed_records=1, self_edges=2,
+            repeated_targets_within_row=1, zero_target_edges=1))
+        self.assertNotIn(str(private_id), json.dumps(report))
+        self.assertNotIn(str((1 << 64) - 1), json.dumps(report))
+
     def test_paths_limits_and_encrypted_header_detection(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

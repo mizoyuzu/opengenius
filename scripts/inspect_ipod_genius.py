@@ -288,12 +288,24 @@ def inspect_sqlite(data):
             if result['tables']['genius_metadata'] > 100000 or result['tables']['genius_similarities'] > 100000:
                 result['relations'] = dict(status='row_limit', complete=False, ipod_profile_verified=False)
                 return result
-            metadata = {_unsigned(row[0]) for row in connection.execute('SELECT genius_id FROM genius_metadata')}
+            metadata = set()
+            duplicate_metadata = zero_metadata = 0
+            for row in connection.execute('SELECT genius_id FROM genius_metadata'):
+                identifier = _unsigned(row[0])
+                duplicate_metadata += identifier in metadata
+                zero_metadata += identifier == 0
+                metadata.add(identifier)
             edges = dangling = missing_seeds = unsupported = 0
+            seeds = set()
+            duplicate_seeds = zero_seeds = self_edges = repeated_targets = zero_targets = 0
             for seed, version, blob in connection.execute('SELECT genius_id,version,data FROM genius_similarities'):
                 if time.monotonic() > deadline:
                     raise ValueError('time_limit')
-                missing_seeds += _unsigned(seed) not in metadata
+                seed = _unsigned(seed)
+                missing_seeds += seed not in metadata
+                duplicate_seeds += seed in seeds
+                zero_seeds += seed == 0
+                seeds.add(seed)
                 if version != 1 or not isinstance(blob, bytes) or len(blob) < 12:
                     unsupported += 1
                     continue
@@ -301,15 +313,29 @@ def inspect_sqlite(data):
                 if compression != 0 or size != len(blob) - 8 or count != (len(blob) - 12) // 8 or len(blob) != 12 + count * 8:
                     unsupported += 1
                     continue
+                seen_targets = set()
                 for (target,) in struct.iter_unpack('<Q', memoryview(blob)[12:]):
                     edges += 1
                     if edges > 2000000 or (edges % 1000 == 0 and time.monotonic() > deadline):
                         raise ValueError('relation_limit')
                     dangling += target not in metadata
+                    self_edges += target == seed
+                    repeated_targets += target in seen_targets
+                    zero_targets += target == 0
+                    seen_targets.add(target)
             result['relations'] = dict(envelope_profile='observed_music_v1_uncompressed',
                                        examined_edges=edges, dangling_edges=dangling,
                                        seeds_missing_metadata=missing_seeds, unsupported_rows=unsupported,
-                                       complete=unsupported == 0, ipod_profile_verified=False)
+                                       complete=unsupported == 0, ipod_profile_verified=False,
+                                       anomalies=dict(
+                                           interpretation='counts_only_permissibility_unverified',
+                                           metadata_duplicate_records=duplicate_metadata,
+                                           zero_metadata_records=zero_metadata,
+                                           duplicate_seed_records=duplicate_seeds,
+                                           zero_seed_records=zero_seeds,
+                                           self_edges=self_edges,
+                                           repeated_targets_within_row=repeated_targets,
+                                           zero_target_edges=zero_targets))
         return result
     except (sqlite3.Error, ValueError, TypeError, OverflowError):
         return dict(status='sqlite_invalid_or_unsupported')

@@ -32,6 +32,9 @@ ITUNESDB_METRICS = (
     'dangling_playlist_members',
 )
 RELATION_METRICS = ('examined_edges', 'dangling_edges', 'seeds_missing_metadata', 'unsupported_rows')
+ANOMALY_METRICS = ('metadata_duplicate_records', 'zero_metadata_records',
+                   'duplicate_seed_records', 'zero_seed_records', 'self_edges',
+                   'repeated_targets_within_row', 'zero_target_edges')
 
 
 def _safe_count(value):
@@ -116,7 +119,8 @@ def _normalized_file(raw):
     if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', digest):
         digest = None
     entry = dict(valid=True, format=fmt, status=status, bytes=size, sha256=digest.lower() if digest else None,
-                 profile=None, cuid=None, itunesdb_metrics=None, sqlite_tables=None, relations=None)
+                 profile=None, cuid=None, itunesdb_metrics=None, sqlite_tables=None, relations=None,
+                 anomalies=None)
     profile = _normalized_profile({**raw, 'format': fmt, 'status': status})
     if profile is not None:
         entry['profile'], detail = profile
@@ -145,6 +149,12 @@ def _normalized_file(raw):
                 normalized = {name: _safe_count(relations.get(name)) for name in RELATION_METRICS}
                 if all(value is not None for value in normalized.values()):
                     entry['relations'] = normalized
+                    anomalies = relations.get('anomalies')
+                    if (isinstance(anomalies, dict) and anomalies.get('interpretation')
+                            == 'counts_only_permissibility_unverified'):
+                        counts = {name: _safe_count(anomalies.get(name)) for name in ANOMALY_METRICS}
+                        if all(value is not None for value in counts.values()):
+                            entry['anomalies'] = counts
     return entry
 
 
@@ -237,6 +247,10 @@ def _file_comparison(before, after):
         else:
             record['sqlite_relation_envelope'] = dict(status='not_comparable',
                                                       interpretation='observed_music_v1_only')
+        record['sqlite_relation_anomalies'] = dict(
+            interpretation='counts_only_permissibility_unverified',
+            metrics=_compare_metric_sets(before.get('anomalies') or {}, after.get('anomalies') or {},
+                                         ANOMALY_METRICS))
     else:
         category_status = 'not_comparable' if has_sqlite else 'not_applicable'
         record['sqlite_table_counts'] = dict(status=category_status)
