@@ -150,6 +150,14 @@ OPENGENIUS_MUSIC_EXECUTABLE=/home/mizoyuzu/Music.app/Contents/MacOS/Music \
 
 この環境変数を指定しない通常のテストでは、バイナリが必要な4件をスキップする。
 
+## Genius Mixの調査
+
+Genius Mixについては、複数seedを受けるネイティブGenius関数の限定実行と
+同じcontextからの継続取得、playlistリストと保存レコードの読み取り監査を追加した。
+内部Mix種別32の比較処理は実行確認済み。Mix専用保存形式・純正画面・
+iPodでの動作は未検証。
+[Genius Mixの調査・テスト結果と再実行方法](docs/research/2026-10-05-genius-mix.md)を参照。
+
 ## 新しいIDとmetadataの実験
 
 元のconfigを保ち、合成したmetadata IDの同一性だけを変えて選曲を比較できる。
