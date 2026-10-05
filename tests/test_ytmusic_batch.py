@@ -87,6 +87,7 @@ class BatchTests(unittest.TestCase):
             self.assertEqual(manifest['seeds'][0]['seed_series'], 'Series')
             summary = json.loads(next(output.glob('summary-*.json')).read_text())
             self.assertEqual(summary['http_requests'], 0)
+            self.assertEqual(summary['library_sha256'], manifest['library_sha256'])
             self.assertFalse(summary['account_authentication_verified'])
             with patch.object(sys, 'argv', [*argv, '--seed-observations', str(root / 'absent-observations')]), \
                     patch('sys.stderr', new=io.StringIO()), patch('probe_ytmusic_batch.load_library') as library:

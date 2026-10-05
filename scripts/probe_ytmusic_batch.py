@@ -272,6 +272,7 @@ def main():
     session = None
     try:
         tracks, library_hash, provenance = load_library(args.bundle, args.track_snapshot)
+        report['library_sha256'] = library_hash
         matcher, map_hash = None, None
         if args.identity_map:
             map_bytes = args.identity_map.read_bytes()
