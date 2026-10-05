@@ -10,10 +10,52 @@ Apple Music／iTunes側への読み込みも検証対象。
 既存Genius IDの曲との対応付けと、関係リストを変更した暗号化DBの生成に対応する。
 実ライブラリのコピーへ新規IDと関係を保存し、macOSのMusic.appで2,974曲・
 286件のID・885本の関係が終了後も保持されることを確認した。
-通常プレイリストの再起動後の曲順も確認済み。
-Music自身によるGeniusプレイリスト生成、純正iPodでの動作、
-Apple形式のrank生成は未検証。
-[実Musicでの検証結果と制約](docs/research/2026-10-04-native-real-library.md)を参照。
+実MacのMusic 1.5.6で、注入した関係から純正Geniusプレイリストを生成できた。
+両DBの有効状態を揃えた後は終了・再起動・約162秒の待機後も状態を保持し、
+再起動後のSwedenの新規Geniusプレイリストは18曲で、以前の曲順と一致した。
+純正iPodでの動作、Genius Mix、Apple形式のrank生成は未検証。
+[実Musicでの検証](docs/research/2026-10-05-real-mac-music.md)と
+[有効状態の保持](docs/research/2026-10-05-native-genius-state-persistence.md)を参照。
+
+Webビューは保存済みYouTube Musicの関係と、提供されたMusic 1.7の
+選曲処理のエミュレーションを使う。Apple公式の推薦データを表示するものではない。
+実Musicで確認した起点以外も同じ結果になるかは、まだ検証が必要。
+
+## 現在の準備・検証経路
+
+Music終了後のライブラリコピーで、両DBに保存された状態を確認できる。
+
+```sh
+python3 scripts/inspect_music_genius_state.py /path/to/copy.musiclibrary --require-enabled
+```
+
+両状態が1でも、MusicやiPodによる読み込み成功を証明するものではない。
+片方だけ1、鍵ヘッダー不一致、未対応形式は別の状態として報告する。
+
+実験bundleの生成では、`build_real_library_experiment.py` と
+`prepare_macos_real_rebase.py` に `--local-genius-opt-in` を指定すると、
+出力コピーの両状態を1に揃える。Appleへの有効化要求は行わない。
+既定では入力状態を保持する。Webの同一アーティスト設定に合わせる場合は
+bundle生成時に `--artist-preference moderate` を指定する。
+ライブラリの形式制限と、既存Genius IDを持つ入力の拒否は継続している。
+[既存IDを保持する増分計画API](docs/research/2026-10-05-incremental-genius-plan.md)は
+別途用意したが、計画をDBへ適用する経路は未実装。
+[対応形式・生成例・保存差分の検証](docs/research/2026-10-05-offline-dual-state-integration.md)を参照。
+
+関係データの拡張は、短い推薦につながる未観測曲をアーティスト・アルバムに
+分散して選び、少数ずつYTMusicを観測する。
+[追加観測計画](docs/research/2026-10-05-offline-expansion-planner.md)は
+ネットワークなしで作成できる。検索で確定できない曲は保留し、
+観測していない逆向き関係を自動で追加しない。
+[8曲を追加した比較](docs/research/2026-10-05-observed-outgoing-expansion.md)では
+旧45起点の出力が長くなる一方、一意曲数が減った。
+[共通ID空間での比較](docs/research/2026-10-05-common-space-graph-comparison.md)と
+[経由曲の集中監査](docs/research/2026-10-05-recommendation-path-audit.md)を使い、
+長さ・集中・ユーザー指定範囲を分けて確認する。
+
+iPod到着後は、Musicが実際に同期したファイルの前後差分と、
+端末自身によるGenius生成を別々に確認する。
+[iPod検証の手順](docs/research/2026-10-05-ipod-paired-snapshot-workflow.md)を参照。
 
 ## Genius DBのオフライン復号
 

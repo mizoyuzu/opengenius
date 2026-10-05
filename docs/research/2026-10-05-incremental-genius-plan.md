@@ -1,0 +1,15 @@
+# 既存Genius IDを保持する増分計画
+
+`scripts/plan_genius_update.py` はOpenGeniusのsynthetic rows専用の純粋API。`make_synthetic_state` で専用stateを作り、`plan_genius_update` に変更後の全有向グラフを渡す。ファイルやDBの書き換え、ネットワーク、Musicの操作は行わない。AppleのDBを一般的に取り込むインターフェースも持たない。
+
+stateはproducer、Libraryと対応表のSHA、全曲メタデータと正規化ラベルのfingerprint、PID/GID、metadataと関係BLOBを保持する。自己ハッシュは破損確認用で、署名やApple由来データを識別する証明ではない。sourceやラベルの変化、重複PID/GID、不正ID、genre非0、groupとラベルの不整合、未割当IDへの辺を拒否する。
+
+既存PIDのGIDとmetadataの全バイトを維持し、新PIDにだけ未使用uint32 GIDを割り当てる。既存のartist/album/songラベルは以前のgroup番号を使い、新ラベルは最大値の次を使う。変更後の関係は明示された全グラフだけから作り、省略された旧起点は空の出方向行になる。削除辺と順序変更をdeltaへ記録し、逆辺は発明しない。
+
+## 実データでの計画確認
+
+旧45起点から作ったstateの286 metadata行と関係行が、生成済み実験bundleを復号した実際のSQL行と完全一致することを確認した。追加8観測を含む53起点へ計画すると、旧286 GIDと全metadataを維持し、6曲だけ追加、合計292曲・969有向辺となった。変更行は新規割当を含め14行。計画は `data/ytmusic/incremental-plan-20261005.json` に保存している。
+
+比較用の `data/comparison-only-expanded53-moderate-bundle-20261005/` は従来のゼロID入力から作った別コピーであり、この増分計画を適用したものではない。そのコピーでは既存268 IDが振り直されているため、生きたLibraryへの増分更新として扱わない。両状態1、SQL整合性、全2974曲の解析メタデータ保持、全53起点の標準expanded評価とのPID順一致は独立監査済みだが、新コピーのMusic/iPod受け入れは未確認。
+
+8テストで旧ID/metadata保持、既存ラベル再利用、辺削除・順序差分、再計画の不変、source変更拒否、genre/group不整合、ID折返し・group上限、重複グラフの拒否を確認した。次に必要なのは、実験bundleの入出力hashとconfig・鍵・補助ファイルを拘束したDB更新経路、暗号化往復監査、実Musicでの読み込み確認。このAPIだけで増分更新が完成したとは扱わない。
