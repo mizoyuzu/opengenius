@@ -5,9 +5,36 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from genius_format import pack_config, parse_config
 from sweep_genius_profiles import distance_profiles
+from genius_profiles import artist_preference_config
 
 
 class ProfileTests(unittest.TestCase):
+    def test_slight_artist_preference_changes_only_initial_artist_distance(self):
+        parsed = {'version': 2, 'filters': [
+            {'type': 1, 'parameters': [20, 50, 10, 10]},
+            {'type': 3, 'parameters': [1, 1, 6, 6]},
+            {'type': 3, 'parameters': [2, 1, 10, 6]},
+            {'type': 3, 'parameters': [3, 3, 10, 6]},
+            {'type': 4, 'parameters': [2, 604800, 0, 50]},
+            {'type': 5, 'parameters': [70, 100]}], 'flags': 0, 'result_words': [10, 20]}
+        raw = pack_config(parsed)
+        self.assertEqual(artist_preference_config(raw), raw)
+        expected = parse_config(raw)
+        expected['filters'][1]['parameters'][2] = 5
+        self.assertEqual(parse_config(artist_preference_config(raw, 'slight')), expected)
+        expected['filters'][1]['parameters'][2] = 4
+        self.assertEqual(parse_config(artist_preference_config(raw, 'moderate')), expected)
+        self.assertEqual(parse_config(raw), parsed)
+        expected['filters'][1]['parameters'][2] = 1
+        floor = pack_config(expected)
+        self.assertEqual(artist_preference_config(floor, 'slight'), floor)
+        self.assertEqual(artist_preference_config(floor, 'moderate'), floor)
+        relations = pack_config({**parsed, 'filters': [parsed['filters'][0]]})
+        self.assertEqual(artist_preference_config(relations, 'slight'), relations)
+        self.assertEqual(artist_preference_config(relations, 'moderate'), relations)
+        with self.assertRaisesRegex(ValueError, 'preference'):
+            artist_preference_config(raw, 'strong')
+
     def test_minimum_changes_preserve_song_skip_jitter_and_other_distance_words(self):
         config = {'version': 2, 'filters': [
             {'type': 1, 'parameters': [20, 50, 10, 10]},

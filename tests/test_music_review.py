@@ -158,6 +158,13 @@ class ReviewTests(unittest.TestCase):
         with patch('evaluate_ytmusic_batch.evaluate_graphs') as evaluate:
             evaluate.return_value = {'root_results': [{'root_pid': pid}], 'root_overlaps': []}
             result = self.session.evaluate({'root_pid': pid})
+            self.assertEqual(evaluate.call_args.kwargs['artist_preference'], 'moderate')
+            self.assertEqual(result['evaluation']['artist_preference'], 'moderate')
+            neutral = self.session.evaluate({'root_pid': pid, 'artist_preference': 'neutral'})
+            self.assertEqual(evaluate.call_args.kwargs['artist_preference'], 'neutral')
+            self.assertEqual(neutral['evaluation']['artist_preference'], 'neutral')
+            with self.assertRaisesRegex(ValueError, 'preference'):
+                self.session.evaluate({'root_pid': pid, 'artist_preference': 'strong'})
         self.assertEqual(result['evaluation_source_status'], 'current')
         self.assertEqual(self.session.state()['evaluation_source_status'], 'current')
         success = copy.deepcopy(self.session.latest)
