@@ -39,7 +39,10 @@ python3 scripts/inspect_music_genius_state.py /path/to/copy.musiclibrary --requi
 bundle生成時に `--artist-preference moderate` を指定する。
 ライブラリの形式制限と、既存Genius IDを持つ入力の拒否は継続している。
 [既存IDを保持する増分計画API](docs/research/2026-10-05-incremental-genius-plan.md)は
-別途用意したが、計画をDBへ適用する経路は未実装。
+独立コピーへ適用する `update_genius_bundle.py` と併用できる。
+既存286 IDを保持した292曲・969関係の更新コピーで、全53起点の
+オフライン選曲順が比較用コピーと一致した。更新コピーの実Music／iPodでの
+読み込みは未確認。
 [対応形式・生成例・保存差分の検証](docs/research/2026-10-05-offline-dual-state-integration.md)を参照。
 
 関係データの拡張は、短い推薦につながる未観測曲をアーティスト・アルバムに
