@@ -150,12 +150,15 @@ class ReviewSession:
     def evaluate(self, payload):
         if self.engine is None:
             raise ValueError('Offline evaluation inputs were not configured')
-        if not isinstance(payload, dict) or set(payload) - {'tags', 'kind', 'excluded_kinds', 'profile', 'root_pid'}:
+        if not isinstance(payload, dict) or set(payload) - {'tags', 'kind', 'excluded_kinds', 'profile', 'root_pid', 'artist_preference'}:
             raise ValueError('Invalid evaluation fields')
         tags, kind = payload.get('tags', []), payload.get('kind')
         profile = payload.get('profile', PROFILES[0])
         if profile not in PROFILES:
             raise ValueError('Unsupported profile')
+        artist_preference = payload.get('artist_preference', 'moderate')
+        if artist_preference not in ('neutral', 'slight', 'moderate'):
+            raise ValueError('Unsupported artist preference')
         graphs, matcher, config, executable, provenance = self.engine
         labels = classify_tracks(self.config, self.tracks, self.library_hash)
         filtered, scope = scope_graphs(graphs, labels, tags, kind, excluded_kinds=payload.get('excluded_kinds', []))
@@ -168,12 +171,14 @@ class ReviewSession:
                 raise ValueError('Selected root has no observations in this scope')
         from evaluate_ytmusic_batch import evaluate_graphs
         evaluated = evaluate_graphs(filtered, matcher, config, executable, profile=profile,
-                                    root_pids=[root] if root is not None else None)
+                                    root_pids=[root] if root is not None else None,
+                                    artist_preference=artist_preference)
         report = {'schema_version': 1, 'library_sha256': self.library_hash, 'library_input': self.provenance,
                   'cluster_config_sha256': self.config_hash(),
                   'cluster_config_semantic_sha256': self.config_hash(), 'cluster_config': copy.deepcopy(self.config),
                   'cluster_scope': scope,
-                  'input_provenance': provenance, 'profile': profile, **evaluated,
+                  'input_provenance': provenance, 'profile': profile,
+                  'artist_preference': artist_preference, **evaluated,
                   'network_requests': 0, 'identity_status': 'unverified',
                   'music_app_acceptance_verified': False, 'ipod_acceptance_verified': False}
         path = self._save('evaluation', report)

@@ -191,7 +191,7 @@ def relation_distances(root_pid, edges):
     return _relation_tree(root_pid, edges)[0]
 
 
-def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=None, profile='without-compatible-genre', root_pids=None):
+def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=None, profile='without-compatible-genre', root_pids=None, artist_preference='neutral'):
     """Generate selected roots while retaining the full observed graph and ID space."""
     if not 1 <= limit <= 100:
         raise ValueError('Limit must be 1..100')
@@ -216,11 +216,14 @@ def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=
         controlled = distance_profiles(config)[profile]
     else:
         controlled = controlled_configs(config)[profile]
+    from genius_profiles import artist_preference_config
+    controlled = artist_preference_config(controlled, artist_preference)
     core = None
     edges = {root['root_pid']: root['ordered_target_pids'] for root in roots}
     results = []
     for root in selected_roots:
-        result = {**root, 'candidate_count': len(root['ordered_target_pids']), 'profile': profile}
+        result = {**root, 'candidate_count': len(root['ordered_target_pids']), 'profile': profile,
+                  'artist_preference': artist_preference}
         if not root['ordered_target_pids']:
             generated, playlist = {}, []
             result['status'] = 'empty_candidates'
@@ -259,6 +262,7 @@ def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=
                              'nonroot_playlist_pid_jaccard': jaccard(set(left['playlist_pids']) - root_pids,
                                                                     set(right['playlist_pids']) - root_pids)})
     return {'temporary_id_mapping': mapping, 'root_results': results, 'root_overlaps': overlaps,
+            'artist_preference': artist_preference,
             'controlled_config_sha256': hashlib.sha256(controlled).hexdigest(),
             'relation_rows': [{'root_pid': root['root_pid'], 'ordered_target_pids': root['ordered_target_pids']} for root in roots],
             'shared_metadata_count': len(metadata), 'total_instructions': core.steps if core is not None else 0}
@@ -292,6 +296,7 @@ def main():
     parser.add_argument('--exclude-kind', action='append', default=[], choices=('vocal', 'bgm', 'off_vocal', 'unknown'))
     parser.add_argument('--profile', choices=('without-compatible-genre', 'relations-only', 'artist-album-minimum-one'),
                         default='without-compatible-genre')
+    parser.add_argument('--artist-preference', choices=('neutral', 'slight', 'moderate'), default='neutral')
     args = parser.parse_args()
     if (args.cluster_tag or args.track_kind or args.exclude_kind) and not args.cluster_config:
         parser.error('Cluster scope requires --cluster-config')
@@ -332,7 +337,8 @@ def main():
               'observation_inputs': observation_inputs, 'skipped_snapshots': skipped, 'snapshot_graphs': graphs,
               'cluster_scope': cluster_scope, 'cluster_config_sha256': cluster_config_hash,
               'cluster_config_semantic_sha256': cluster_config_semantic_hash,
-              **evaluate_graphs(graphs, matcher, config, paths['executable'], args.limit, profile=args.profile),
+              **evaluate_graphs(graphs, matcher, config, paths['executable'], args.limit, profile=args.profile,
+                                artist_preference=args.artist_preference),
               'grouping_policy': {'ids': 'Sorted local PIDs in one shared temporary uint32 ID space',
                                   'metadata': 'genre 0; canonical artist credits; normalized album; credits plus original title song groups',
                                   'relations': 'Actual radio/related targets only; per-root ordered PID union; no reverse edges',
