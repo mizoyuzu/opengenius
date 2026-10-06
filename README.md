@@ -60,6 +60,11 @@ iPod到着後は、Musicが実際に同期したファイルの前後差分と�
 端末自身によるGenius生成を別々に確認する。
 [iPod検証の手順](docs/research/2026-10-05-ipod-paired-snapshot-workflow.md)を参照。
 
+Webではタグで曲を絞って一括分類し、推薦を「範囲内だけ」または
+「範囲内を優先」で生成できる。
+[クラスタ優先の動作と実曲検証](docs/research/2026-10-06-cluster-preference.md)を参照。
+優先モードはWeb側の追加選曲ポリシーで、純正Genius DBへの書き出しは未対応。
+
 ## Genius DBのオフライン復号
 
 提供されたMusic 1.7.0.146のARM64実行ファイルが必要。

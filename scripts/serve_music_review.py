@@ -150,7 +150,7 @@ class ReviewSession:
     def evaluate(self, payload):
         if self.engine is None:
             raise ValueError('Offline evaluation inputs were not configured')
-        if not isinstance(payload, dict) or set(payload) - {'tags', 'kind', 'excluded_kinds', 'profile', 'root_pid', 'artist_preference'}:
+        if not isinstance(payload, dict) or set(payload) - {'tags', 'kind', 'excluded_kinds', 'profile', 'root_pid', 'artist_preference', 'cluster_mode'}:
             raise ValueError('Invalid evaluation fields')
         tags, kind = payload.get('tags', []), payload.get('kind')
         profile = payload.get('profile', PROFILES[0])
@@ -161,7 +161,8 @@ class ReviewSession:
             raise ValueError('Unsupported artist preference')
         graphs, matcher, config, executable, provenance = self.engine
         labels = classify_tracks(self.config, self.tracks, self.library_hash)
-        filtered, scope = scope_graphs(graphs, labels, tags, kind, excluded_kinds=payload.get('excluded_kinds', []))
+        mode = payload.get('cluster_mode', 'only')
+        filtered, scope = scope_graphs(graphs, labels, tags, kind, excluded_kinds=payload.get('excluded_kinds', []), mode=mode)
         root = payload.get('root_pid')
         if root is not None:
             if not isinstance(root, str):
@@ -169,14 +170,15 @@ class ReviewSession:
             # Keep other roots' edges for observed two-hop recommendations.
             if root not in {graph['root_pid'] for graph in filtered}:
                 raise ValueError('Selected root has no observations in this scope')
-        from evaluate_ytmusic_batch import evaluate_graphs
-        evaluated = evaluate_graphs(filtered, matcher, config, executable, profile=profile,
-                                    root_pids=[root] if root is not None else None,
+        from cluster_recommendations import evaluate_clusters
+        evaluated, scope = evaluate_clusters(graphs, matcher, config, executable, labels,
+                                    tags=tags, kind=kind, excluded_kinds=payload.get('excluded_kinds', []), mode=mode,
+                                    profile=profile, root_pids=[root] if root is not None else None,
                                     artist_preference=artist_preference)
         report = {'schema_version': 1, 'library_sha256': self.library_hash, 'library_input': self.provenance,
                   'cluster_config_sha256': self.config_hash(),
                   'cluster_config_semantic_sha256': self.config_hash(), 'cluster_config': copy.deepcopy(self.config),
-                  'cluster_scope': scope,
+                  'cluster_scope': scope, 'cluster_mode': mode,
                   'input_provenance': provenance, 'profile': profile,
                   'artist_preference': artist_preference, **evaluated,
                   'network_requests': 0, 'identity_status': 'unverified',

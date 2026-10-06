@@ -178,6 +178,8 @@ def main():
     evaluation = json.loads(input_bytes['evaluation'])
     if evaluation.get('library_sha256') != library_hash:
         parser.error('Evaluation belongs to a different Library')
+    if evaluation.get('selection_policy') is not None:
+        parser.error('Application selection policy cannot be encoded by this Genius updater')
     if args.baseline_state:
         baseline = json.loads(input_bytes['baseline_state'])
     else:

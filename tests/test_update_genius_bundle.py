@@ -3,6 +3,8 @@ import copy
 from pathlib import Path
 import sqlite3
 import sys
+import json
+import subprocess
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
@@ -20,6 +22,7 @@ class IncrementalSqlTests(unittest.TestCase):
         self.pids = [f'{i:016X}' for i in range(1, 5)]
         tracks = [dict(persistent_id=pid, title=str(i), artist='Artist', album='Album')
                   for i, pid in enumerate(self.pids)]
+        self.tracks = tracks
         matcher = IdentityMap(build_map(tracks, self.digest), tracks, self.digest)
         self.old = make_synthetic_state([self.root(2, [3])], matcher, self.digest, self.map_hash)
         self.new = plan_genius_update(self.old, [self.root(2, [1, 3]), self.root(1, [3])],
@@ -94,6 +97,28 @@ class IncrementalSqlTests(unittest.TestCase):
             (root / 'link').symlink_to(root / 'Genius.itdb')
             with self.assertRaisesRegex(ValueError, 'Symlink'):
                 read_bundle(root)
+
+    def test_review_preference_cannot_be_silently_exported_as_native_genius(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = {
+                'track-snapshot': dict(source_sha256=self.digest, tracks=self.tracks),
+                'identity-map': build_map(self.tracks, self.digest),
+                'evaluation': dict(library_sha256=self.digest, selection_policy='user_cluster_preferred_then_fill'),
+                'baseline-state': self.old}
+            command = [sys.executable, str(Path(__file__).resolve().parents[1] / 'scripts/update_genius_bundle.py')]
+            for name, document in inputs.items():
+                path = root / (name + '.json')
+                path.write_text(json.dumps(document))
+                command.extend(['--' + name, str(path)])
+            (root / 'source').mkdir()
+            (root / 'Music').write_bytes(b'unused executable')
+            output = root / 'output'
+            command.extend(['--bundle', str(root / 'source'), '--executable', str(root / 'Music'), '--output', str(output)])
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn('Application selection policy cannot be encoded', result.stderr)
+            self.assertFalse(output.exists())
 
 
 if __name__ == '__main__':

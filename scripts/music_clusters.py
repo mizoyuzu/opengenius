@@ -147,7 +147,7 @@ def classify_tracks(config, tracks, library_hash):
     return result
 
 
-def scope_graphs(graphs, classifications, tags=(), kind=None, excluded_kinds=()):
+def scope_graphs(graphs, classifications, tags=(), kind=None, excluded_kinds=(), *, mode='only'):
     """Restrict all root edges before emulation; retain original observations.
 
     removed_target_count includes every edge removed with an excluded root.
@@ -155,6 +155,8 @@ def scope_graphs(graphs, classifications, tags=(), kind=None, excluded_kinds=())
     """
     if not isinstance(graphs, list) or not isinstance(classifications, dict):
         raise ValueError('Need graph list and classifications by PID')
+    if mode not in ('only', 'prefer'):
+        raise ValueError('Invalid cluster mode')
     if not isinstance(tags, (list, tuple)):
         raise ValueError('Scope tags must be a list or tuple')
     _strings(list(tags), 'scope tags', allow_empty=True)
@@ -191,23 +193,28 @@ def scope_graphs(graphs, classifications, tags=(), kind=None, excluded_kinds=())
         current_tags, current_kind = normalized[pid]
         return (set(requested) <= current_tags and (kind is None or current_kind == kind)
                 and current_kind not in excluded_kinds)
+    def retains(pid):
+        return accepts(pid) if mode == 'only' else normalized[pid][1] not in excluded_kinds
     filtered, excluded, removed = [], [], 0
     for graph in graphs:
         root = graph['root_pid']
-        if not accepts(root):
+        if not retains(root):
             if root not in excluded:
                 excluded.append(root)
             removed += len(graph['ordered_target_pids'])
             continue
-        targets = [pid for pid in graph['ordered_target_pids'] if accepts(pid)]
+        targets = [pid for pid in graph['ordered_target_pids'] if retains(pid)]
         removed += len(graph['ordered_target_pids']) - len(targets)
         retained = copy.deepcopy(graph)
         retained['ordered_target_pids'] = targets
         filtered.append(retained)
     if not filtered:
         raise ValueError('No roots remain in the requested cluster scope')
-    return filtered, {'excluded_root_pids': excluded, 'removed_target_count': removed,
-                      'tags': requested, 'kind': kind, 'excluded_kinds': list(excluded_kinds)}
+    summary = {'excluded_root_pids': excluded, 'removed_target_count': removed,
+               'tags': requested, 'kind': kind, 'excluded_kinds': list(excluded_kinds)}
+    if mode == 'prefer':
+        summary.update(mode=mode, preferred_pids=sorted(pid for pid in normalized if accepts(pid)))
+    return filtered, summary
 
 
 def _unique_keys(pairs):
