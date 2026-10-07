@@ -57,21 +57,66 @@ def load_library(bundle=None, track_snapshot=None):
                                  'original_library_hash_verified_this_run': False}
 
 
+_VERSION_MARKERS = {
+    'off_vocal': r'\boff[ _-]?vocal\b',
+    'karaoke': r'\bkaraoke\b|カラオケ|からおけ',
+    'instrumental': r'\binstrument(?:al)?\b',
+    'game_size': r'game[ _-]?size',
+    'tv_size': r'tv[ _-]?size',
+    'short_version': r'\bshort\s+(?:ver(?:sion)?|edit)\b',
+    'edit': r'\b(?:tv\s+)?(?:short\s+)?edit(?:ed)?\b',
+    'live': r'\blive\b|ライブ',
+    'remix': r'\bremix\b|\brmx\b|リミックス',
+    'remaster': r'\bremaster(?:ed|ing)?\b|再マスタリング',
+    'piano': r'\bpiano\b|ピアノ',
+    'orchestral': r'\borchestr(?:al|a)\b|オーケストラ',
+}
+_VERSION_MARKER_RE = {name: re.compile(pattern, re.IGNORECASE)
+                      for name, pattern in _VERSION_MARKERS.items()}
+_YEAR_RE = re.compile(r'(?<!\d)((?:19|20)\d{2})(?!\d)')
+_QUALIFIER_RE = re.compile(r'\(([^()]*)\)')
+_BRACKET_QUALIFIER_RE = re.compile(r'\[([^\[\]]*)\]|【([^【】]*)】')
+
+
 def version_signature(title):
-    """Conservative guard for common versions; does not prove equivalence."""
+    """Return recognized title facets used only as a spelling-alias guard."""
     title = normalize(title).replace('_', ' ')
-    markers = {
-        'instrumental': r'off[ _-]?vocal|\binstrument(?:al)?\b|カラオケ|からおけ',
-        'game_size': r'game[ _-]?size',
-        'tv_size': r'tv[ _-]?size',
-        'live': r'\blive\b|ライブ',
-        'remix': r'\bremix\b|\brmx\b|リミックス',
-        'piano': r'\bpiano\b|ピアノ',
-        'orchestral': r'\borchestr(?:al|a)\b|オーケストラ',
-    }
-    flags = {name for name, pattern in markers.items() if re.search(pattern, title)}
-    flags.update('year:' + year for year in re.findall(r'(?<!\d)((?:19|20)\d{2})(?!\d)', title))
+    flags = {name for name, pattern in _VERSION_MARKER_RE.items() if pattern.search(title)}
+    flags.update('year:' + year for year in _YEAR_RE.findall(title))
     return flags
+
+
+def version_facets(title):
+    """Describe title markers without asserting recording identity.
+
+    Qualifier text that is not explained by a recognized marker is retained as
+    unknown. This is diagnostic metadata; callers must preserve the source title.
+    """
+    original = title or ''
+    normalized = normalize(original).replace('_', ' ')
+    signature = version_signature(original)
+    markers = sorted(value for value in signature if not value.startswith('year:'))
+    years = sorted(value[5:] for value in signature if value.startswith('year:'))
+    unknown = set()
+    qualifier_matches = list(_QUALIFIER_RE.finditer(normalized)) + list(_BRACKET_QUALIFIER_RE.finditer(normalized))
+    for match in qualifier_matches:
+        raw = next((value for value in match.groups() if value is not None), '')
+        text = normalize(raw).replace('_', ' ')
+        text = re.sub(r'【[^【】]*】|\[[^\[\]]*\]', ' ', text)
+        if not text:
+            continue
+        remainder = text
+        for pattern in _VERSION_MARKER_RE.values():
+            remainder = pattern.sub(' ', remainder)
+        remainder = _YEAR_RE.sub(' ', remainder)
+        remainder = re.sub(r'\b(?:ver|version|size|for|the)\b', ' ', remainder)
+        remainder = re.sub(r'[^\w\u3040-\u30ff\u3400-\u9fff]+', ' ', remainder)
+        remainder = ' '.join(remainder.split())
+        if remainder:
+            unknown.add(remainder)
+    kinds = sorted(set(markers) & {'off_vocal', 'instrumental', 'karaoke'})
+    return {'original_title': original, 'markers': markers, 'years': years,
+            'kinds': kinds, 'unknown_qualifiers': sorted(unknown)}
 
 
 def build_map(tracks, library_hash, artist_evidence=()):

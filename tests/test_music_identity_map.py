@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from music_identity_map import IdentityMap, apply_title_review, build_map, load_library, main, version_signature, group_candidate_observations
+from music_identity_map import IdentityMap, apply_title_review, build_map, load_library, main, version_signature, version_facets, group_candidate_observations
 
 
 class IdentityMapTests(unittest.TestCase):
@@ -88,7 +88,7 @@ class IdentityMapTests(unittest.TestCase):
 
     def test_review_rejects_remix_and_live_markers_even_with_underscore(self):
         for suffix, marker in (('_RMX', 'remix'), ('_REMIX', 'remix'), ('_LIVE', 'live'),
-                               (' (Off Vocal)', 'instrumental'), (' (Game Size)', 'game_size'),
+                               (' (Off Vocal)', 'off_vocal'), (' (Game Size)', 'game_size'),
                                (' (2023 Ver.)', 'year:2023')):
             with self.subTest(suffix=suffix):
                 title = 'REFRESH' + suffix
@@ -99,6 +99,44 @@ class IdentityMapTests(unittest.TestCase):
                     {'persistent_id': 'R', 'original_title': title, 'alias': 'REFRESH', 'reason': 'Unsafe removal'}]}
                 with self.assertRaises(ValueError):
                     apply_title_review(document, decisions, tracks, 'hash')
+
+    def test_review_distinguishes_off_vocal_instrumental_and_karaoke(self):
+        self.assertIn('off_vocal', version_signature('Song (Off Vocal)'))
+        self.assertIn('instrumental', version_signature('Song (Instrumental)'))
+        self.assertIn('karaoke', version_signature('Song (Karaoke)'))
+        self.assertNotEqual(version_signature('Song (Off Vocal)'), version_signature('Song (Instrumental)'))
+        for alias in ('曲 (Instrumental)', '曲 (Karaoke)'):
+            tracks = [{'persistent_id': 'V', 'title': '曲 (Off Vocal)', 'artist': 'Artist', 'duration_ms': 100000}]
+            document = build_map(tracks, 'hash')
+            decisions = {'schema_version': 1, 'library_sha256': 'hash', 'decisions': [
+                {'persistent_id': 'V', 'original_title': tracks[0]['title'], 'alias': alias,
+                 'reason': 'Would change vocal version'}]}
+            with self.subTest(alias=alias), self.assertRaises(ValueError):
+                apply_title_review(document, decisions, tracks, 'hash')
+
+    def test_review_accepts_english_suffix_when_game_size_is_retained(self):
+        title = 'ゲーム曲 (Game Size)'
+        alias = 'ゲーム曲 (Game Size) - Game Song (Game Size)'
+        tracks = [{'persistent_id': 'V', 'title': title, 'artist': 'Artist', 'duration_ms': 100000}]
+        document = build_map(tracks, 'hash')
+        decisions = {'schema_version': 1, 'library_sha256': 'hash', 'decisions': [
+            {'persistent_id': 'V', 'original_title': title, 'alias': alias,
+             'reason': 'English spelling suffix preserves the version'}]}
+        reviewed = apply_title_review(document, decisions, tracks, 'hash')
+        self.assertTrue(reviewed['track_title_aliases'][0]['aliases'][0]['enabled'])
+        self.assertIn('game_size', version_signature(alias))
+
+    def test_version_facets_keep_unknown_qualifier_text(self):
+        facets = version_facets('曲 (Instrumental 【-Bass】)')
+        self.assertEqual(facets['original_title'], '曲 (Instrumental 【-Bass】)')
+        self.assertEqual(facets['kinds'], ['instrumental'])
+        self.assertEqual(facets['unknown_qualifiers'], ['bass'])
+        self.assertIn('remaster', version_facets('Song (2023 Remastering Ver.)')['markers'])
+        self.assertIn('year:2023', version_signature('Song (2023 Remastering Ver.)'))
+        fullwidth = version_facets('曲（Instrumental 【-Bass】）')
+        self.assertEqual(fullwidth['original_title'], '曲（Instrumental 【-Bass】）')
+        self.assertEqual(fullwidth['kinds'], ['instrumental'])
+        self.assertEqual(fullwidth['unknown_qualifiers'], ['bass'])
 
     def test_snapshot_validates_hash_ids_and_durations(self):
         with tempfile.TemporaryDirectory() as directory:
