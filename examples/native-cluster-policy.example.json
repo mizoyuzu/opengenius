@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "excluded_kinds": ["off_vocal"],
+  "scopes": [
+    {"name": "アイマス", "tags": ["アイマス"]},
+    {"name": "シャニマス", "tags": ["アイマス", "シャニマス"]},
+    {"name": "ノベルゲー歌唱", "tags": ["ノベルゲー"], "kind": "vocal"},
+    {"name": "ノベルゲーBGM", "tags": ["ノベルゲー"], "kind": "bgm"}
+  ]
+}

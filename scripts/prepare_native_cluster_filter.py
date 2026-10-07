@@ -14,6 +14,7 @@ from decrypt_genius import derive_key, decrypt_pages, extract_key_header, valida
 from genius_format import pack_config, parse_config, parse_similarities
 from music_clusters import classify_tracks, scope_graphs
 from music_identity_map import IdentityMap, load_library
+from probe_ytmusic import normalize
 from rewrite_genius import encrypt_pages, table_snapshot
 from update_genius_bundle import read_bundle, sha, state_rows, update_bundle, update_sql
 
@@ -25,10 +26,7 @@ def compile_filter(clear, baseline, classifications, *, tags=(), kind=None, excl
     In-scope seeds allow bucket 1, outside seeds allow 1+2, excluded seeds
     allow none. The seed itself is retained by the observed Music core.
     """
-    ids, metadata, _ = state_rows(baseline)
-    # Retain the updater's strict SQL/config/schema checks, without weakening
-    # its prohibition against genre filters or nonzero first metadata words.
-    _, before = update_sql(clear, baseline, baseline)
+    ids, _, _ = state_rows(baseline)
     graphs = [dict(root_pid=pid, ordered_target_pids=[]) for pid in ids]
     _, scope = scope_graphs(graphs, classifications, tags, kind, excluded_kinds, mode='prefer')
     preferred = set(scope['preferred_pids']) & ids.keys()
@@ -36,6 +34,68 @@ def compile_filter(clear, baseline, classifications, *, tags=(), kind=None, excl
         raise ValueError('No assigned Genius tracks match the requested scope')
     buckets = {pid: (3 if classifications[pid]['kind'] in excluded_kinds
                      else 1 if pid in preferred else 2) for pid in ids}
+    audit = dict(schema_version=1, policy='native_hard_scope_for_matching_seeds', scope=scope,
+                 bucket_counts={str(bucket): sum(value == bucket for value in buckets.values()) for bucket in (1, 2, 3)},
+                 pid_buckets=buckets, similarities_preserved=True, metadata_tail_preserved=True,
+                 web_preference_encoded=False, music_app_acceptance_verified=False, ipod_acceptance_verified=False)
+    return _write_filter(clear, baseline, buckets, [(1, [1]), (2, [1, 2]), (3, [])], audit)
+
+
+def compile_policy(clear, baseline, classifications, policy):
+    """Compile overlapping scopes: every seed membership must be retained.
+
+    A seed with no membership may use all nonexcluded buckets. This strict
+    intersection prevents a shared song from bridging otherwise separate scopes.
+    """
+    if (not isinstance(policy, dict) or set(policy) != {'schema_version', 'scopes', 'excluded_kinds'}
+            or type(policy['schema_version']) is not int or policy['schema_version'] != 1
+            or not isinstance(policy['scopes'], list) or not 1 <= len(policy['scopes']) <= 16):
+        raise ValueError('Policy requires schema 1, 1..16 scopes and excluded_kinds')
+    ids, _, _ = state_rows(baseline)
+    graphs = [dict(root_pid=pid, ordered_target_pids=[]) for pid in ids]
+    scopes, names, matches = [], set(), []
+    # Even if a later scope is invalid, no SQL writes have occurred yet.
+    for scope in policy['scopes']:
+        if (not isinstance(scope, dict) or not {'name', 'tags'} <= scope.keys()
+                or scope.keys() - {'name', 'tags', 'kind'}
+                or not isinstance(scope['name'], str) or not normalize(scope['name'])
+                or normalize(scope['name']) in names
+                or not scope['tags'] and scope.get('kind') is None):
+            raise ValueError('Scopes need unique names and a tag or kind condition')
+        names.add(normalize(scope['name']))
+        _, summary = scope_graphs(graphs, classifications, scope['tags'], scope.get('kind'),
+                                  policy['excluded_kinds'], mode='prefer')
+        matched = set(summary['preferred_pids']) & ids.keys()
+        if not matched:
+            raise ValueError('No assigned Genius tracks match scope: ' + scope['name'])
+        matches.append(matched)
+        scopes.append(dict(name=scope['name'], tags=summary['tags'], kind=summary['kind'], assigned_count=len(matched)))
+    memberships = {pid: (None if classifications[pid]['kind'] in policy['excluded_kinds']
+                          else tuple(i for i, matched in enumerate(matches) if pid in matched)) for pid in ids}
+    signatures = sorted({value for value in memberships.values() if value is not None})
+    if None in memberships.values():
+        signatures.append(None)
+    if len(signatures) > 256:
+        raise ValueError('Policy exceeds 256 membership buckets')
+    bucket_ids = {signature: i + 1 for i, signature in enumerate(signatures)}
+    buckets = {pid: bucket_ids[signature] for pid, signature in memberships.items()}
+    records = [(bucket_ids[signature], [] if signature is None else
+                [bucket_ids[target] for target in signatures if target is not None and set(signature) <= set(target)])
+               for signature in signatures]
+    audit = dict(schema_version=1, policy='native_all_matching_scopes', scopes=scopes,
+                 excluded_kinds=list(policy['excluded_kinds']), pid_buckets=buckets,
+                 bucket_counts={str(bucket): sum(value == bucket for value in buckets.values()) for bucket in bucket_ids.values()},
+                 bucket_memberships={str(bucket_ids[signature]): None if signature is None else list(signature) for signature in signatures},
+                 compatibility_records=records, similarities_preserved=True, metadata_tail_preserved=True,
+                 web_preference_encoded=False, music_app_acceptance_verified=False, ipod_acceptance_verified=False)
+    return _write_filter(clear, baseline, buckets, records, audit)
+
+
+def _write_filter(clear, baseline, buckets, records, audit):
+    ids, metadata, _ = state_rows(baseline)
+    # Keep the updater's SQL/config/schema checks and its refusal to update
+    # nonzero first metadata words or existing genre filters.
+    _, before = update_sql(clear, baseline, baseline)
     replacement = {gid: struct.pack('<Q', buckets[pid]) + metadata[gid][8:]
                    for pid, gid in ids.items()}
     with closing(sqlite3.connect(':memory:')) as connection:
@@ -43,7 +103,7 @@ def compile_filter(clear, baseline, classifications, *, tags=(), kind=None, excl
         schema = connection.execute('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name').fetchall()
         raw_config = connection.execute('SELECT data FROM genius_config WHERE id=1').fetchone()[0]
         config = parse_config(raw_config)
-        config['filters'].append(dict(type=2, metadata_index=0, records=[(1, [1]), (2, [1, 2]), (3, [])]))
+        config['filters'].append(dict(type=2, metadata_index=0, records=records))
         packed = pack_config(config)
         expected = dict(before)
         expected['genius_metadata'] = [(gid, 1, blob) for gid, blob in sorted(replacement.items())]
@@ -62,10 +122,6 @@ def compile_filter(clear, baseline, classifications, *, tags=(), kind=None, excl
             if connection.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
                 raise ValueError('Native filter SQL integrity failed')
         result = connection.serialize()
-    audit = dict(schema_version=1, policy='native_hard_scope_for_matching_seeds', scope=scope,
-                 bucket_counts={str(bucket): sum(value == bucket for value in buckets.values()) for bucket in (1, 2, 3)},
-                 pid_buckets=buckets, similarities_preserved=True, metadata_tail_preserved=True,
-                 web_preference_encoded=False, music_app_acceptance_verified=False, ipod_acceptance_verified=False)
     return result, expected, audit
 
 
@@ -74,9 +130,12 @@ def main():
     for name in ('bundle', 'baseline-state', 'track-snapshot', 'identity-map', 'cluster-config', 'executable', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--cluster-tag', action='append', default=[])
+    parser.add_argument('--scope-policy', type=Path, help='JSON with named overlapping scopes and global exclusions')
     parser.add_argument('--kind')
     parser.add_argument('--exclude-kind', action='append', default=[])
     args = parser.parse_args()
+    if args.scope_policy and (args.cluster_tag or args.kind is not None or args.exclude_kind):
+        parser.error('Scope policy cannot be mixed with single-scope flags')
     output = args.output.resolve()
     inputs = {name: path for name, path in vars(args).items() if isinstance(path, Path) and name != 'output'}
     if output.exists() or any(output == path.resolve() or output.is_relative_to(path.resolve())
@@ -98,8 +157,12 @@ def main():
     if plan['new_pids'] or plan['relation_deltas']:
         raise ValueError('Unexpected baseline delta')
     key, _ = derive_key(args.executable, extract_key_header(files['Library Preferences.musicdb']))
-    clear, expected, audit = compile_filter(decrypt_pages(files['Genius.itdb'], key), baseline, classifications,
-                                            tags=args.cluster_tag, kind=args.kind, excluded_kinds=args.exclude_kind)
+    source_clear = decrypt_pages(files['Genius.itdb'], key)
+    if args.scope_policy:
+        clear, expected, audit = compile_policy(source_clear, baseline, classifications, json.loads(snapshots['scope_policy']))
+    else:
+        clear, expected, audit = compile_filter(source_clear, baseline, classifications,
+                                                tags=args.cluster_tag, kind=args.kind, excluded_kinds=args.exclude_kind)
     encrypted = encrypt_pages(clear, key)
     recovered = decrypt_pages(encrypted, key)
     counts = validate_database(recovered)

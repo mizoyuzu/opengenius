@@ -10,7 +10,11 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from emulate_genius import MusicCore
 from genius_format import pack_config, pack_similarities
-from prepare_native_cluster_filter import compile_filter
+from prepare_native_cluster_filter import compile_filter, compile_policy
+from emulate_genius import database_rows
+from music_identity_map import IdentityMap, build_map
+from plan_genius_update import make_synthetic_state
+from verify_native_cluster_filter import compare_core
 from rewrite_genius import table_snapshot
 from update_genius_bundle import update_sql
 import test_update_genius_bundle as fixtures
@@ -65,6 +69,83 @@ class NativeClusterFilterTests(unittest.TestCase):
             source, _ = self.fixture.database(mutation)
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 compile_filter(source, self.fixture.old, self.labels, tags=['cluster'])
+
+    def overlapping_fixture(self):
+        pids = [f'{i:016X}' for i in range(1, 8)]
+        tracks = [dict(persistent_id=pid, title=str(i), artist='Artist', album='Album') for i, pid in enumerate(pids)]
+        matcher = IdentityMap(build_map(tracks, self.fixture.digest), tracks, self.fixture.digest)
+        self.fixture.old = make_synthetic_state(
+            [dict(root_pid=pid, ordered_target_pids=[other for other in pids if other != pid]) for pid in pids],
+            matcher, self.fixture.digest, self.fixture.map_hash)
+        labels = {pid: dict(tags=tags, kind=kind) for pid, (tags, kind) in zip(pids, [
+            (['A'], 'vocal'), (['B'], 'vocal'), (['A', 'B'], 'vocal'), (['A', 'B'], 'vocal'),
+            ([], 'unknown'), (['A'], 'off_vocal'), (['A'], 'bgm')])}
+        policy = dict(schema_version=1, excluded_kinds=['off_vocal'], scopes=[
+            dict(name='A vocals', tags=['A'], kind='vocal'), dict(name='B vocals', tags=['B'], kind='vocal'),
+            dict(name='A BGM', tags=['A'], kind='bgm')])
+        return pids, labels, policy, self.fixture.database()[0]
+
+    def test_overlapping_scopes_intersect_and_unknowns_remain_broad(self):
+        pids, labels, policy, source = self.overlapping_fixture()
+        clear, expected, audit = compile_policy(source, self.fixture.old, labels, policy)
+        allowed = dict(audit['compatibility_records'])
+        buckets = audit['pid_buckets']
+        def targets(pid):
+            return {other for other in pids if buckets[other] in allowed[buckets[pid]]}
+        self.assertEqual(targets(pids[0]), {pids[0], pids[2], pids[3]})
+        self.assertEqual(targets(pids[2]), {pids[2], pids[3]})
+        self.assertEqual(targets(pids[4]), set(pids) - {pids[5]})
+        self.assertEqual(targets(pids[5]), set())
+        self.assertEqual(targets(pids[6]), {pids[6]})
+        self.assertTrue(all(bucket > 0 for bucket in buckets.values()))
+        self.assertEqual(database_rows(clear)[2], database_rows(source)[2])
+        reversed_policy = {**policy, 'scopes': policy['scopes'][::-1]}
+        _, _, other = compile_policy(source, self.fixture.old, labels, reversed_policy)
+        other_allowed = dict(other['compatibility_records'])
+        for pid in pids:
+            self.assertEqual(targets(pid), {candidate for candidate in pids
+                if other['pid_buckets'][candidate] in other_allowed[other['pid_buckets'][pid]]})
+
+    def test_invalid_multi_scope_policies_refused(self):
+        _, labels, policy, source = self.overlapping_fixture()
+        invalid = []
+        for update in (dict(schema_version=True), dict(scopes=[]), dict(unrecognized=True), dict(excluded_kinds=['vocal'])):
+            invalid.append({**policy, **update})
+        for scope in (dict(name='A vocals', tags=['B']), dict(name='Empty', tags=[]),
+                      dict(name='Typo', tags=['nonexistent']), dict(name='Kind typo', tags=[], kind='music'),
+                      dict(name='Extra', tags=['A'], mystery=True)):
+            invalid.append({**policy, 'scopes': policy['scopes'] + [scope]})
+        for value in invalid:
+            with self.subTest(policy=value), self.assertRaises(ValueError):
+                compile_policy(source, self.fixture.old, labels, value)
+
+    @unittest.skipUnless(os.environ.get('OPENGENIUS_MUSIC_EXECUTABLE'), 'Needs the pinned Music executable')
+    def test_actual_core_handles_overlap_kind_split_excluded_and_unknown_seeds(self):
+        pids, labels, policy, source = self.overlapping_fixture()
+        clear, _, audit = compile_policy(source, self.fixture.old, labels, policy)
+        ids = {row['persistent_id']: row['genius_id'] for row in self.fixture.old['rows']}
+        comparison = compare_core(Path(os.environ['OPENGENIUS_MUSIC_EXECUTABLE']),
+                                  database_rows(source), database_rows(clear), ids, audit, pids, 10)
+        expected = [{1, 3, 4}, {2, 3, 4}, {3, 4}, {3, 4}, {1, 2, 3, 4, 5, 7}, {6}, {7}]
+        for pid, selected, row in zip(pids, expected, comparison['results']):
+            result = row['after']
+            self.assertEqual(result[0], pid)
+            self.assertEqual(set(result), {pids[i-1] for i in selected})
+            self.assertEqual(len(result), len(set(result)))
+
+    def test_verifier_refuses_repeated_roots_and_changed_relations_or_metadata(self):
+        pids, labels, policy, source = self.overlapping_fixture()
+        clear, _, audit = compile_policy(source, self.fixture.old, labels, policy)
+        ids = {row['persistent_id']: row['genius_id'] for row in self.fixture.old['rows']}
+        before, after = database_rows(source), database_rows(clear)
+        malformed = copy.deepcopy(after)
+        gid = ids[pids[0]]
+        malformed[1][gid] = malformed[1][gid][:8] + bytes(24)
+        changed_relations = copy.deepcopy(after)
+        changed_relations[2][gid] = pack_similarities(0, [])
+        for rows, seeds in ((after, [pids[0], pids[0]]), (malformed, pids), (changed_relations, pids)):
+            with self.subTest(seeds=seeds), self.assertRaises(ValueError):
+                compare_core(Path('unused'), before, rows, ids, audit, seeds)
 
     @unittest.skipUnless(os.environ.get('OPENGENIUS_MUSIC_EXECUTABLE'), 'Needs the pinned Music executable')
     def test_actual_music_core_enforces_scope_and_empty_exclusion_without_soft_priority(self):

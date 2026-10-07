@@ -530,3 +530,8 @@ Musicが保存した形式を使うと2,974曲・214件のGenius ID・関連性7
 Genius IDと関係を保持し、分類欄とフィルターだけを変更する。
 Webの優先補充は符号化しておらず、このフィルター付きコピーのMusic.app／iPod受け入れは未確認。
 [書き出し方法とMusic 1.7コアの検証](docs/research/2026-10-07-native-cluster-filter.md)。
+
+複数作品・ブランド・歌唱/BGMの範囲を同じDBへ保存する `--scope-policy` も利用できる。
+重複所属する起点はすべての範囲を保持し、未分類の起点は除外種類以外の通常関係を使う。
+`verify_native_cluster_filter.py` で条件からSQLを再生成して照合し、元DBとの実コア選曲比較を保存する。
+[複数クラスタの53起点比較と更新・再検証手順](docs/research/2026-10-07-multiple-native-clusters.md)。

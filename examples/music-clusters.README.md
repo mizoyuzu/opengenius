@@ -27,3 +27,15 @@ python3 scripts/music_clusters.py --track-snapshot data/my-tracks.json --config 
 ```
 
 出力先は新しいファイルにしてください。Library、Genius DB、認証情報には書き込みません。
+
+純正形式の実験用Genius DBには、[複数範囲の設定例](native-cluster-policy.example.json)を
+`prepare_native_cluster_filter.py --scope-policy` で渡せます。
+分類設定とは別に、どのタグ・種類を選曲の境界にするかを指定します。
+各scope内のタグはすべて一致する条件です。起点が複数scopeに属する場合、推薦曲もその全部を
+満たす必要があります。たとえばシャニマス起点はアイマス＋シャニマスの範囲を保持します。
+どのscopeにも属さない起点は、除外種類以外の通常の関係を使います。
+
+kindは自分で指定済みの値を参照し、タグやアルバム名から歌唱／BGMを補いません。
+Genius IDのある曲が一つも属さないscopeはエラーになるため、設定例は使う範囲に合わせて編集してください。
+`--scope-policy` と単一範囲の `--cluster-tag`／`--kind`／`--exclude-kind` は併用できません。
+Webの優先補充はこの形式へ保存していません。
