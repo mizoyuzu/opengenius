@@ -188,6 +188,15 @@ class TasteFeedbackTests(unittest.TestCase):
         self.assertEqual(compared['baseline']['counts']['fits'], 1)
         self.assertEqual(compared['variant']['counts']['fits'], 1)
 
+    def test_bounded_fallback_settings_change_feedback_context(self):
+        report = copy.deepcopy(self.evaluation)
+        report['cluster_scope'].update(mode='prefer', fallback_tags=['Game', 'Ambient'], fallback_limit=2)
+        first = feedback_context(report)
+        report['cluster_scope']['fallback_tags'].reverse()
+        self.assertEqual(first, feedback_context(report))
+        report['cluster_scope']['fallback_limit'] = 3
+        self.assertNotEqual(first, feedback_context(report))
+
 
 if __name__ == '__main__':
     unittest.main()

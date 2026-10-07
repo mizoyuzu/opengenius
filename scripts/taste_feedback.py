@@ -205,8 +205,16 @@ def _semantic_scope(scope, cluster_mode=None):
     kind = scope.get('kind')
     if kind is not None and not isinstance(kind, str):
         raise ValueError('Invalid cluster scope kind')
-    return {'tags': sorted(set(tags)), 'kind': kind,
-            'excluded_kinds': sorted(set(excluded)), 'mode': mode}
+    result = {'tags': sorted(set(tags)), 'kind': kind,
+              'excluded_kinds': sorted(set(excluded)), 'mode': mode}
+    if 'fallback_tags' in scope or 'fallback_limit' in scope:
+        fallback = scope.get('fallback_tags', [])
+        cap = scope.get('fallback_limit')
+        if (not isinstance(fallback, (list, tuple)) or any(not isinstance(tag, str) for tag in fallback)
+                or cap is not None and (type(cap) is not int or not 0 <= cap <= 25)):
+            raise ValueError('Invalid fallback scope')
+        result.update(fallback_tags=sorted(set(fallback)), fallback_limit=cap)
+    return result
 
 
 def _common_root_value(evaluation, key):

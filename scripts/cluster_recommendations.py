@@ -10,9 +10,21 @@ from music_clusters import scope_graphs
 
 def evaluate_clusters(graphs, matcher, config, executable, classifications, *, tags=(), kind=None,
                       excluded_kinds=(), mode='only', profile='without-compatible-genre',
-                      artist_preference='moderate', root_pids=None, limit=25, core_factory=None):
+                      artist_preference='moderate', root_pids=None, limit=25, core_factory=None,
+                      fallback_tags=(), fallback_limit=None):
     from evaluate_ytmusic_batch import evaluate_graphs
+    if fallback_limit is not None and (type(fallback_limit) is not int or not 0 <= fallback_limit <= 25):
+        raise ValueError('Fallback limit must be an integer from 0 to 25')
+    bounded = fallback_limit is not None or bool(fallback_tags)
+    if bounded and (mode != 'prefer' or not (tags or kind is not None)):
+        raise ValueError('Fallback conditions require a preferred scope')
     filtered, scope = scope_graphs(graphs, classifications, tags, kind, excluded_kinds, mode=mode)
+    fallback_allowed = None
+    if bounded:
+        _, fallback_scope = scope_graphs(graphs, classifications, fallback_tags, None, excluded_kinds, mode='prefer')
+        fallback_allowed = set(fallback_scope['preferred_pids'])
+        scope.update(fallback_tags=fallback_scope['tags'], fallback_limit=fallback_limit)
+
     options = dict(profile=profile, artist_preference=artist_preference,
                    root_pids=root_pids, limit=limit, core_factory=core_factory)
     if mode == 'only' or not (tags or kind is not None):
@@ -36,10 +48,18 @@ def evaluate_clusters(graphs, matcher, config, executable, classifications, *, t
             order.append(seed)
         # Preferred tracks in the fallback also precede outside tracks, even
         # when their observed route crosses an outside intermediate node.
+        outside_count = 0
         for pid in [*early['playlist_pids'],
                     *(pid for pid in row['playlist_pids'] if pid in preferred), *row['playlist_pids']]:
-            if pid not in order and len(order) < limit:
-                order.append(pid)
+            if pid == seed or pid in order or len(order) >= limit:
+                continue
+            if pid not in preferred:
+                if fallback_allowed is not None and pid not in fallback_allowed:
+                    continue
+                if fallback_limit is not None and outside_count >= fallback_limit:
+                    continue
+                outside_count += 1
+            order.append(pid)
         playlist = [items[pid] for pid in order]
         for item in playlist:
             item['cluster_preferred'] = item['persistent_id'] in preferred
@@ -52,7 +72,8 @@ def evaluate_clusters(graphs, matcher, config, executable, classifications, *, t
                    indirect_candidate_count=sum(item['observed_relation_hops'] > 1 for item in playlist),
                    unique_artist_count=len(set(credits)), adjacent_same_artist_count=adjacent,
                    adjacent_same_artist_rate=adjacent / (len(credits)-1) if len(credits)>1 else None,
-                   selection_policy='user_cluster_preferred_then_fill',
+                   selection_policy='user_cluster_preferred_bounded_fallback' if bounded else 'user_cluster_preferred_then_fill',
+                   fallback_tags=list(fallback_tags), fallback_limit=fallback_limit,
                    core_result=None, core_passes={'preferred': early['core_result'], 'fallback': original['core_result']},
                    unscoped_playlist_pids=original['playlist_pids'],
                    preferred_count=sum(pid in preferred for pid in order),
@@ -62,7 +83,7 @@ def evaluate_clusters(graphs, matcher, config, executable, classifications, *, t
     # measurements of the composed result.
     baseline['root_overlaps'] = []
     baseline['overlap_measurement'] = 'not_computed_for_cluster_composition'
-    baseline['selection_policy'] = 'user_cluster_preferred_then_fill'
+    baseline['selection_policy'] = 'user_cluster_preferred_bounded_fallback' if bounded else 'user_cluster_preferred_then_fill'
     baseline['total_instructions'] += first['total_instructions']
     baseline['native_selection_order_verified'] = False
     return baseline, scope

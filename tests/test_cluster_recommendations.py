@@ -74,6 +74,26 @@ class ClusterSelectionTests(unittest.TestCase):
         self.assertEqual(result['relation_rows'][0]['ordered_target_pids'], self.pids[1:3])
         self.assertEqual(result['root_overlaps'], [])
 
+    def test_bounded_fallback_counts_nonroot_only_and_restricts_family(self):
+        result, _ = self.evaluate(fallback_limit=0)
+        self.assertEqual(result['root_results'][0]['playlist_pids'], [self.pids[0], self.pids[2]])
+        result, _ = self.evaluate(fallback_limit=1)
+        self.assertEqual(result['root_results'][0]['playlist_pids'], [self.pids[0], self.pids[2], self.pids[1]])
+        self.labels[self.pids[1]]['tags'] = ['Other game']
+        result, _ = self.evaluate(fallback_tags=['Family'], fallback_limit=1)
+        self.assertEqual(result['root_results'][0]['playlist_pids'], [self.pids[0], self.pids[2]])
+        result, _ = self.evaluate(fallback_tags=['Other game'], fallback_limit=1)
+        row = result['root_results'][0]
+        self.assertEqual(row['fallback_nonroot_count'], 1)
+        self.assertEqual(row['selection_policy'], 'user_cluster_preferred_bounded_fallback')
+
+    def test_invalid_fallback_constraints_are_rejected(self):
+        for value in (True, -1, 26, 1.5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.evaluate(fallback_limit=value)
+        with self.assertRaises(ValueError):
+            self.evaluate(mode='only', fallback_limit=0)
+
 
 if __name__ == '__main__':
     unittest.main()
