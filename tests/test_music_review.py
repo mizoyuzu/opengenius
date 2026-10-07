@@ -28,6 +28,28 @@ class ReviewTests(unittest.TestCase):
         self.original_bytes = self.snapshot.read_bytes()
         self.session = ReviewSession(self.snapshot, output_directory=self.directory / 'output')
 
+    def test_context_claims_are_visible_and_separate_from_classification(self):
+        from music_track_context import build_sidecar
+        doc = build_sidecar(self.tracks, 'a' * 64)
+        doc['tracks'][0]['claims'] = [{'work_title': 'Example game', 'franchise': None,
+            'medium': 'game', 'role': 'background', 'kind': 'background_music',
+            'notes': 'User supplied context', 'status': 'confirmed',
+            'source': {'type': 'user', 'reference': 'fixture'}}]
+        path = self.directory / 'context.json'
+        path.write_text(json.dumps(doc))
+        original = path.read_bytes()
+        session = ReviewSession(self.snapshot, track_context=path)
+        state = session.state()
+        self.assertEqual(state['track_context']['summary']['tracks_with_claims'], 1)
+        self.assertEqual(state['track_context']['tracks'][0]['claims'][0]['work_title'], 'Example game')
+        self.assertEqual(state['classifications'][self.tracks[0]['persistent_id']]['kind'], 'unknown')
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.snapshot.read_bytes(), self.original_bytes)
+        doc['library_sha256'] = 'b' * 64
+        path.write_text(json.dumps(doc))
+        with self.assertRaises(ValueError):
+            ReviewSession(self.snapshot, track_context=path)
+
     def feedback_report(self):
         self.session.latest = {'library_sha256': self.session.library_hash,
             'profile': 'artist-album-minimum-one', 'artist_preference': 'moderate',

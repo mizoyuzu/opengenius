@@ -36,12 +36,17 @@ def _source_signature(provenance):
 
 
 class ReviewSession:
-    def __init__(self, snapshot, config=None, output_directory=None, evaluation=None, engine=None, feedback=None):
+    def __init__(self, snapshot, config=None, output_directory=None, evaluation=None, engine=None, feedback=None, track_context=None):
         self.tracks, self.library_hash, self.provenance = load_library(track_snapshot=snapshot)
         config_bytes = config.read_bytes() if config else None
         self.config = (json.loads(config_bytes, object_pairs_hook=_unique_keys) if config else
                        {'schema_version': 1, 'source_library_sha256': self.library_hash, 'rules': [], 'overrides': {}})
         classify_tracks(self.config, self.tracks, self.library_hash)
+        from music_track_context import build_context_report
+        context_bytes = track_context.read_bytes() if track_context else None
+        claims = json.loads(context_bytes, object_pairs_hook=_unique_keys) if context_bytes is not None else None
+        context_hash = hashlib.sha256(context_bytes).hexdigest() if context_bytes is not None else None
+        self.track_context = build_context_report(self.tracks, self.library_hash, claims, sidecar_sha256=context_hash)
         self.output_directory = output_directory or Path('data/music-review')
         self.engine = engine
         self.lock = threading.Lock()
@@ -61,7 +66,7 @@ class ReviewSession:
                 self.latest['cluster_config_semantic_sha256'] = self.config_hash()
 
     def state(self):
-        return {'tracks': self.tracks, 'config': self.config,
+        return {'tracks': self.tracks, 'config': self.config, 'track_context': self.track_context,
                 'classifications': classify_tracks(self.config, self.tracks, self.library_hash),
                 'library_sha256': self.library_hash, 'evaluation': self.latest,
                 'taste_feedback': self.taste_feedback, 'feedback_path': self.feedback_path,
@@ -295,6 +300,7 @@ def main():
     parser.add_argument('--track-snapshot', type=Path, required=True)
     parser.add_argument('--config', type=Path)
     parser.add_argument('--evaluation', type=Path)
+    parser.add_argument('--track-context', type=Path, help='Evidence-backed Library-bound track context claims')
     parser.add_argument('--feedback', type=Path, help='Resume a Library-bound personal feedback snapshot')
     parser.add_argument('--output-directory', type=Path, default=Path('data/music-review'))
     parser.add_argument('--port', type=int, default=8765)
@@ -309,7 +315,7 @@ def main():
         parser.error('Offline generation needs all four evaluation inputs')
     if args.extra_observation and not all(evaluation_args):
         parser.error('Extra observations require offline generation inputs')
-    session = ReviewSession(args.track_snapshot, args.config, args.output_directory, args.evaluation, feedback=args.feedback)
+    session = ReviewSession(args.track_snapshot, args.config, args.output_directory, args.evaluation, feedback=args.feedback, track_context=args.track_context)
     if all(evaluation_args):
         from emulate_genius import database_rows
         from evaluate_ytmusic_batch import collect_graphs, observation_paths

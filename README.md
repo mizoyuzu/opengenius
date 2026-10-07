@@ -541,3 +541,7 @@ Webの優先補充は符号化しておらず、このフィルター付きコ�
 `audit_library_identity.py` は表記・版・重複を、`audit_personal_recommendations.py` は
 露出の集中と明示評価を確認する。Off VocalとInstrumentalを同じ版として扱わない。
 [個人評価の保存・再開と調整の検証](docs/research/2026-10-07-personal-tuning.md)。
+
+曲ごとの作品名・役割・別バージョンと出典も保存できる。
+Webビューの `--track-context` で曲の詳細と作品名検索に使える。
+[作品コンテキストの保存・調査方針](docs/research/2026-10-07-track-context.md)。
