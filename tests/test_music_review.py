@@ -28,6 +28,49 @@ class ReviewTests(unittest.TestCase):
         self.original_bytes = self.snapshot.read_bytes()
         self.session = ReviewSession(self.snapshot, output_directory=self.directory / 'output')
 
+    def feedback_report(self):
+        self.session.latest = {'library_sha256': self.session.library_hash,
+            'profile': 'artist-album-minimum-one', 'artist_preference': 'moderate',
+            'root_results': [{'root_pid': self.tracks[0]['persistent_id'],
+                'playlist_pids': [self.tracks[0]['persistent_id'], self.tracks[1]['persistent_id']],
+                'playlist': [{'persistent_id': t['persistent_id']} for t in self.tracks[:2]]}]}
+        return dict(root_pid=self.tracks[0]['persistent_id'], target_pid=self.tracks[1]['persistent_id'],
+                    verdict='avoid', reason='wrong_version',
+                    context_sha256=self.session.state()['feedback_context_sha256'])
+
+    def test_feedback_is_pair_specific_durably_saved_and_resumable_without_changing_classification(self):
+        payload = self.feedback_report()
+        config = copy.deepcopy(self.session.config)
+        result = self.session.review_feedback(payload)
+        original = Path(result['feedback_path']).read_bytes()
+        self.assertEqual(self.session.config, config)
+        self.assertFalse(self.session.state()['has_unsaved_changes'])
+        resumed = ReviewSession(self.snapshot, feedback=Path(result['feedback_path']))
+        self.assertEqual(resumed.taste_feedback, result['taste_feedback'])
+        self.assertEqual(resumed.taste_feedback['judgments'][0]['reason'], 'wrong_version')
+        clear = {key: payload[key] for key in ('root_pid', 'target_pid', 'context_sha256')}
+        clear['verdict'] = None
+        second = self.session.review_feedback(clear)
+        self.assertEqual(second['taste_feedback']['judgments'], [])
+        self.assertEqual(Path(result['feedback_path']).read_bytes(), original)
+        self.assertNotEqual(result['feedback_path'], second['feedback_path'])
+        self.assertEqual(self.snapshot.read_bytes(), self.original_bytes)
+
+    def test_feedback_rejects_stale_or_undisplayed_pair_and_save_failure_is_atomic(self):
+        payload = self.feedback_report()
+        original = copy.deepcopy(self.session.taste_feedback)
+        for changes in (dict(target_pid=self.tracks[2]['persistent_id']),
+                        dict(target_pid=self.tracks[0]['persistent_id']), dict(context_sha256='f'*64),
+                        dict(reason='invalid')):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.session.review_feedback({**payload, **changes})
+        with patch.object(self.session, '_save', side_effect=OSError('fixture failure')):
+            with self.assertRaises(OSError):
+                self.session.review_feedback(payload)
+        self.assertEqual(self.session.taste_feedback, original)
+        self.assertIsNone(self.session.feedback_path)
+        self.assertFalse(self.session.output_directory.exists())
+
     def test_album_batch_keeps_tags_and_off_vocal_until_explicit_kind_override(self):
         pids = [t['persistent_id'] for t in self.tracks]
         self.session.edit({'persistent_ids': pids, 'tags': ['Game'], 'tag_mode': 'add'})

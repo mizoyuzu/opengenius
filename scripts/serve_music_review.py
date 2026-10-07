@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from music_clusters import _unique_keys, classify_tracks, scope_graphs
 from music_identity_map import IdentityMap, load_library
 from probe_ytmusic import normalize
+from taste_feedback import empty_feedback, feedback_context, record_feedback, validate_feedback
 
 PROFILES = ('without-compatible-genre', 'artist-album-minimum-one', 'relations-only')
 WEB = Path(__file__).resolve().parents[1] / 'web' / 'music-review.html'
@@ -35,7 +36,7 @@ def _source_signature(provenance):
 
 
 class ReviewSession:
-    def __init__(self, snapshot, config=None, output_directory=None, evaluation=None, engine=None):
+    def __init__(self, snapshot, config=None, output_directory=None, evaluation=None, engine=None, feedback=None):
         self.tracks, self.library_hash, self.provenance = load_library(track_snapshot=snapshot)
         config_bytes = config.read_bytes() if config else None
         self.config = (json.loads(config_bytes, object_pairs_hook=_unique_keys) if config else
@@ -45,6 +46,9 @@ class ReviewSession:
         self.engine = engine
         self.lock = threading.Lock()
         self.latest = None
+        self.taste_feedback = validate_feedback(json.loads(feedback.read_bytes(), object_pairs_hook=_unique_keys),
+                                               self.tracks, self.library_hash) if feedback else empty_feedback(self.library_hash)
+        self.feedback_path = str(feedback.resolve()) if feedback else None
         self.saved_config_sha256 = self.config_hash()
         if evaluation:
             self.latest = json.loads(evaluation.read_bytes())
@@ -60,6 +64,8 @@ class ReviewSession:
         return {'tracks': self.tracks, 'config': self.config,
                 'classifications': classify_tracks(self.config, self.tracks, self.library_hash),
                 'library_sha256': self.library_hash, 'evaluation': self.latest,
+                'taste_feedback': self.taste_feedback, 'feedback_path': self.feedback_path,
+                'feedback_context_sha256': feedback_context(self.latest) if self.latest else None,
                 'evaluation_source_status': self.evaluation_source_status(),
                 'evaluation_available': self.engine is not None,
                 'available_root_pids': sorted({g['root_pid'] for g in self.engine[0]}) if self.engine else [],
@@ -147,6 +153,25 @@ class ReviewSession:
         self.saved_config_sha256 = self.config_hash()
         return {'path': path, 'config_sha256': self.saved_config_sha256}
 
+    def review_feedback(self, payload):
+        if not isinstance(payload, dict) or self.latest is None:
+            raise ValueError('A displayed recommendation is required')
+        root, target = payload.get('root_pid'), payload.get('target_pid')
+        rows = [row for row in self.latest.get('root_results', []) if row.get('root_pid') == root]
+        if (len(rows) != 1 or root == target or target not in rows[0].get('playlist_pids',
+                [item.get('persistent_id') for item in rows[0].get('playlist', [])])):
+            raise ValueError('Feedback target is not in the displayed recommendation')
+        if payload.get('context_sha256') != feedback_context(self.latest):
+            raise ValueError('Recommendation changed; refresh before rating')
+        fields = dict(payload)
+        if fields.get('verdict') is None:
+            fields.pop('context_sha256', None)
+        proposed = record_feedback(self.taste_feedback, fields, self.tracks, self.library_hash)
+        path = self._save('taste', proposed)
+        # Update only after durable save; classification and identity remain separate.
+        self.taste_feedback, self.feedback_path = proposed, path
+        return {'taste_feedback': proposed, 'feedback_path': path}
+
     def evaluate(self, payload):
         if self.engine is None:
             raise ValueError('Offline evaluation inputs were not configured')
@@ -186,6 +211,7 @@ class ReviewSession:
         path = self._save('evaluation', report)
         self.latest = report
         return {'path': path, 'evaluation': report,
+                'feedback_context_sha256': feedback_context(report),
                 'evaluation_source_status': self.evaluation_source_status()}
 
 
@@ -241,6 +267,8 @@ def make_handler(session, token):
                         result = session.save()
                     elif self.path == '/api/evaluate':
                         result = session.evaluate(payload)
+                    elif self.path == '/api/feedback':
+                        result = session.review_feedback(payload)
                     else:
                         self.send(404, {'error': 'Not found'})
                         return
@@ -253,6 +281,7 @@ def make_handler(session, token):
                     'Duplicate tags': '同じタグが重複しています。',
                     'Tags must be nonempty strings': 'タグ名を確認してください。',
                     'Requested kind is also excluded': '対象の種類と除外の種類が同じです。',
+                    'Recommendation changed; refresh before rating': '推薦が更新されています。画面を更新してください。',
                 }
                 self.send(400, {'error': messages.get(str(error), str(error))})
             except Exception:
@@ -266,6 +295,7 @@ def main():
     parser.add_argument('--track-snapshot', type=Path, required=True)
     parser.add_argument('--config', type=Path)
     parser.add_argument('--evaluation', type=Path)
+    parser.add_argument('--feedback', type=Path, help='Resume a Library-bound personal feedback snapshot')
     parser.add_argument('--output-directory', type=Path, default=Path('data/music-review'))
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--host', default='127.0.0.1')
@@ -279,7 +309,7 @@ def main():
         parser.error('Offline generation needs all four evaluation inputs')
     if args.extra_observation and not all(evaluation_args):
         parser.error('Extra observations require offline generation inputs')
-    session = ReviewSession(args.track_snapshot, args.config, args.output_directory, args.evaluation)
+    session = ReviewSession(args.track_snapshot, args.config, args.output_directory, args.evaluation, feedback=args.feedback)
     if all(evaluation_args):
         from emulate_genius import database_rows
         from evaluate_ytmusic_batch import collect_graphs, observation_paths

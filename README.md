@@ -535,3 +535,9 @@ Webの優先補充は符号化しておらず、このフィルター付きコ�
 重複所属する起点はすべての範囲を保持し、未分類の起点は除外種類以外の通常関係を使う。
 `verify_native_cluster_filter.py` で条件からSQLを再生成して照合し、元DBとの実コア選曲比較を保存する。
 [複数クラスタの53起点比較と更新・再検証手順](docs/research/2026-10-07-multiple-native-clusters.md)。
+
+個人の好みに合わせるため、推薦行から起点ごとの「合う／違う」と理由を保存できる。
+曲・版の取り違えは好みと分け、未評価は肯定にも否定にも数えない。
+`audit_library_identity.py` は表記・版・重複を、`audit_personal_recommendations.py` は
+露出の集中と明示評価を確認する。Off VocalとInstrumentalを同じ版として扱わない。
+[個人評価の保存・再開と調整の検証](docs/research/2026-10-07-personal-tuning.md)。
