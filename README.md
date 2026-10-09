@@ -549,3 +549,35 @@ Webビューの `--track-context` で曲の詳細と作品名検索に使える�
 Geniusの登録曲・出方向の関連性を増やす際は、次の起点計画と保存後のDB監査を使える。
 [継続バッチとindex拡張の検証](docs/research/2026-10-09-index-expansion.md)。
 大量取得には[予算付き連続バッチと保存済み動画IDの利用](docs/research/2026-10-09-large-index-expansion.md)を使える。
+参加状態1の2曲再試験では曲を読み込めたが、終了後Genius IDと関係DBが消え、
+状態は0へ戻った。前回のCOUNT0は再現せず、曲消失とGeniusデータ消去を区別する。
+統合ログは既知メッセージ件数だけを返し、生ログや値は保存しない。
+
+## iPod Genius同期用のLibrary出力
+
+実機同期では、`Library.musicdb`のGenius IDだけではGenius.itdbの行が端末へ
+転送されなかった。Music 1.5.6 / iPod classic FW 2.0.4では、曲ごとの
+`itma+0x68`の更新値が変わった曲だけが同期対象になり、端末では対応する値が
+`mhit+0x1f0`へ保存されることを確認した。
+
+[`scripts/genius_sync_revision.py`](scripts/genius_sync_revision.py)は、Genius IDを
+持つ全曲へ、metadata/similaritiesの内容から安定した非ゼロのOpenGenius revisionを
+生成し、`itma+0x68`へ書き込む。Apple独自のchecksum算法は未確定なので、これは
+OpenGeniusの変更検出用tokenとして明示する。関係データが変わればtokenも変わる。
+
+既存のassignment JSON（`persistent_id`と`genius_id`の配列）からLibrary DBを作る場合:
+
+```sh
+python3 scripts/genius_sync_revision.py \
+  --input /path/to/source/Library.musicdb \
+  --assignments /path/to/assignments.json \
+  --output /path/to/output/Library.musicdb
+```
+
+既存の生成処理がmetadata/similaritiesをメモリ上に持っている場合は、
+`assignments_with_revisions()`でassignmentへ`sync_revision`を追加してから
+`patch_expanded_library()`を呼ぶ。対象はGenius IDと対応するDB行を持つ曲だけで、
+Genius関係のない曲へ値を捏造しない。
+
+これはMusic/iPodの受理を自動で保証する処理ではない。出力後は通常のMusic終了・
+再起動とiPod同期を行い、`audit_ipod_genius_sync.py`でIDとrevisionの対応を確認する。
