@@ -179,6 +179,70 @@ def apply_title_review(document, decisions, tracks, library_hash):
     return result
 
 
+def apply_artist_credit_alias_review(document, decisions, proposals, tracks, library_hash,
+                                    identity_map_sha256, proposal_sha256):
+    """Apply reviewed remote whole-credit labels without changing local credits."""
+    IdentityMap(document, tracks, library_hash)
+    if decisions.get('schema_version') != 1:
+        raise ValueError('Unsupported artist credit review schema')
+    if decisions.get('library_sha256') != library_hash:
+        raise ValueError('Review decisions do not match this Library')
+    if decisions.get('identity_map_sha256') != identity_map_sha256:
+        raise ValueError('Review decisions target a different map revision')
+    if decisions.get('proposal_sha256') != proposal_sha256:
+        raise ValueError('Review decisions target a different proposal document')
+    source_report = proposals.get('source_report') or {}
+    if decisions.get('source_report_sha256') != source_report.get('sha256'):
+        raise ValueError('Review decisions target a different source report')
+    proposal_rows = {}
+    for row in proposals.get('proposals', []):
+        key = (normalize(row.get('remote_credit') or ''), normalize(row.get('local_credit') or ''),
+               row.get('persistent_id'))
+        if row.get('status') == 'verified' and row.get('activation_recommendation') == 'root_review_only':
+            proposal_rows[key] = row
+    by_pid = {track['persistent_id']: track for track in tracks}
+    result = copy.deepcopy(document)
+    aliases = result.setdefault('artist_credit_aliases', [])
+    seen_sources = {normalize(row['remote_credit']) for row in aliases if row.get('enabled')}
+    for decision in decisions.get('decisions', []):
+        remote = decision.get('remote_credit')
+        local = decision.get('local_credit')
+        pid = decision.get('target_persistent_id')
+        reason = decision.get('reason')
+        sources = decision.get('evidence_sources')
+        if not all(isinstance(value, str) and normalize(value) for value in (remote, local)):
+            raise ValueError('Credit review needs complete remote and local credit strings')
+        if not isinstance(pid, str) or pid not in by_pid or by_pid[pid].get('artist') != local:
+            raise ValueError('Credit review target must be an exact existing local artist credit')
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError('Credit review needs a reason')
+        if not isinstance(sources, list) or not sources or any(
+                not isinstance(url, str) or not url.startswith('https://') for url in sources):
+            raise ValueError('Credit review needs HTTPS evidence sources')
+        key = (normalize(remote), normalize(local), pid)
+        proposal = proposal_rows.get(key)
+        if proposal is None:
+            raise ValueError('Credit review does not match a verified proposal')
+        if normalize(remote) == normalize(local):
+            raise ValueError('Credit alias source and target are already equivalent')
+        if normalize(remote) in {normalize(track.get('artist') or '') for track in tracks}:
+            raise ValueError('Credit alias source is already a local artist credit')
+        if normalize(remote) in seen_sources:
+            raise ValueError('Duplicate or overlapping remote credit alias')
+        proposal_urls = {source.get('url') for source in proposal.get('sources', [])}
+        if not set(sources).issubset(proposal_urls):
+            raise ValueError('Review evidence sources are not bound to the proposal')
+        seen_sources.add(normalize(remote))
+        aliases.append({'remote_credit': remote, 'local_credit': local, 'enabled': True,
+                        'status': 'reviewed_whole_credit_alias',
+                        'evidence': {'reason': reason.strip(), 'sources': sources,
+                                     'proposal_sha256': proposal_sha256,
+                                     'source_report_sha256': source_report['sha256']}})
+    result['identity_status'] = 'unverified'
+    IdentityMap(result, tracks, library_hash)
+    return result
+
+
 class IdentityMap:
     def __init__(self, document, tracks, library_hash):
         if document.get('schema_version') != 1 or document.get('library_sha256') != library_hash:
@@ -217,6 +281,24 @@ class IdentityMap:
                 self.credit_sets[key] = credits
         if any(component in self.credit_sets for credits in self.credit_sets.values() for component in credits):
             raise ValueError('Nested or cyclic artist credit declarations are unsupported')
+        self.artist_credit_aliases = {}
+        local_artist_keys = {self.artist_key(track.get('artist') or '') for track in tracks}
+        for declaration in document.get('artist_credit_aliases', []):
+            if not declaration.get('enabled'):
+                continue
+            remote, local = declaration.get('remote_credit'), declaration.get('local_credit')
+            if not isinstance(remote, str) or not normalize(remote) or not isinstance(local, str) or not normalize(local):
+                raise ValueError('Invalid whole artist credit alias')
+            remote_key, local_key = self.artist_key(remote), self.artist_key(local)
+            if remote_key == local_key:
+                raise ValueError('Whole artist credit alias source and target are equivalent')
+            if remote_key in local_artist_keys and remote_key != local_key:
+                raise ValueError('Whole artist credit alias overlaps a local artist credit')
+            if local_key not in local_artist_keys:
+                raise ValueError('Whole artist credit alias target is not a local artist credit')
+            if remote_key in self.artist_credit_aliases:
+                raise ValueError('Duplicate or overlapping whole artist credit aliases')
+            self.artist_credit_aliases[remote_key] = local_key
         self.titles = {}
         self.proposed_titles = {}
         for row in document.get('track_title_aliases', []):
@@ -261,13 +343,18 @@ class IdentityMap:
 
     def artist_credits(self, name):
         key = self.artist_key(name)
+        if key in self.artist_credit_aliases:
+            key = self.artist_credit_aliases[key]
         return self.credit_sets.get(key, frozenset({key}))
 
     def match(self, remote, include_proposed=False):
         title = normalize(remote.get('title') or '')
         artists = {credit for artist in (remote.get('artists') or []) if artist.get('name')
                    for credit in self.artist_credits(artist['name'])}
-        remote_declared_credits = any(self.artist_key(artist['name']) in self.credit_sets
+        remote_declared_credits = any(self.artist_key(artist['name']) in self.credit_sets or
+                                      self.artist_key(artist['name']) in self.artist_credit_aliases
+                                      for artist in (remote.get('artists') or []) if artist.get('name'))
+        remote_has_credit_alias = any(self.artist_key(artist['name']) in self.artist_credit_aliases
                                       for artist in (remote.get('artists') or []) if artist.get('name'))
         duration = remote.get('duration_seconds')
         if duration is None and isinstance(remote.get('length'), str):
@@ -321,7 +408,9 @@ class IdentityMap:
                                'local_metadata': {key: local.get(key) for key in ('title', 'artist', 'album', 'duration_ms')},
                                'title_match': 'exact' if exact_title else ('proposed_alias' if pending_title else 'explicit_alias'),
                                'alias_review_status': 'needs_review' if pending_title else 'active_metadata_candidate',
-                               'artist_match': 'explicit_credit_set' if credit_match else ('exact' if exact_artist else 'explicit_alias'),
+                               'artist_match': ('explicit_artist_credit_alias' if remote_has_credit_alias else
+                                                'explicit_credit_set' if credit_match else
+                                                'exact' if exact_artist else 'explicit_alias'),
                                # A literal singer match may omit an additional remote
                                # credit. Report that evidence without assuming its role.
                                'artist_credit_match': 'complete' if self.artist_credits(local_artist) == artists else 'partial',

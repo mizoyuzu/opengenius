@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import io
 import json
 import tempfile
@@ -7,7 +8,10 @@ from pathlib import Path
 import sys
 import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from music_identity_map import IdentityMap, apply_title_review, build_map, load_library, main, version_signature, version_facets, group_candidate_observations
+from apply_artist_credit_aliases import main as apply_credit_aliases_main
+from music_identity_map import (IdentityMap, apply_artist_credit_alias_review, apply_title_review,
+                                build_map, load_library, main, version_signature, version_facets,
+                                group_candidate_observations)
 
 
 class IdentityMapTests(unittest.TestCase):
@@ -285,6 +289,115 @@ class IdentityMapTests(unittest.TestCase):
         matcher = IdentityMap(document, tracks, 'hash')
         remote = {'title': 'Song', 'artists': [{'name': 'A、B'}], 'duration_seconds': 100}
         self.assertEqual([row['persistent_id'] for row in matcher.match(remote)], ['J'])
+
+    def test_whole_credit_alias_resolves_remote_to_local_without_rewriting_local_credit(self):
+        tracks = [{'persistent_id': 'C', 'title': 'Song', 'artist': '櫻木真乃 (CV.関根 瞳)',
+                   'album': 'Album', 'duration_ms': 100000}]
+        document = build_map(tracks, 'hash')
+        document['artist_credit_aliases'] = [{
+            'remote_credit': 'MANO SAKURAGI (CV: Hitomi Sekine)',
+            'local_credit': '櫻木真乃 (CV.関根 瞳)', 'enabled': True,
+            'status': 'reviewed_whole_credit_alias'}]
+        matcher = IdentityMap(document, tracks, 'hash')
+        remote = {'title': 'Song', 'artists': [{'name': 'MANO SAKURAGI (CV: Hitomi Sekine)'}],
+                  'duration_seconds': 100}
+        match, = matcher.match(remote)
+        self.assertEqual(match['persistent_id'], 'C')
+        self.assertEqual(match['artist_match'], 'explicit_artist_credit_alias')
+        self.assertEqual(match['identity_status'], 'unverified')
+        self.assertEqual(tracks[0]['artist'], '櫻木真乃 (CV.関根 瞳)')
+        self.assertEqual(matcher.artist_key('櫻木真乃 (CV.関根 瞳)'),
+                         ('literal', '櫻木真乃 (cv.関根 瞳)'))
+
+    def test_whole_credit_aliases_reject_local_overlap_duplicates_and_missing_targets(self):
+        tracks = [{'persistent_id': 'C', 'title': 'Song', 'artist': 'Local Credit', 'duration_ms': 100000}]
+        document = build_map(tracks, 'hash')
+        base = {'local_credit': 'Local Credit', 'enabled': True}
+        for aliases in (
+                [{**base, 'remote_credit': 'Other', 'local_credit': 'Missing'}],
+                [{**base, 'remote_credit': 'Other'}, {**base, 'remote_credit': 'Other'}],
+                [{**base, 'remote_credit': 'Local Credit'}],
+                [{**base, 'remote_credit': 'Other'}, {**base, 'remote_credit': 'Third',
+                                                       'local_credit': 'Other'}]):
+            with self.subTest(aliases=aliases):
+                candidate = copy.deepcopy(document)
+                candidate['artist_credit_aliases'] = aliases
+                with self.assertRaises(ValueError):
+                    IdentityMap(candidate, tracks, 'hash')
+
+    def test_credit_review_is_bound_to_proposal_map_target_and_evidence(self):
+        tracks = [{'persistent_id': 'C', 'title': 'Song', 'artist': 'Local Credit', 'duration_ms': 100000}]
+        document = build_map(tracks, 'hash')
+        proposal = {'remote_credit': 'REMOTE CREDIT', 'local_credit': 'Local Credit',
+                    'persistent_id': 'C', 'status': 'verified', 'activation_recommendation': 'root_review_only',
+                    'sources': [{'url': 'https://example.test/official'}]}
+        proposals = {'source_report': {'sha256': 'report-hash'}, 'proposals': [proposal]}
+        decisions = {'schema_version': 1, 'library_sha256': 'hash',
+                     'identity_map_sha256': 'map-hash', 'proposal_sha256': 'proposal-hash',
+                     'source_report_sha256': 'report-hash', 'decisions': [{
+                         'remote_credit': 'REMOTE CREDIT', 'local_credit': 'Local Credit',
+                         'target_persistent_id': 'C', 'reason': 'Official names preserve the full CV credit.',
+                         'evidence_sources': ['https://example.test/official']} ]}
+        result = apply_artist_credit_alias_review(document, decisions, proposals, tracks, 'hash',
+                                                   'map-hash', 'proposal-hash')
+        self.assertEqual(result['artist_credit_aliases'][0]['remote_credit'], 'REMOTE CREDIT')
+        self.assertNotIn('artist_credit_aliases', document)
+        self.assertEqual(result['identity_status'], 'unverified')
+        for changed in (
+                {**decisions, 'identity_map_sha256': 'stale-map'},
+                {**decisions, 'proposal_sha256': 'stale-proposals'},
+                {**decisions, 'source_report_sha256': 'stale-report'},
+                {**decisions, 'decisions': [{**decisions['decisions'][0],
+                                             'target_persistent_id': 'missing'}]},
+                {**decisions, 'decisions': [{**decisions['decisions'][0],
+                                             'evidence_sources': ['https://example.test/other']}]}):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                apply_artist_credit_alias_review(document, changed, proposals, tracks, 'hash',
+                                                 'map-hash', 'proposal-hash')
+
+    def test_credit_alias_cli_writes_revision_receipt_and_new_map(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            track = {'persistent_id': '0000000000000001', 'title': 'Song',
+                     'artist': 'Local Credit', 'duration_ms': 100000}
+            snapshot = root / 'tracks.json'
+            snapshot.write_text(json.dumps({'source_sha256': 'a' * 64, 'tracks': [track]}))
+            identity_map = root / 'identity-map.json'
+            identity_map.write_text(json.dumps(build_map([track], 'a' * 64)))
+            source_report = root / 'source-report.json'
+            source_report.write_text('{"provenance":"saved"}')
+            source_report_hash = hashlib.sha256(source_report.read_bytes()).hexdigest()
+            proposals = root / 'proposals.json'
+            proposals.write_text(json.dumps({'source_report': {'path': str(source_report),
+                                                                'sha256': source_report_hash}, 'proposals': [{
+                'remote_credit': 'Remote Credit', 'local_credit': 'Local Credit',
+                'persistent_id': track['persistent_id'], 'status': 'verified',
+                'activation_recommendation': 'root_review_only',
+                'sources': [{'url': 'https://example.test/official'}]}]}))
+            decisions = root / 'review.json'
+            decisions.write_text(json.dumps({
+                'schema_version': 1, 'library_sha256': 'a' * 64,
+                'identity_map_sha256': hashlib.sha256(identity_map.read_bytes()).hexdigest(),
+                'proposal_sha256': hashlib.sha256(proposals.read_bytes()).hexdigest(),
+                'source_report_sha256': source_report_hash,
+                'decisions': [{'remote_credit': 'Remote Credit', 'local_credit': 'Local Credit',
+                               'target_persistent_id': track['persistent_id'], 'reason': 'Reviewed',
+                               'evidence_sources': ['https://example.test/official']}]}))
+            output, receipt = root / 'next-map.json', root / 'receipt.json'
+            argv = ['apply_artist_credit_aliases.py', '--track-snapshot', str(snapshot),
+                    '--identity-map', str(identity_map), '--proposals', str(proposals),
+                    '--review-decisions', str(decisions), '--output', str(output),
+                    '--receipt', str(receipt)]
+            with patch.object(sys, 'argv', argv), patch('sys.stdout', new=io.StringIO()):
+                apply_credit_aliases_main()
+            applied = json.loads(output.read_text())
+            provenance = json.loads(receipt.read_text())
+            self.assertEqual(applied['artist_credit_aliases'][0]['local_credit'], 'Local Credit')
+            self.assertEqual(provenance['input_identity_map_sha256'],
+                             hashlib.sha256(identity_map.read_bytes()).hexdigest())
+            self.assertEqual(provenance['output_identity_map_sha256'],
+                             hashlib.sha256(output.read_bytes()).hexdigest())
+            self.assertFalse(provenance['recording_identity_verified'])
 
     def test_additional_remote_credit_is_reported_without_changing_candidates(self):
         tracks = [{'persistent_id': 'S', 'title': 'Song', 'artist': 'Singer', 'duration_ms': 100000},

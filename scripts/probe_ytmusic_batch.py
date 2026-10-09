@@ -496,6 +496,11 @@ def main():
     except Exception as error:
         report['status'] = 'stopped'
         report['error_type'] = type(error).__name__  # Never store exception text/headers.
+        if (active_seed_pid is not None and session is not None
+                and session.count > active_seed_request_start
+                and not any(row.get('persistent_id') == active_seed_pid
+                            for row in report['results'])):
+            report['partial_seed_persistent_id'] = active_seed_pid
         if isinstance(error, CollectionDeadlineReached):
             report['deadline_stop_at'] = datetime.now(timezone.utc).isoformat()
             if (active_seed_pid is not None and session is not None
