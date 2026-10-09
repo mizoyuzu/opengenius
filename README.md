@@ -2,8 +2,10 @@
 
 YouTube Musicの関係性データを使い、純正iPodのGenius機能で利用できる
 互換データの生成を目指す個人用研究プロジェクト。
-最終検証対象はFW 2.0.4。実機は未到着で、現在はMusic.appのライブラリを解析中。
-Apple Music／iTunes側への読み込みも検証対象。
+最終検証対象はiPod classic FW 2.0.4。実機の1曲同期では、Libraryの`itma+0x68`が
+変わるとExtras.itdbのGenius行が転送され、端末`mhit+0x1f0`に値が保存されることを確認した。
+Music.app／iPodでの動作確認済みという利用者報告もあるが、今回作成する出力コピーの
+受け入れ確認とは区別する。
 
 現時点でLibrary.musicdbの読み取りと、提供されたMusic.appの特定ビルドを
 使ったGenius.itdbのオフライン復号に成功している。
@@ -13,7 +15,9 @@ Apple Music／iTunes側への読み込みも検証対象。
 実MacのMusic 1.5.6で、注入した関係から純正Geniusプレイリストを生成できた。
 両DBの有効状態を揃えた後は終了・再起動・約162秒の待機後も状態を保持し、
 再起動後のSwedenの新規Geniusプレイリストは18曲で、以前の曲順と一致した。
-純正iPodでの動作、Genius Mix、Apple形式のrank生成は未検証。
+利用者から別PCでMusic.appとiPodの動作を確認済みとの報告がある。独立した実機記録では、
+同期トリガーと1曲のExtras.itdb転送を確認した。端末自身のGenius生成についての独立した
+実機記録はこの環境に取り込まれていない。Genius MixとApple形式のrank生成は未検証。
 [実Musicでの検証](docs/research/2026-10-05-real-mac-music.md)と
 [有効状態の保持](docs/research/2026-10-05-native-genius-state-persistence.md)を参照。
 
@@ -56,7 +60,7 @@ bundle生成時に `--artist-preference moderate` を指定する。
 [経由曲の集中監査](docs/research/2026-10-05-recommendation-path-audit.md)を使い、
 長さ・集中・ユーザー指定範囲を分けて確認する。
 
-iPod到着後は、Musicが実際に同期したファイルの前後差分と、
+iPodの同期では、Musicが実際に転送したファイルの前後差分と、
 端末自身によるGenius生成を別々に確認する。
 [iPod検証の手順](docs/research/2026-10-05-ipod-paired-snapshot-workflow.md)を参照。
 
@@ -581,3 +585,8 @@ Genius関係のない曲へ値を捏造しない。
 
 これはMusic/iPodの受理を自動で保証する処理ではない。出力後は通常のMusic終了・
 再起動とiPod同期を行い、`audit_ipod_genius_sync.py`でIDとrevisionの対応を確認する。
+増分更新器`update_genius_bundle.py`も、既存IDを保ったまま関係行の変更に合わせて
+全対象曲のrevisionを更新する。内容が同じ再実行ではLibraryとrevisionを変えない。
+2026-10-09に作成した2,377曲のコピーは、既存SQLをbyte-for-byte保持し、独立監査で全revisionが
+SQL BLOB由来の値と一致した。コピー自体のMusic.app／iPod受け入れはまだ未確認。
+[同期revisionの増分更新と監査](docs/research/2026-10-09-ipod-sync-revision-integration.md)を参照。
