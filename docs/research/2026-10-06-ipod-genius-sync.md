@@ -68,16 +68,25 @@ OpenGenius由来の純正Genius生成と再起動後の有効状態保持が成�
 従って、曲間データの同期はIDだけで決まるものではない。
 ただし内部オブジェクトの+0x198をディスク上のmhit/itmaの同じoffsetへ移植しない。
 
-## Library内の候補欄と検証コピー
+## Library内の候補欄と実機検証
 
 376-byte itmaの+0x68は、別の既存Mac LibraryのGenius ID付き479曲で
 全て非ゼロ、IDなし4,568曲で全て0だった。+0xccのGenius ID以外で、
 この強い対応を示すheader内の32-bit欄は+0x68のみだった。
 一方、OpenGeniusの286曲では+0x68が全て0。
 
-これはchecksum欠落仮説を支持するが、+0x68を内部genius_checksumと対応付けた
-ネイティブ試験はまだない。IDの直後の+0xd0/+0xd4は既存479曲でも0だったため、
-隣接しているという理由でこれらをchecksumと呼ばない。
+この欄の意味を、接続中の同じiPodで1曲だけ検証した。
+Music終了後の完全バックアップを取り、Swedenの+0x68だけを0から1へ変更した。
+音楽同期が有効で全曲ライブラリを対象にしていることを画面で確認して同期したところ、
+AMPDevicesAgentのログは`1 tracks`、続いて`copy m 32 s 116`になった。
+端末Extras.itdbはgenius_metadata=0/similarities=0から各1へ増え、
+両行のIDはSwedenのGenius IDと一致した。PIDそのものではない。
+端末mhitでは+0x1f0が0から1へ変わった。
+このため、観測したMusic 1.5.6.11 / iTunesDB 117では、
+`itma+0x68 -> mhit+0x1f0`の更新値対応と、値の変更が同期トリガーになることを確認した。
+
+Appleの元checksum算法そのものは未確定である。IDの直後の+0xd0/+0xd4は既存479曲でも0だったため、
+隣接しているという理由でこれらをchecksumとは呼ばない。
 別の提供済み復号DBとの共通IDは1件だけで、CRC32の単純な候補式は一致しなかった。
 そのDBと現在のLibraryの関係が確立していないため、Appleのchecksum算法の検証とは扱わない。
 
@@ -85,10 +94,11 @@ Musicを通常終了後、完全なbundleコピーを作成した。
 Swedenの1曲のitma+0x68だけを0から1へ変え、再圧縮・暗号化した。
 展開後の変更は1 byte。許可した4-byte欄を元へ戻すと全展開データが一致する。
 全曲の解析済みメタデータとGenius ID、Genius.itdb、両有効化状態を保持している。
-0→1は候補欄の意味を特定する診断用の値であり、Apple互換checksumを生成したとは主張しない。
-元Libraryと端末DBは書き換えていない。
+0→1は診断用の値だったが、同期対象化と端末保存値の対応は確認できた。
+試験後、元Libraryは展開後の曲情報・Genius ID・Genius.itdbと一致する状態へ戻し、
+端末Extras.itdbも試験前の空テーブルへbyte-for-byteで復元した。
 
-## 次のネイティブ検証
+## OpenGenius出力への反映
 
 検証前の通信確認ではLuLuのextensionは稼働していたが、MusicとAMPDevicesAgentの
 ルールはALLOW、AMPLibraryAgentはBLOCKだった。
@@ -97,15 +107,14 @@ Appleへ送信しないという条件のため、前2つを一時BLOCKにして
 LuLuのaction 0=BLOCK、1=ALLOWは公式ソース
 [consts.h](https://github.com/objective-see/LuLu/blob/master/LuLu/Shared/consts.h)で照合した。
 
-確認後は以下を分けて検証する。
+OpenGeniusの出力側には`scripts/genius_sync_revision.py`を追加した。
+metadata/similaritiesの行BLOBから安定した非ゼロCRC32 tokenを作り、
+Genius IDとともにLibraryの+0x68へ保存する。Appleの元checksumを再現したとは扱わず、
+関係行の内容が変わればtokenも変わるOpenGenius用変更検出値とする。
+実Libraryの286曲へ適用した一時出力では、286曲すべてが非ゼロかつ重複なしになり、
+曲情報とGenius IDは入力と一致した。
 
-1. コピーを開き、候補欄の非ゼロ値が正常終了後も保持されるか確認。
-2. 同期で1曲がqueueへ入り、Extrasのmetadata/similaritiesが0→1になるか確認。
-   端末mhitに新しく保存された値とMac候補欄を照合し、欄の対応を確定する。
-3. 成功した場合だけ全286曲の更新値生成と同期を設計する。
-   診断用の一定値を本番のchecksum算法として採用しない。
-4. 全参照と候補metadataを揃えた後、端末上のGenius生成を別途確認。
-   1曲だけの転送試験では純正端末の類似曲10曲条件を満たしたと扱わない。
+端末上のGenius生成そのものは別検証であり、1曲転送の成功だけで類似曲10曲条件を満たすとは扱わない。
 
 scripts/audit_ipod_genius_sync.pyはこの観測プロファイルの読み取り専用監査器。
 PID/GIDの対応と候補欄の0/nonzero件数、端末Extrasのテーブル件数だけを表示する。
@@ -117,6 +126,6 @@ python3 scripts/audit_ipod_genius_sync.py /path/to/Music.musiclibrary /path/to/d
 python3 -m unittest discover -s tests -p test_ipod_genius_sync_audit.py
 ```
 
-4テストが成功。元Library・検証コピー・端末スナップショットの実データ監査も成功。
-現在の結論は「ID対応は正常、設定は転送済み、関係行は未転送、checksum/update条件が
-有力な原因候補」。欄の修正による同期成功と端末Genius生成はまだ確認していない。
+5テストが成功。元Library・検証コピー・端末スナップショットの実データ監査も成功。
+現在の結論は「ID対応は正常。Genius行の同期には曲ごとの更新値が必要で、
+OpenGeniusは全Genius対象曲へ安定した非ゼロrevisionを出力する」。
