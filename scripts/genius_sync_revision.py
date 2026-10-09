@@ -122,7 +122,7 @@ def patch_expanded_library(expanded, assignments, revisions):
         if cursor + 24 > len(expanded) or expanded[cursor:cursor + 4] != b"itma":
             raise ValueError("invalid itma record")
         header, total = struct.unpack_from("<II", expanded, cursor + 4)
-        if header < 376 or total < header or cursor + total > len(expanded):
+        if header != 376 or total < header or cursor + total > len(expanded):
             raise ValueError("unsupported itma profile")
         pid = struct.unpack_from("<Q", expanded, cursor + 16)[0]
         if pid in seen:
@@ -147,11 +147,13 @@ def patch_expanded_library(expanded, assignments, revisions):
         cursor += total
     if not set(requested).issubset(seen):
         raise ValueError("assignment PID is missing from Library")
-    for pos in range(start + list_header, cursor):
-        if result[pos] != expanded[pos] and pos not in {x["expanded_revision_offset"] + i for x in changed for i in range(4)}:
-            # The only other permitted change is a Genius ID slot.
-            if pos not in {x["expanded_revision_offset"] - 0x68 + 0xCC + i for x in changed for i in range(4)}:
-                raise ValueError("unexpected Library change")
+    restored = bytearray(result)
+    for change in changed:
+        for pos in (change["expanded_revision_offset"],
+                    change["expanded_revision_offset"] - 0x68 + 0xCC):
+            restored[pos:pos + 4] = expanded[pos:pos + 4]
+    if restored != expanded:
+        raise ValueError("unexpected Library change")
     return bytes(result), changed
 
 
