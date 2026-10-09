@@ -1,8 +1,9 @@
 """Read-only comparison of the observed Music/iPod Genius track profiles.
 
-The host word at itma+0x68 is a checksum candidate, not yet a confirmed field.
-Device Genius IDs at mhit+0x1e4 were matched against all 286 host IDs on the
-connected device. These observations do not establish firmware acceptance.
+On the observed Music 1.5.6.11 / iTunesDB 117 profiles, changing itma+0x68
+from 0 to 1 caused native sync to copy the seed's Genius rows and store 1 at
+mhit+0x1f0. Device Genius IDs at mhit+0x1e4 matched all 286 host IDs.
+These field observations do not establish on-device Genius generation.
 Only aggregate counts are printed; identifiers and database contents stay local.
 """
 import argparse
@@ -103,7 +104,8 @@ def device_tracks(data):
                 pid = struct.unpack_from('<Q', data, pos + 0x70)[0]
                 if not pid or pid in tracks:
                     raise ValueError('invalid device track identity')
-                tracks[pid] = struct.unpack_from('<Q', data, pos + 0x1e4)[0]
+                tracks[pid] = (struct.unpack_from('<Q', data, pos + 0x1e4)[0],
+                               word(data, pos + 0x1f0))
                 pos += rs
             if pos != end:
                 raise ValueError('unparsed device track data')
@@ -113,19 +115,23 @@ def device_tracks(data):
     return tracks
 
 
-def compare(host, device):
+def compare(host, device, *, checksum_mapping_verified=False):
     genius = {pid: row for pid, row in host.items() if row[0]}
     return {
         'host_tracks': len(host), 'device_tracks': len(device),
         'matched_track_pids': len(host.keys() & device.keys()),
         'host_genius_tracks': len(genius),
         'host_genius_tracks_missing_on_device': sum(pid not in device for pid in genius),
-        'matched_nonzero_genius_ids': sum(device.get(pid) == row[0] for pid, row in genius.items()),
-        'mismatched_genius_ids': sum(device[pid] != row[0] for pid, row in host.items() if pid in device),
-        'host_genius_tracks_with_zero_candidate_checksum': sum(row[1] == 0 for row in genius.values()),
-        'host_genius_tracks_with_nonzero_candidate_checksum': sum(row[1] != 0 for row in genius.values()),
-        'checksum_candidate_offset': 'itma+0x68',
-        'checksum_field_native_verified': False,
+        'matched_nonzero_genius_ids': sum(pid in device and device[pid][0] == row[0]
+                                        for pid, row in genius.items()),
+        'mismatched_genius_ids': sum(device[pid][0] != row[0] for pid, row in host.items() if pid in device),
+        'host_genius_tracks_with_zero_checksum': sum(row[1] == 0 for row in genius.values()),
+        'host_genius_tracks_with_nonzero_checksum': sum(row[1] != 0 for row in genius.values()),
+        'mismatched_genius_checksums': sum(device[pid][1] != row[1]
+                                          for pid, row in genius.items() if pid in device),
+        'host_checksum_offset': 'itma+0x68',
+        'device_checksum_offset': 'mhit+0x1f0',
+        'checksum_field_native_verified': checksum_mapping_verified,
         'read_only': True, 'firmware_genius_generation_verified': False,
     }
 
@@ -149,9 +155,13 @@ def main():
     parser.add_argument('device_snapshot', type=Path)
     args = parser.parse_args()
     try:
-        host = host_tracks(decode_host(read_file(args.host_bundle / 'Library.musicdb')))
-        device = device_tracks(read_file(args.device_snapshot / 'iTunesDB'))
-        report = compare(host, device)
+        host_data = read_file(args.host_bundle / 'Library.musicdb')
+        device_data = read_file(args.device_snapshot / 'iTunesDB')
+        host = host_tracks(decode_host(host_data))
+        device = device_tracks(device_data)
+        verified = (host_data[16:48].split(b'\0', 1)[0] == b'1.5.6.11'
+                    and word(device_data, 16) == 117)
+        report = compare(host, device, checksum_mapping_verified=verified)
         report['device_extras_rows'] = extras_counts(read_file(args.device_snapshot / 'Extras.itdb'))
         print(json.dumps(report, indent=2))
     except (ValueError, OSError, sqlite3.Error, struct.error, ImportError):

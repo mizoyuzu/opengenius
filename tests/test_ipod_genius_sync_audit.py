@@ -10,15 +10,17 @@ spec.loader.exec_module(audit)
 
 class SyncAuditTests(unittest.TestCase):
     def test_id_alignment_and_missing_update_candidate_are_separate(self):
-        report = audit.compare({111: (71, 0), 222: (72, 1), 333: (0, 0)}, {111: 71, 222: 72, 333: 0})
+        report = audit.compare({111: (71, 0), 222: (72, 1), 333: (0, 0)},
+                               {111: (71, 0), 222: (72, 1), 333: (0, 0)})
         self.assertEqual(report['matched_nonzero_genius_ids'], 2)
-        self.assertEqual(report['host_genius_tracks_with_zero_candidate_checksum'], 1)
-        self.assertEqual(report['host_genius_tracks_with_nonzero_candidate_checksum'], 1)
+        self.assertEqual(report['host_genius_tracks_with_zero_checksum'], 1)
+        self.assertEqual(report['host_genius_tracks_with_nonzero_checksum'], 1)
+        self.assertEqual(report['mismatched_genius_checksums'], 0)
         self.assertFalse(report['checksum_field_native_verified'])
         self.assertNotIn('111', str(report))
 
     def test_missing_and_mismatched_tracks(self):
-        report = audit.compare({1: (7, 0), 2: (8, 0), 3: (0, 0)}, {1: 9, 3: 10})
+        report = audit.compare({1: (7, 0), 2: (8, 0), 3: (0, 0)}, {1: (9, 0), 3: (10, 0)})
         self.assertEqual(report['host_genius_tracks_missing_on_device'], 1)
         self.assertEqual(report['mismatched_genius_ids'], 2)
 
@@ -47,12 +49,20 @@ class SyncAuditTests(unittest.TestCase):
         struct.pack_into('<II', data, 344, 12, 1)
         struct.pack_into('<Q', data, 352 + 0x70, 123)
         struct.pack_into('<Q', data, 352 + 0x1e4, 456)
-        self.assertEqual(audit.device_tracks(data), {123: 456})
+        struct.pack_into('<I', data, 352 + 0x1f0, 1)
+        self.assertEqual(audit.device_tracks(data), {123: (456, 1)})
         with self.assertRaises(ValueError):
             audit.device_tracks(data[:-1])
         struct.pack_into('<I', data, 352 + 4, 620)
         with self.assertRaises(ValueError):
             audit.device_tracks(data)
+
+    def test_dirty_checksum_detected_with_unchanged_genius_id(self):
+        report = audit.compare({1: (7, 1)}, {1: (7, 0)}, checksum_mapping_verified=True)
+        self.assertEqual(report['matched_nonzero_genius_ids'], 1)
+        self.assertEqual(report['mismatched_genius_ids'], 0)
+        self.assertEqual(report['mismatched_genius_checksums'], 1)
+        self.assertTrue(report['checksum_field_native_verified'])
 
 
 if __name__ == '__main__':
