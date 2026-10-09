@@ -61,6 +61,15 @@ class PlanIndexExpansionTests(unittest.TestCase):
         self.assertEqual(audit['selected_unindexed_track_count'], 1)
         self.assertEqual(audit['selected'][0]['current_incoming_relation_count'], 1)
 
+    def test_excluded_track_without_artist_does_not_break_fairness_counts(self):
+        tracks = copy.deepcopy(self.tracks)
+        tracks[-1].pop('artist')
+        state = self.make_state(self.graph, self.pids[:4], tracks=tracks)
+        relations = self.make_relations(self.graph, state)
+        plan, _ = plan_index_expansion(tracks, self.library_hash, state, relations, 2,
+                                      excluded_pids=[self.pids[-1]])
+        self.assertEqual({row['persistent_id'] for row in plan['seeds']}, set(self.pids[1:3]))
+
     def test_no_observed_roots_uses_unindexed_library_candidates(self):
         graph = {pid: [] for pid in self.pids[:2]}
         state = self.make_state(graph, self.pids[:2])

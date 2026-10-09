@@ -29,6 +29,34 @@ class IdentityMapTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             IdentityMap(stale, self.tracks, 'library-hash')
 
+    def test_title_index_matches_full_scan_with_duplicates_and_preview_aliases(self):
+        tracks = self.tracks + [
+            {'persistent_id': 'C', 'title': '曲 - Song', 'artist': 'アンティーカ',
+             'duration_ms': 102000, 'album': 'Another album'},
+            {'persistent_id': 'D', 'title': '曲 - Song', 'artist': "L'Antica",
+             'duration_ms': 130000, 'album': 'Album'},
+            {'persistent_id': 'E', 'title': '曲 - Song', 'artist': 'Other singer',
+             'duration_ms': 100000, 'album': 'Album'},
+            {'persistent_id': 'F', 'title': 'Unrelated', 'artist': "L'Antica",
+             'duration_ms': 100000, 'album': 'Album'},
+        ]
+        document = build_map(tracks, 'library-hash', [{
+            'from': 'アンティーカ', 'to': "L'Antica", 'matching_title_album_duration_records': 61}])
+        for row in document['track_title_aliases']:
+            if row['persistent_id'] == 'B':
+                row['aliases'][0]['enabled'] = True
+        matcher = IdentityMap(document, tracks, 'library-hash')
+        for title in ('曲', '曲 - Song', '曲 - Translation',
+                      '曲 (Off Vocal)', '曲 (Off Vocal) - Song (Off Vocal)', 'Unrelated'):
+            for preview in (False, True):
+                for seconds in (100, 130, None):
+                    remote = {'title': title, 'artists': [{'name': 'アンティーカ'}],
+                              'duration_seconds': seconds}
+                    indexed = matcher.match(remote, include_proposed=preview)
+                    with patch.object(matcher, '_matching_track_indices', return_value=range(len(tracks))):
+                        scanned = matcher.match(remote, include_proposed=preview)
+                    self.assertEqual(indexed, scanned, (title, preview, seconds))
+
     def test_pending_translation_aliases_are_inactive_and_preserve_versions(self):
         self.assertEqual(self.document['track_title_aliases'][0]['aliases'][0]['value'], '曲 (Off Vocal)')
         matcher = IdentityMap(self.document, self.tracks, 'library-hash')

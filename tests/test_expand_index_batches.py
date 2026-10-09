@@ -1,5 +1,6 @@
 """Offline coverage for the bounded incremental collector orchestrator."""
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -90,6 +91,9 @@ class ExpandIndexBatchesTests(unittest.TestCase):
                exclude_pids=(), prefetched_batch=None, prefetched_plan=None,
                batch_size=1, unindexed_per_batch=0,
                seed_video_evidence_path=None, candidate_limit=25,
+               known_video_only=False,
+               interval=5, target_indexed_count=None,
+               deadline=None,
                seed_plan_override_path=None):
         patches = (
             patch.object(batches, 'load_library', return_value=(self.tracks, LIBRARY_HASH, {'path': 'fixture'})),
@@ -105,10 +109,13 @@ class ExpandIndexBatchesTests(unittest.TestCase):
                 accepted_snapshots_path=self.paths['accepted.json'], output_dir=output,
                 auth_path=self.root / 'auth.json', max_requests=max_requests,
                 max_attempts=max_attempts, batch_size=batch_size,
+                interval=interval, target_indexed_count=target_indexed_count,
+                deadline=deadline,
                 unindexed_per_batch=unindexed_per_batch,
                 exclude_pids=exclude_pids, collector_runner=runner,
                 prefetched_batch=prefetched_batch, prefetched_plan=prefetched_plan,
                 seed_video_evidence_path=seed_video_evidence_path,
+                known_video_only=known_video_only,
                 candidate_limit=candidate_limit,
                 seed_plan_override_path=seed_plan_override_path)
 
@@ -129,8 +136,13 @@ class ExpandIndexBatchesTests(unittest.TestCase):
                        'account_authentication_verified': status == 'completed',
                        'library_sha256': LIBRARY_HASH,
                        'http_requests': min(requests_each, request_budget),
+                       'request_budget': request_budget,
                        'results': [{'persistent_id': seed['persistent_id'], 'status': 'collected'}
                                    for seed in selected]}
+            if status == 'stopped':
+                summary.update(account_authentication_verified=True,
+                               error_type='RuntimeError',
+                               error_location={'function': 'request'})
             (out / 'summary-fixture.json').write_text(json.dumps(summary), encoding='utf-8')
             return SimpleNamespace(returncode=0)
         return run, calls
@@ -179,6 +191,143 @@ class ExpandIndexBatchesTests(unittest.TestCase):
         self.assertEqual(progress['stop_reason'], 'collector_stopped')
         audit = json.loads((self.root / 'error' / 'run-audit.json').read_text())
         self.assertEqual(audit['batch_count'], 1)
+
+    def test_request_boundary_stop_accepts_completed_snapshots_and_stops(self):
+        runner, calls = self.fake_runner(requests_each=3, statuses={1: 'stopped'})
+        new_graph = graph(pid(2), [pid(3)])
+        with patch.object(batches, 'collect_graphs', return_value=([new_graph], [], [])):
+            progress = self.invoke(self.root / 'boundary-stop', runner,
+                                   max_requests=3, max_attempts=5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(progress['requests'], 3)
+        self.assertEqual(progress['attempted_seeds'], 1)
+        self.assertEqual(progress['seeds_valid'], 1)
+        self.assertEqual(progress['stop_reason'], 'request_budget_reached')
+        audit = json.loads((self.root / 'boundary-stop' / 'batch-001' / 'batch-audit.json').read_text())
+        self.assertEqual(audit['collector_boundary_stop'], 'request_budget_boundary')
+
+    def test_max_attempts_can_reach_library_size_but_not_exceed_it(self):
+        runner, calls = self.fake_runner()
+        progress = self.invoke(self.root / 'library-sized-budget', runner, max_attempts=len(self.tracks))
+        self.assertEqual(progress['target_attempted_seed_count'], len(self.tracks))
+        self.assertEqual(progress['stop_reason'], 'no_more_eligible_roots')
+        self.assertTrue(calls)
+        with self.assertRaisesRegex(ValueError, 'Library track count'):
+            self.invoke(self.root / 'oversized-budget', runner, max_attempts=len(self.tracks) + 1)
+
+    def test_interval_is_bounded_and_forwarded_to_collector(self):
+        runner, calls = self.fake_runner()
+        self.invoke(self.root / 'fast-interval', runner, max_attempts=1, interval=2,
+                    max_requests=10000)
+        self.assertEqual(calls[0][calls[0].index('--interval') + 1], '2')
+        for value in (1.99, 60.01, float('inf'), float('nan')):
+            with self.assertRaisesRegex(ValueError, 'interval must be finite'):
+                self.invoke(self.root / ('invalid-interval-' + str(value)), runner,
+                            max_attempts=1, interval=value)
+
+    def test_target_indexed_count_stops_after_reaching_virtual_state_target(self):
+        runner, calls = self.fake_runner()
+        with patch.object(batches, 'collect_graphs', return_value=(
+                [graph(pid(2), [pid(3)])], [], [])):
+            progress = self.invoke(self.root / 'target-count', runner, max_attempts=5,
+                                   target_indexed_count=3)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(progress['indexed_tracks'], 3)
+        self.assertEqual(progress['stop_reason'], 'indexed_track_target_reached')
+
+    def test_target_indexed_count_is_bounded_by_library_size(self):
+        runner, _ = self.fake_runner()
+        with self.assertRaisesRegex(ValueError, 'target_indexed_count'):
+            self.invoke(self.root / 'oversized-index-target', runner,
+                        target_indexed_count=len(self.tracks) + 1)
+
+    def test_expired_deadline_prevents_collector_launch_and_attempt_accounting(self):
+        runner, calls = self.fake_runner()
+        deadline = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        progress = self.invoke(self.root / 'expired-deadline', runner,
+                               max_attempts=2, deadline=deadline)
+        self.assertEqual(calls, [])
+        self.assertEqual(progress['attempted_seeds'], 0)
+        self.assertEqual(progress['stop_reason'], 'deadline_reached')
+        audit = json.loads((self.root / 'expired-deadline' / 'run-audit.json').read_text())
+        self.assertEqual(audit['deadline'], deadline)
+
+    def test_deadline_stop_accepts_only_completed_seeds_and_keeps_actual_count(self):
+        runner, calls = self.fake_runner(requests_each=2)
+        deadline_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+        deadline = deadline_at.isoformat()
+        clock = [deadline_at - timedelta(seconds=10)]
+        def stopped_run(command):
+            result = runner(command)
+            clock[0] = deadline_at + timedelta(seconds=1)
+            output = Path(command[command.index('--output') + 1])
+            summary_path = next(output.glob('summary-*.json'))
+            summary = json.loads(summary_path.read_text())
+            summary.update(status='stopped', account_authentication_verified=True,
+                           deadline=deadline, deadline_stop_at=clock[0].isoformat(),
+                           error_type='CollectionDeadlineReached',
+                           error_location={'function': 'request'})
+            summary['results'] = summary['results'][:1]
+            summary_path.write_text(json.dumps(summary), encoding='utf-8')
+            return result
+        with patch.object(batches, 'datetime', SimpleNamespace(now=lambda tz: clock[0])), \
+                patch.object(batches, 'collect_graphs', side_effect=lambda paths, *_:
+                          ([graph(paths[0].stem, [pid(4)])], [], [])):
+            progress = self.invoke(self.root / 'deadline-partial', stopped_run,
+                                   max_attempts=2, batch_size=2, deadline=deadline)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(progress['attempted_seeds'], 1)
+        self.assertEqual(progress['attempted_pids'], [pid(2)])
+        self.assertEqual(progress['stop_reason'], 'deadline_reached')
+        audit = json.loads((self.root / 'deadline-partial' / 'batch-001' / 'batch-audit.json').read_text())
+        self.assertEqual(audit['seeds'], [pid(2)])
+        self.assertEqual(audit['requested_seeds'], [pid(2), pid(3)])
+        self.assertEqual(calls[0][calls[0].index('--deadline') + 1], deadline)
+
+    def test_invoke_collector_rechecks_deadline_after_pacing_wait(self):
+        deadline = datetime(2026, 10, 9, 13, 30, tzinfo=timezone.utc)
+        times = iter([deadline - timedelta(seconds=2), deadline + timedelta(seconds=1)])
+        command = ['python', 'collector.py', '--deadline', deadline.isoformat()]
+        with patch.object(batches, 'datetime', SimpleNamespace(now=lambda tz: next(times))), \
+                patch.object(batches.time, 'sleep') as sleep, \
+                patch.object(batches.subprocess, 'run') as run:
+            result = batches._invoke_collector(command)
+        sleep.assert_called_once_with(2.0)
+        run.assert_not_called()
+        self.assertTrue(result.deadline_before_launch)
+
+    def test_known_video_only_planner_uses_strict_hints_with_regular_fairness(self):
+        evidence_path = self.root / 'strict-evidence.json'
+        evidence_path.write_text('{}', encoding='utf-8')
+        # PID 4 is deliberately a version variant and must be removed even when
+        # the evidence validator returns it as a saved hint.
+        self.tracks[3]['title'] = 'Track 4 Karaoke'
+        self.state = json.loads(json.dumps(make_synthetic_state(
+            [{'root_pid': pid(1), 'ordered_target_pids': [pid(2)]}],
+            self.matcher, LIBRARY_HASH, batches._sha(MAP_BYTES))))
+        self.relations = batches._relation_document(
+            LIBRARY_HASH, self.state,
+            [{'root_pid': pid(1), 'ordered_target_pids': [pid(2)]}])
+        self.evaluation['relation_rows'] = self.relations['relation_rows']
+        self.paths['state.json'].write_text(json.dumps(self.state), encoding='utf-8')
+        self.paths['relations.json'].write_text(json.dumps(self.relations), encoding='utf-8')
+        self.paths['evaluation.json'].write_text(json.dumps(self.evaluation), encoding='utf-8')
+        runner, calls = self.fake_runner()
+        hints = {pid(2): {}, pid(3): {}, pid(4): {}, pid(5): {}}
+        with patch.object(batches, 'select_seed_video_evidence', return_value=hints), \
+                patch.object(batches, 'collect_graphs', side_effect=lambda paths, *_:
+                             ([graph(paths[0].stem, [pid(6)])], [], [])):
+            progress = self.invoke(self.root / 'known-video', runner,
+                                   max_attempts=2, batch_size=2,
+                                   seed_video_evidence_path=evidence_path,
+                                   known_video_only=True)
+        selected = [seed['persistent_id'] for command in calls
+                    for seed in json.loads(Path(command[command.index('--seed-plan') + 1]).read_text())['seeds']]
+        self.assertTrue(set(selected) <= {pid(2), pid(3), pid(5)})
+        self.assertEqual(progress['attempted_seeds'], 2)
+        plan_audit = json.loads((self.root / 'known-video' / 'batch-001' /
+                                 'seed-plan-audit.json').read_text())
+        self.assertTrue(plan_audit['known_video_only'])
 
     def test_all_previously_attempted_candidates_are_skipped(self):
         runner, calls = self.fake_runner()

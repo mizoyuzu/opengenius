@@ -89,13 +89,15 @@ def update_sql(clear, baseline, next_state):
         return connection.serialize(), expected
 
 
-def update_bundle(files, baseline, roots, matcher, library_hash, identity_hash, executable):
+def update_bundle(files, baseline, roots, matcher, library_hash, identity_hash, executable,
+                  *, allow_unverified_profile=False):
     plan = plan_genius_update(baseline, roots, matcher, library_hash, identity_hash)
     old_ids, _, _ = state_rows(baseline)
     ids, _, _ = state_rows(plan['next_state'])
     expanded = decode_musicdb(files['Library.musicdb'])
     # Keep the established codec guard; this path does not bypass legacy refusal.
-    if encode_library(expanded, files['Library.musicdb']) != files['Library.musicdb']:
+    if encode_library(expanded, files['Library.musicdb'],
+                      allow_unverified_profile=allow_unverified_profile) != files['Library.musicdb']:
         raise ValueError('Source Library codec does not reproduce its bytes')
     tracks, _ = parse_tracks(expanded)
     source_tracks = {t['persistent_id']: t for t in matcher.tracks}
@@ -121,7 +123,7 @@ def update_bundle(files, baseline, roots, matcher, library_hash, identity_hash, 
     library = files['Library.musicdb']
     if assignments:
         patched, changes = patch_ids(expanded, assignments)
-        library = encode_library(patched, library)
+        library = encode_library(patched, library, allow_unverified_profile=allow_unverified_profile)
     saved, _ = parse_tracks(decode_musicdb(library))
     if {t['persistent_id']: t for t in saved} != {
             pid: {**track, 'genius_id': f'{ids.get(pid, 0):016X}'} for pid, track in source_tracks.items()}:
@@ -136,7 +138,8 @@ def update_bundle(files, baseline, roots, matcher, library_hash, identity_hash, 
                   config_and_auxiliary_tables_preserved=True, local_genius_state_preserved=True,
                   encrypted_round_trip_verified=True, sql_integrity_check='ok', table_counts=counts,
                   previous_state_sha256=baseline['state_sha256'], next_state_sha256=plan['next_state']['state_sha256'],
-                  network_requests=0, music_app_acceptance_verified=False, ipod_acceptance_verified=False)
+                  network_requests=0, allow_unverified_profile=allow_unverified_profile,
+                  music_app_acceptance_verified=False, ipod_acceptance_verified=False)
     return output, report, plan
 
 
@@ -165,6 +168,8 @@ def main():
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument('--baseline-state', type=Path)
     source.add_argument('--baseline-evaluation', type=Path, help='Bootstrap state only when complete baseline SQL matches')
+    parser.add_argument('--allow-unverified-profile', action='store_true',
+                        help='Explicitly allow a legacy Library copy; native Music may reset it')
     args = parser.parse_args()
     output = args.output.resolve()
     paths = [value.resolve() for name, value in vars(args).items() if isinstance(value, Path) and name != 'output']
@@ -189,7 +194,8 @@ def main():
         baseline = make_synthetic_state(old['relation_rows'], matcher, library_hash, identity_hash)
     files = read_bundle(args.bundle)
     prepared, report, plan = update_bundle(files, baseline, evaluation['relation_rows'], matcher,
-                                          library_hash, identity_hash, args.executable)
+                                          library_hash, identity_hash, args.executable,
+                                          allow_unverified_profile=args.allow_unverified_profile)
     report['input_sha256'] = {name: sha(blob) for name, blob in input_bytes.items()}
     report['updater_sha256'] = sha(Path(__file__).read_bytes())
     if read_bundle(args.bundle) != files or any(

@@ -236,6 +236,22 @@ class IdentityMap:
         # Recording links are reserved for a later explicit verification workflow.
         if document.get('recording_links'):
             raise ValueError('Recording links are not yet supported')
+        # The Library and alias document are fixed inputs for this matcher.
+        # Narrow by title before the recording/version/credit/duration checks;
+        # retain Library order when multiple local recordings share a title.
+        self._active_title_indices = {}
+        self._preview_title_indices = {}
+        for index, track in enumerate(tracks):
+            pid = track['persistent_id']
+            active = {normalize(track.get('title') or ''), *self.titles.get(pid, [])}
+            for value in active:
+                self._active_title_indices.setdefault(value, set()).add(index)
+            for value in active | set(self.proposed_titles.get(pid, [])):
+                self._preview_title_indices.setdefault(value, set()).add(index)
+
+    def _matching_track_indices(self, remote_titles, include_proposed):
+        lookup = self._preview_title_indices if include_proposed else self._active_title_indices
+        return sorted({index for title in remote_titles for index in lookup.get(title, ())})
 
     def artist_key(self, name):
         normalized = normalize(name)
@@ -269,7 +285,8 @@ class IdentityMap:
         if remote_proposal:
             remote_titles.add(normalize(remote_proposal['value']))
         candidates = []
-        for local in self.tracks:
+        for index in self._matching_track_indices(remote_titles, include_proposed):
+            local = self.tracks[index]
             pid = local['persistent_id']
             exact_title = title == normalize(local.get('title') or '')
             active_title = exact_title or title in self.titles.get(pid, [])

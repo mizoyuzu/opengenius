@@ -1,4 +1,5 @@
 import copy
+from datetime import datetime, timedelta, timezone
 import hashlib
 import io
 import json
@@ -11,6 +12,7 @@ from unittest.mock import patch
 import requests
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from probe_ytmusic_batch import (AuthenticationUnconfirmed, CachedClient,
+                                 CollectionDeadlineReached,
                                  create_paced_session, main, resolve_seed_search, select_observed_seeds, select_planned_seeds, select_seeds, verify_account)
 
 
@@ -202,6 +204,83 @@ class BatchTests(unittest.TestCase):
                 self.assertEqual([call['time'] for call in adapter.calls], [100.0, 105.0])
                 self.assertEqual([call['timeout'] for call in adapter.calls], [25, 25])
                 self.assertEqual(session.count, 2)
+
+    def test_deadline_checked_after_pacing_before_count_or_send(self):
+        deadline = datetime(2026, 10, 9, 13, 0, tzinfo=timezone.utc)
+        wall_clock = [deadline - timedelta(seconds=10)]
+        mono_clock = [100.0]
+        def sleep(seconds):
+            wall_clock[0] += timedelta(seconds=seconds)
+            mono_clock[0] += seconds
+        with patch('probe_ytmusic_batch.time.monotonic', side_effect=lambda: mono_clock[0]), \
+                patch('probe_ytmusic_batch.time.sleep', side_effect=sleep):
+            with create_paced_session(5, 5, deadline=deadline,
+                                      deadline_clock=lambda: wall_clock[0]) as session:
+                adapter = OfflineAdapter(clock=mono_clock)
+                session.mount('https://', adapter)
+                session.get('https://example.invalid/first')
+                wall_clock[0] = deadline - timedelta(seconds=4)
+                with self.assertRaises(CollectionDeadlineReached):
+                    session.get('https://example.invalid/after-deadline')
+                self.assertEqual(session.count, 1)
+                self.assertEqual(len(adapter.calls), 1)
+
+    def test_deadline_requires_timezone_aware_iso_timestamp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv = ['probe', '--track-snapshot', str(root / 'missing.json'),
+                    '--output', str(root / 'output'), '--deadline', '2026-10-09T13:30:00',
+                    '--plan-only']
+            with patch.object(sys, 'argv', argv), patch('sys.stderr', new=io.StringIO()), \
+                    patch('probe_ytmusic_batch.load_library') as load:
+                with self.assertRaises(SystemExit) as stopped:
+                    main()
+                self.assertEqual(stopped.exception.code, 2)
+                load.assert_not_called()
+            self.assertFalse((root / 'output').exists())
+
+    def test_deadline_stop_records_only_seed_with_a_started_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            track = {'persistent_id': '0000000000000001', 'title': 'Song',
+                     'artist': 'Artist', 'album': 'Album', 'duration_ms': 100000}
+            snapshot = root / 'tracks.json'
+            snapshot.write_text(json.dumps({'source_sha256': 'a' * 64, 'tracks': [track]}))
+            plan = root / 'plan.json'
+            plan.write_text(json.dumps({'schema_version': 1, 'source_library_sha256': 'a' * 64,
+                'seeds': [{'persistent_id': track['persistent_id'], 'series': 'fixture',
+                           'sample_kind': 'track'}]}))
+            output = root / 'experiment'
+            deadline = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+            class FakeSession:
+                count = 0
+            session = FakeSession()
+            class FakeMusicClient:
+                def __init__(self, *args, **kwargs):
+                    pass
+                def get_account_info(self):
+                    return {'accountName': 'private'}
+                def search(self, **kwargs):
+                    return [{'videoId': 'seedvideo01', 'title': track['title'],
+                             'artists': [{'name': track['artist']}], 'duration_seconds': 100}]
+            def request(*args, **kwargs):
+                session.count += 1
+                raise CollectionDeadlineReached('private detail')
+            argv = ['probe', '--track-snapshot', str(snapshot), '--seed-plan', str(plan),
+                    '--seeds', '1', '--output', str(output), '--auth', str(root / 'auth'),
+                    '--deadline', deadline]
+            with patch.dict(sys.modules, {'ytmusicapi': SimpleNamespace(YTMusic=FakeMusicClient)}), \
+                    patch.object(sys, 'argv', argv), patch('sys.stdout', new=io.StringIO()), \
+                    patch('probe_ytmusic_batch.create_paced_session', return_value=session), \
+                    patch('probe_ytmusic_batch.collect', side_effect=request):
+                self.assertEqual(main(), 1)
+            report = json.loads(next(output.glob('summary-*.json')).read_text())
+            self.assertEqual(report['error_type'], 'CollectionDeadlineReached', report)
+            self.assertEqual(report['results'], [{'persistent_id': track['persistent_id'],
+                                                  'status': 'deadline_partial'}])
+            self.assertEqual(report['http_requests'], 1)
+            self.assertEqual(report['deadline'], deadline)
+            self.assertNotIn('private detail', json.dumps(report))
 
     def test_nonfinite_intervals_rejected_before_reading_library(self):
         with tempfile.TemporaryDirectory() as directory:

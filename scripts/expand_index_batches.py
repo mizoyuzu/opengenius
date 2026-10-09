@@ -8,6 +8,7 @@ from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -18,13 +19,13 @@ from evaluate_ytmusic_batch import collect_graphs, merge_graphs
 from music_identity_map import IdentityMap, load_library, version_facets
 from plan_genius_update import plan_genius_update
 from plan_index_expansion import plan_index_expansion
-from probe_ytmusic_batch import select_planned_seeds
+from probe_ytmusic_batch import parse_deadline, select_planned_seeds
 from seed_video_evidence import select_seed_video_evidence
 from update_genius_bundle import state_rows
 
 
 DEFAULT_EXCLUDED_PIDS = ()
-DEFAULT_ATTEMPT_BUDGET = 100
+DEFAULT_ATTEMPT_BUDGET = 200
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_REQUEST_BUDGET = 90
 DEFAULT_UNINDEXED_PER_BATCH = 5
@@ -91,20 +92,40 @@ def _summary_path(directory):
 
 def _collector_command(python, script, track_snapshot, identity_map, auth,
                        seed_plan, output, count, request_budget,
-                       candidate_limit=25, seed_video_evidence=None):
-    return [str(python), str(script), '--track-snapshot', str(track_snapshot),
+                       candidate_limit=25, seed_video_evidence=None, interval=5,
+                       deadline=None):
+    command = [str(python), str(script), '--track-snapshot', str(track_snapshot),
             '--identity-map', str(identity_map), '--seed-plan', str(seed_plan),
-            '--seeds', str(count), '--interval', '5', '--request-budget', str(request_budget),
+            '--seeds', str(count), '--interval', str(interval), '--request-budget', str(request_budget),
             '--candidate-limit', str(candidate_limit),
             *(('--seed-video-evidence', str(seed_video_evidence)) if seed_video_evidence else ()),
             '--auth', str(auth), '--output', str(output)]
+    if deadline is not None:
+        command.extend(['--deadline', str(deadline)])
+    return command
 
 
 def _invoke_collector(command):
     """Capture collector output so account or response data cannot reach logs."""
     # Each collector subprocess creates a fresh paced session. Keep its first
     # request at least five seconds after the previous child has finished.
-    time.sleep(5)
+    deadline_arg = None
+    if '--deadline' in command:
+        deadline_arg = command[command.index('--deadline') + 1]
+    if deadline_arg is None:
+        time.sleep(5)
+    else:
+        deadline_at = parse_deadline(deadline_arg)
+        remaining = (deadline_at - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
+            stopped = subprocess.CompletedProcess(command, 0, '', '')
+            stopped.deadline_before_launch = True
+            return stopped
+        time.sleep(min(5, remaining))
+        if datetime.now(timezone.utc) >= deadline_at:
+            stopped = subprocess.CompletedProcess(command, 0, '', '')
+            stopped.deadline_before_launch = True
+            return stopped
     return subprocess.run(command, check=False, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, text=True)
 
@@ -123,6 +144,48 @@ def _collector_result(directory, returncode):
     if returncode != 0:
         return summary, summary_path, 'collector_exit_failure'
     return summary, summary_path, None
+
+
+def _is_request_boundary_stop(summary, request_budget):
+    """Accept only an authenticated stop caused by exhausting this exact budget."""
+    return (
+        summary.get('status') == 'stopped'
+        and summary.get('account_authentication_verified') is True
+        and type(summary.get('http_requests')) is int
+        and type(summary.get('request_budget')) is int
+        and summary['request_budget'] == request_budget
+        and summary['http_requests'] == request_budget
+        and summary.get('error_type') == 'RuntimeError'
+        and isinstance(summary.get('error_location'), dict)
+        and summary['error_location'].get('function') == 'request'
+        and 'http_error_status' not in summary
+    )
+
+
+def _is_deadline_stop(summary, deadline, request_budget):
+    if (deadline is None or summary.get('status') != 'stopped'
+            or summary.get('account_authentication_verified') is not True
+            or summary.get('error_type') != 'CollectionDeadlineReached'
+            or type(summary.get('request_budget')) is not int
+            or summary['request_budget'] != request_budget
+            or type(summary.get('http_requests')) is not int
+            or not 0 <= summary['http_requests'] <= request_budget
+            or not isinstance(summary.get('error_location'), dict)
+            or summary['error_location'].get('function') != 'request'
+            or 'http_error_status' in summary
+            or summary.get('deadline') != str(deadline)):
+        return False
+    try:
+        expected = parse_deadline(str(deadline))
+        stopped = parse_deadline(summary.get('deadline_stop_at'))
+    except ValueError:
+        return False
+    current = datetime.now(timezone.utc)
+    return expected <= stopped <= current and current >= expected
+
+
+def _deadline_expired(deadline_at):
+    return deadline_at is not None and datetime.now(timezone.utc) >= deadline_at
 
 
 def _snapshot_paths(batch_dir, seeds):
@@ -176,16 +239,25 @@ def run_expansion(*, track_snapshot, identity_map_path, baseline_state_path,
                   accepted_snapshots_path, output_dir, auth_path,
                   prefetched_batch=None, prefetched_plan=None,
                   seed_video_evidence_path=None, candidate_limit=25,
+                  known_video_only=False,
                   seed_plan_override_path=None,
-                  max_requests=450, max_attempts=100,
+                  max_requests=450, max_attempts=DEFAULT_ATTEMPT_BUDGET,
+                  interval=5, target_indexed_count=None, deadline=None,
                   batch_size=20, unindexed_per_batch=DEFAULT_UNINDEXED_PER_BATCH,
                   exclude_pids=(), python=sys.executable,
                   collector_script=None, collector_runner=None):
     """Execute batches. ``collector_runner`` is injectable for offline tests."""
-    if type(max_requests) is not int or not 1 <= max_requests <= 500:
-        raise ValueError('max_requests must be between 1 and 500')
-    if type(max_attempts) is not int or not 1 <= max_attempts <= 200:
-        raise ValueError('max_attempts must be between 1 and 200')
+    if type(max_requests) is not int or not 1 <= max_requests <= 10000:
+        raise ValueError('max_requests must be between 1 and 10000')
+    if (type(interval) not in (int, float) or not math.isfinite(interval)
+            or not 2 <= interval <= 60):
+        raise ValueError('interval must be finite and between 2 and 60 seconds')
+    try:
+        deadline_at = parse_deadline(deadline)
+    except ValueError:
+        raise ValueError('deadline must be a timezone-aware ISO timestamp') from None
+    if type(max_attempts) is not int or max_attempts < 1:
+        raise ValueError('max_attempts must be a positive integer')
     if type(batch_size) is not int or not 1 <= batch_size <= 20:
         raise ValueError('batch_size must be between 1 and 20')
     if type(unindexed_per_batch) is not int or not 0 <= unindexed_per_batch <= batch_size:
@@ -196,11 +268,21 @@ def run_expansion(*, track_snapshot, identity_map_path, baseline_state_path,
         raise ValueError('Explicit seed plan cannot be combined with a prefetched batch')
     if seed_plan_override_path is not None and seed_video_evidence_path is None:
         raise ValueError('Explicit seed plan requires strict seed-video evidence')
+    if known_video_only and seed_video_evidence_path is None:
+        raise ValueError('Known-video-only planning requires strict seed-video evidence')
+    if known_video_only and seed_plan_override_path is not None:
+        raise ValueError('Known-video-only planning cannot be combined with an explicit seed plan')
     output_dir = Path(output_dir).resolve()
     if output_dir.exists():
         raise FileExistsError('Output directory exists; choose a new directory')
-    output_dir.mkdir(parents=True)
     tracks, library_hash, library_input = load_library(track_snapshot=Path(track_snapshot))
+    if max_attempts > len(tracks):
+        raise ValueError('max_attempts cannot exceed the Library track count')
+    if (target_indexed_count is not None and
+            (type(target_indexed_count) is not int or
+             not 1 <= target_indexed_count <= len(tracks))):
+        raise ValueError('target_indexed_count must be between 1 and the Library track count')
+    output_dir.mkdir(parents=True)
     map_bytes = Path(identity_map_path).read_bytes()
     map_hash = _sha(map_bytes)
     matcher = IdentityMap(json.loads(map_bytes), tracks, library_hash)
@@ -209,6 +291,22 @@ def run_expansion(*, track_snapshot, identity_map_path, baseline_state_path,
     if seed_video_evidence_path is not None:
         evidence_bytes = Path(seed_video_evidence_path).read_bytes()
         evidence_document = json.loads(evidence_bytes)
+    known_video_pids = None
+    if known_video_only:
+        hints = select_seed_video_evidence(
+            evidence_document, seed_video_evidence_path,
+            [{'persistent_id': track['persistent_id']} for track in tracks],
+            tracks, matcher, library_hash, map_hash)
+        by_pid = {track['persistent_id']: track for track in tracks}
+        known_video_pids = {
+            pid for pid in hints
+            if all(isinstance(by_pid[pid].get(field), str) and by_pid[pid][field].strip()
+                   for field in ('title', 'artist', 'album'))
+            and type(by_pid[pid].get('duration_ms')) is int
+            and by_pid[pid]['duration_ms'] > 0
+            and not (set(version_facets(by_pid[pid]['title'])['kinds'])
+                     & {'off_vocal', 'karaoke', 'instrumental'})
+        }
     override_bytes = None
     override_plan = None
     if seed_plan_override_path is not None:
@@ -337,7 +435,7 @@ def run_expansion(*, track_snapshot, identity_map_path, baseline_state_path,
     })
 
     def accept_batch(batch_number, batch_dir, seeds, summary, summary_path,
-                     *, prefetched=False, snapshot_dir=None):
+                     *, prefetched=False, snapshot_dir=None, requested_seeds=None):
         nonlocal state, roots, raw_snapshots, attempted_count, requests
         attempted.extend(pid for pid in seeds if pid not in attempted)
         attempted_count += len(seeds)
@@ -346,6 +444,8 @@ def run_expansion(*, track_snapshot, identity_map_path, baseline_state_path,
                         'http_requests': summary.get('http_requests', 0),
                         'summary': str(summary_path), 'status': summary.get('status'),
                         'prefetched': prefetched}
+        if requested_seeds is not None and list(requested_seeds) != list(seeds):
+            batch_record['requested_seeds'] = list(requested_seeds)
         batch_rows.append(batch_record)
         history.extend({'persistent_id': row.get('persistent_id'),
                         'status': row.get('status')}
@@ -448,18 +548,8 @@ def run_expansion(*, track_snapshot, identity_map_path, baseline_state_path,
         summary_path = _summary_path(pre_dir)
         summary = json.loads(summary_path.read_text(encoding='utf-8'))
         if summary.get('status') != 'completed' or not summary.get('account_authentication_verified'):
-            boundary_stop = (
-                summary.get('status') == 'stopped'
-                and summary.get('account_authentication_verified') is True
-                and type(summary.get('http_requests')) is int
-                and type(summary.get('request_budget')) is int
-                and summary['http_requests'] == summary['request_budget']
-                and summary.get('error_type') == 'RuntimeError'
-                and isinstance(summary.get('error_location'), dict)
-                and summary['error_location'].get('function') == 'request'
-                and 'http_error_status' not in summary
-            )
-            if not boundary_stop:
+            boundary_budget = summary.get('request_budget')
+            if not _is_request_boundary_stop(summary, boundary_budget):
                 save_progress('prefetched_batch_not_successfully_authenticated')
                 raise ValueError('Prefetched batch did not complete or stop at its request budget boundary')
             summary['accepted_boundary_stop_reason'] = 'request_budget_boundary'
@@ -482,6 +572,8 @@ def run_expansion(*, track_snapshot, identity_map_path, baseline_state_path,
         plan_seeds = select_planned_seeds(plan_doc, tracks, library_hash, len(seeds))
         if [row['persistent_id'] for row in plan_seeds] != seeds:
             raise ValueError('Prefetched collector seeds differ from the original seed plan')
+        if known_video_pids is not None and not set(seeds) <= known_video_pids:
+            raise ValueError('Prefetched batch includes a PID without strict seed-video evidence')
         manifest_by_pid = {row.get('persistent_id'): row for row in seed_manifest['seeds']}
         fields = ('persistent_id', 'title', 'artist', 'album', 'duration_ms')
         for planned in plan_seeds:
@@ -510,7 +602,16 @@ def run_expansion(*, track_snapshot, identity_map_path, baseline_state_path,
     else:
         save_progress()
 
-    while attempted_count < target_attempt_count and requests < max_requests:
+    if (target_indexed_count is not None
+            and len(state_rows(state)[0]) >= target_indexed_count):
+        stop_reason = 'indexed_track_target_reached'
+    while (stop_reason is None and attempted_count < target_attempt_count
+           and requests < max_requests
+           and (target_indexed_count is None
+                or len(state_rows(state)[0]) < target_indexed_count)):
+        if _deadline_expired(deadline_at):
+            stop_reason = 'deadline_reached'
+            break
         remaining_attempts = target_attempt_count - attempted_count
         count = min(batch_size, remaining_attempts)
         if override_seeds is not None:
@@ -525,16 +626,29 @@ def run_expansion(*, track_snapshot, identity_map_path, baseline_state_path,
                      'network_requests': 0, 'explicit_override': True,
                      'seed_plan_override_sha256': _sha(override_bytes)}
         else:
-            try:
-                seed_plan, audit = plan_index_expansion(
-                    tracks, library_hash, state, _relation_document(library_hash, state, roots),
-                    count, excluded_pids=attempted,
-                    unindexed_count=min(unindexed_per_batch, count))
-            except ValueError as error:
-                if str(error).startswith('Only ') or 'No eligible roots' in str(error):
-                    stop_reason = 'no_more_eligible_roots'
+            planning_excluded = attempted
+            if known_video_pids is not None:
+                planning_excluded = sorted(
+                    set(attempted) |
+                    ({track['persistent_id'] for track in tracks} - known_video_pids))
+            for requested_count in range(count, 0, -1):
+                try:
+                    seed_plan, audit = plan_index_expansion(
+                        tracks, library_hash, state,
+                        _relation_document(library_hash, state, roots),
+                        requested_count, excluded_pids=planning_excluded,
+                        unindexed_count=min(unindexed_per_batch, requested_count))
                     break
-                raise
+                except ValueError as error:
+                    if str(error).startswith('Only ') or 'No eligible roots' in str(error):
+                        continue
+                    raise
+            else:
+                stop_reason = 'no_more_eligible_roots'
+                break
+            if known_video_pids is not None:
+                audit['known_video_only'] = True
+                audit['seed_video_evidence_sha256'] = _sha(evidence_bytes)
         batch_number = len(batch_rows) + 1
         batch_dir = output_dir / ('batch-%03d' % batch_number)
         batch_dir.mkdir()
@@ -547,10 +661,34 @@ def run_expansion(*, track_snapshot, identity_map_path, baseline_state_path,
         command = _collector_command(python, script, track_snapshot, identity_map_path,
                                      auth_path, plan_path, batch_dir, count, req_budget,
                                      candidate_limit=candidate_limit,
-                                     seed_video_evidence=seed_video_evidence_path)
+                                     seed_video_evidence=seed_video_evidence_path,
+                                     interval=interval, deadline=deadline)
+        if _deadline_expired(deadline_at):
+            _write_json(batch_dir / 'batch-prelaunch-audit.json', {
+                'schema_version': 1, 'status': 'deadline_before_launch',
+                'requested_seeds': seeds, 'attempted_seeds': [],
+                'http_requests': 0, 'deadline': deadline})
+            batch_rows.append({'batch': batch_number, 'seeds': [],
+                               'requested_seeds': seeds, 'http_requests': 0,
+                               'status': 'deadline_before_launch', 'prefetched': False})
+            stop_reason = 'deadline_reached'
+            save_progress(stop_reason)
+            break
         result = collector_runner(command)
+        if getattr(result, 'deadline_before_launch', False):
+            _write_json(batch_dir / 'batch-prelaunch-audit.json', {
+                'schema_version': 1, 'status': 'deadline_before_launch',
+                'requested_seeds': seeds, 'attempted_seeds': [],
+                'http_requests': 0, 'deadline': deadline})
+            batch_rows.append({'batch': batch_number, 'seeds': [],
+                               'requested_seeds': seeds, 'http_requests': 0,
+                               'status': 'deadline_before_launch', 'prefetched': False})
+            stop_reason = 'deadline_reached'
+            save_progress(stop_reason)
+            break
         returncode = getattr(result, 'returncode', 0)
         summary, summary_path, failure = _collector_result(batch_dir, returncode)
+        history_before_batch = len(history)
         attempted.extend(pid for pid in seeds if pid not in attempted)
         attempted_count += len(seeds)
         requests += summary.get('http_requests', 0)
@@ -563,6 +701,32 @@ def run_expansion(*, track_snapshot, identity_map_path, baseline_state_path,
                         'prefetched': False}
         batch_rows.append(batch_record)
         if failure:
+            if _is_deadline_stop(summary, deadline, req_budget):
+                completed_seed_statuses = {'collected', 'search_unresolved', 'deadline_partial'}
+                actually_attempted = list(dict.fromkeys(
+                    row.get('persistent_id') for row in summary.get('results', [])
+                    if isinstance(row, dict) and row.get('persistent_id') in seeds
+                    and row.get('status') in completed_seed_statuses))
+                attempted_count -= len(seeds)
+                requests -= summary.get('http_requests', 0)
+                attempted[:] = [pid for pid in attempted if pid not in set(seeds)]
+                history = history[:history_before_batch]
+                batch_rows.pop()
+                accept_batch(batch_number, batch_dir, actually_attempted,
+                             summary, summary_path, requested_seeds=seeds)
+                stop_reason = 'deadline_reached'
+                break
+            if _is_request_boundary_stop(summary, req_budget):
+                summary['accepted_boundary_stop_reason'] = 'request_budget_boundary'
+                # Keep this planned chunk in the attempt and request totals, and
+                # accept any complete, valid snapshots captured before exhaustion.
+                attempted_count -= len(seeds)
+                requests -= summary.get('http_requests', 0)
+                history = history[:history_before_batch]
+                batch_rows.pop()
+                accept_batch(batch_number, batch_dir, seeds, summary, summary_path)
+                stop_reason = 'request_budget_reached'
+                break
             stop_reason = failure
             save_progress(stop_reason)
             break
@@ -573,14 +737,21 @@ def run_expansion(*, track_snapshot, identity_map_path, baseline_state_path,
         # accept_batch records attempts itself; undo accounting already applied above.
         attempted_count -= len(seeds)
         requests -= summary.get('http_requests', 0)
-        history = history[:-len(summary.get('results', []))] if summary.get('results') else history
+        history = history[:history_before_batch]
         batch_rows.pop()
         accept_batch(batch_number, batch_dir, seeds, summary, summary_path)
+        if (target_indexed_count is not None
+                and len(state_rows(state)[0]) >= target_indexed_count):
+            stop_reason = 'indexed_track_target_reached'
+            break
         if requests > max_requests:
             stop_reason = 'global_request_budget_exhausted'
             break
     if stop_reason is None and attempted_count >= target_attempt_count:
         stop_reason = 'attempt_budget_reached'
+    if (stop_reason is None and target_indexed_count is not None
+            and len(state_rows(state)[0]) >= target_indexed_count):
+        stop_reason = 'indexed_track_target_reached'
     if stop_reason is None and requests >= max_requests:
         stop_reason = 'request_budget_reached'
     final_progress = save_progress(stop_reason)
@@ -596,6 +767,7 @@ def run_expansion(*, track_snapshot, identity_map_path, baseline_state_path,
         'virtual_state_only': True, 'persisted_database_updated': False,
         'persisted_indexed_pid_count': None,
         'final_virtual_state_sha256': state['state_sha256'],
+        **({'deadline': deadline} if deadline is not None else {}),
         'baseline_root_graph_preserved': all(
             next((row['ordered_target_pids'] for row in roots if row['root_pid'] == old['root_pid']), None)
             == old['ordered_target_pids'] for old in original_roots),
@@ -618,11 +790,18 @@ def main():
     parser.add_argument('--prefetched-plan', type=Path,
                         help='Original seed plan whose hash is recorded by a prefetched collector')
     parser.add_argument('--seed-video-evidence', type=Path)
+    parser.add_argument('--known-video-only', action='store_true',
+                        help='Select only eligible roots with strict saved-video evidence')
     parser.add_argument('--seed-plan', type=Path,
                         help='Explicit plan to run in chunks; every PID must have strict saved-video evidence')
     parser.add_argument('--candidate-limit', type=int, default=25)
     parser.add_argument('--max-requests', type=int, default=450)
     parser.add_argument('--max-attempts', type=int, default=DEFAULT_ATTEMPT_BUDGET)
+    parser.add_argument('--interval', type=float, default=5,
+                        help='Minimum seconds between request starts (2..60)')
+    parser.add_argument('--target-indexed-count', type=int,
+                        help='Stop when the virtual state contains this many indexed tracks')
+    parser.add_argument('--deadline', help='Optional timezone-aware ISO timestamp for the last allowed request')
     parser.add_argument('--batch-size', type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument('--unindexed-per-batch', type=int, default=DEFAULT_UNINDEXED_PER_BATCH)
     parser.add_argument('--exclude-pid', action='append', default=[])
@@ -638,9 +817,12 @@ def main():
             auth_path=args.auth, prefetched_batch=args.prefetched_batch,
             prefetched_plan=args.prefetched_plan,
             seed_video_evidence_path=args.seed_video_evidence,
+            known_video_only=args.known_video_only,
             seed_plan_override_path=args.seed_plan,
             candidate_limit=args.candidate_limit,
             max_requests=args.max_requests, max_attempts=args.max_attempts,
+            interval=args.interval, target_indexed_count=args.target_indexed_count,
+            deadline=args.deadline,
             batch_size=args.batch_size, unindexed_per_batch=args.unindexed_per_batch,
             exclude_pids=excluded)
     except Exception as error:

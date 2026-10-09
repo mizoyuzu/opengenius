@@ -133,7 +133,8 @@ def plan_index_expansion(tracks, library_hash, state, relations, count, excluded
     # label. This dampens repeated selection from prolific artists while keeping
     # the raw-label-only policy free of alias or genre inference.
     previously_sampled = roots | excluded_pids
-    artist_loads = Counter(by_pid[pid]['artist'] for pid in previously_sampled)
+    artist_loads = Counter(by_pid[pid]['artist'] for pid in previously_sampled
+                           if by_pid[pid].get('artist'))
     target_quota = count - unindexed_count
     chosen_target = _round_robin(target_candidates, by_pid, target_quota,
                                   artist_loads, library_hash)

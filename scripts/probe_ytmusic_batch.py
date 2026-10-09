@@ -152,6 +152,24 @@ class AuthenticationUnconfirmed(Exception):
     pass
 
 
+class CollectionDeadlineReached(Exception):
+    """Raised before sending an HTTP request at or after the configured deadline."""
+
+
+def parse_deadline(value):
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError('deadline must be a timezone-aware ISO timestamp')
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+    except ValueError:
+        raise ValueError('deadline must be a timezone-aware ISO timestamp') from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError('deadline must be a timezone-aware ISO timestamp')
+    return parsed
+
+
 def verify_account(client):
     try:
         account = client.get_account_info()
@@ -163,9 +181,18 @@ def verify_account(client):
     return True
 
 
-def create_paced_session(interval, request_budget):
+def create_paced_session(interval, request_budget, deadline=None, deadline_clock=None):
     # Keep requests optional for local-only planning.
     import requests
+    if isinstance(deadline, str) or deadline is None:
+        deadline_at = parse_deadline(deadline)
+    elif isinstance(deadline, datetime):
+        deadline_at = deadline
+    else:
+        raise ValueError('deadline must be a timezone-aware ISO timestamp')
+    if deadline_at is not None and (deadline_at.tzinfo is None or deadline_at.utcoffset() is None):
+        raise ValueError('deadline must be a timezone-aware ISO timestamp')
+    now = deadline_clock or (lambda: datetime.now(timezone.utc))
 
     class PacedSession(requests.Session):
         def __init__(self):
@@ -177,6 +204,12 @@ def create_paced_session(interval, request_budget):
                 raise RuntimeError('Request budget exhausted')
             if self.last_start is not None:
                 time.sleep(max(0, interval - (time.monotonic() - self.last_start)))
+            if deadline_at is not None:
+                current = now()
+                if current.tzinfo is None or current.utcoffset() is None:
+                    raise ValueError('deadline clock must return a timezone-aware timestamp')
+                if current >= deadline_at:
+                    raise CollectionDeadlineReached('Collection deadline reached before request')
             self.last_start = time.monotonic()
             self.count += 1
             kwargs['timeout'] = 25
@@ -260,6 +293,7 @@ def main():
                         help='Radio candidate observation window (25..100); seed search and watch request stay at 25')
     parser.add_argument('--interval', type=float, default=5, help='Minimum seconds between HTTP request starts')
     parser.add_argument('--request-budget', type=int, default=45)
+    parser.add_argument('--deadline', help='Optional timezone-aware ISO timestamp; stop before requests at or after it')
     args = parser.parse_args()
     output = args.output.resolve()
     if (args.bundle is None) == (args.track_snapshot is None):
@@ -270,6 +304,10 @@ def main():
             or not math.isfinite(args.interval)
             or args.interval < 2 or not 1 <= args.request_budget <= 100):
         parser.error('seeds: 1..20; candidate-limit: 25..100; interval: finite and >=2; request-budget: 1..100')
+    try:
+        deadline_at = parse_deadline(args.deadline)
+    except ValueError:
+        parser.error('--deadline must be a timezone-aware ISO timestamp')
     if args.language != 'en' and not args.plan_only and not args.seed_observations:
         parser.error('Filtered songs search requires --language en with the current YTMusic adapter; localized shelf headings may be discarded')
     output.mkdir(parents=True, exist_ok=True)
@@ -281,7 +319,11 @@ def main():
               'request_budget': args.request_budget, 'identity_status': 'unverified',
               'radio_candidate_limit': args.candidate_limit,
               'radio_window_note': 'The service may paginate or return fewer candidates; added coverage is uncertain.'}
+    if args.deadline is not None:
+        report['deadline'] = args.deadline
+        report['deadline_stop_at'] = None
     session = None
+    active_seed_pid, active_seed_request_start = None, 0
     try:
         tracks, library_hash, provenance = load_library(args.bundle, args.track_snapshot)
         report['library_sha256'] = library_hash
@@ -346,6 +388,8 @@ def main():
             manifest['seed_plan_sha256'] = seed_plan_hash
         if args.candidate_limit != 25:
             manifest['candidate_limit'] = args.candidate_limit
+        if args.deadline is not None:
+            manifest['deadline'] = args.deadline
         manifest_path = output / 'seeds.json'
         if manifest_path.exists():
             if json.loads(manifest_path.read_text()) != manifest:
@@ -359,12 +403,14 @@ def main():
             return 0
         from ytmusicapi import YTMusic
 
-        session = create_paced_session(args.interval, args.request_budget)
+        session = create_paced_session(args.interval, args.request_budget, deadline=deadline_at)
         client = YTMusic(str(args.auth), requests_session=session, language=args.language, location='JP')
         report['account_authentication_verified'] = verify_account(client)
         print('Authenticated account response confirmed; no account identity stored.', flush=True)
         cached = CachedClient(client, cache)
         for seed in seeds:
+            active_seed_pid = seed['persistent_id']
+            active_seed_request_start = session.count
             path = output / (seed['persistent_id'] + '.json')
             if path.exists():
                 snapshot = json.loads(path.read_text())
@@ -420,6 +466,14 @@ def main():
     except Exception as error:
         report['status'] = 'stopped'
         report['error_type'] = type(error).__name__  # Never store exception text/headers.
+        if isinstance(error, CollectionDeadlineReached):
+            report['deadline_stop_at'] = datetime.now(timezone.utc).isoformat()
+            if (active_seed_pid is not None and session is not None
+                    and session.count > active_seed_request_start
+                    and not any(row.get('persistent_id') == active_seed_pid
+                                for row in report['results'])):
+                report['results'].append({'persistent_id': active_seed_pid,
+                                          'status': 'deadline_partial'})
         frames = traceback.extract_tb(error.__traceback__)
         if frames:
             last = frames[-1]
