@@ -11,12 +11,13 @@ import sqlite3
 
 from decrypt_genius import derive_key, decrypt_pages, extract_key_header, validate_database
 from genius_format import parse_config, parse_metadata, parse_similarities
+from genius_sync_revision import revisions_for_assignments, patch_expanded_library
 from inspect_music_library import decode_musicdb, parse_tracks
 from music_identity_map import IdentityMap, load_library
 from plan_genius_update import make_synthetic_state, plan_genius_update, PRODUCER, _hash
 from prepare_music_genius_state import inspect_state_pair
 from rewrite_genius import encrypt_pages, table_snapshot
-from rewrite_music_ids import encode_library, patch_ids
+from rewrite_music_ids import encode_library
 
 CORE = ('Library.musicdb', 'Library Preferences.musicdb', 'Genius.itdb')
 
@@ -86,7 +87,15 @@ def update_sql(clear, baseline, next_state):
                 raise ValueError('Unexpected SQL or schema change')
             if connection.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
                 raise ValueError('Updated database integrity failed')
-        return connection.serialize(), expected
+        return (clear if expected == before else connection.serialize()), expected
+
+
+def update_library_sync(expanded, state):
+    """Refresh IDs and content revisions, including existing relation-only updates."""
+    ids, metadata, relations = state_rows(state)
+    assignments = [dict(persistent_id=pid, genius_id=gid) for pid, gid in ids.items()]
+    revisions = revisions_for_assignments(assignments, metadata, relations)
+    return patch_expanded_library(expanded, assignments, revisions)
 
 
 def update_bundle(files, baseline, roots, matcher, library_hash, identity_hash, executable,
@@ -110,19 +119,25 @@ def update_bundle(files, baseline, roots, matcher, library_hash, identity_hash, 
     if not pair['key_headers_match']:
         raise ValueError('Library key headers differ')
     key, _ = derive_key(executable, extract_key_header(files['Library Preferences.musicdb']))
-    clear, expected_tables = update_sql(decrypt_pages(files['Genius.itdb'], key), baseline, plan['next_state'])
-    encrypted = encrypt_pages(clear, key)
-    recovered = decrypt_pages(encrypted, key)
+    source_clear = decrypt_pages(files['Genius.itdb'], key)
+    clear, expected_tables = update_sql(source_clear, baseline, plan['next_state'])
+    if clear == source_clear:
+        encrypted, recovered = files['Genius.itdb'], source_clear
+    else:
+        encrypted = encrypt_pages(clear, key)
+        recovered = decrypt_pages(encrypted, key)
     counts = validate_database(recovered)
     with sqlite3.connect(':memory:') as connection:
         connection.deserialize(recovered)
         if table_snapshot(connection) != expected_tables:
             raise ValueError('Encrypted SQL round trip differs')
-    assignments = [dict(persistent_id=pid, genius_id=f'{ids[pid]:016X}') for pid in plan['new_pids']]
-    changes = []
+    patched, revision_changes = update_library_sync(expanded, plan['next_state'])
+    changes = [dict(persistent_id=change['persistent_id'],
+                    genius_id=f"{ids[change['persistent_id']]:016X}",
+                    expanded_offset=change['expanded_revision_offset'] - 0x68 + 0xCC)
+               for change in revision_changes if change['persistent_id'] in plan['new_pids']]
     library = files['Library.musicdb']
-    if assignments:
-        patched, changes = patch_ids(expanded, assignments)
+    if patched != expanded:
         library = encode_library(patched, library, allow_unverified_profile=allow_unverified_profile)
     saved, _ = parse_tracks(decode_musicdb(library))
     if {t['persistent_id']: t for t in saved} != {
@@ -133,6 +148,9 @@ def update_bundle(files, baseline, roots, matcher, library_hash, identity_hash, 
         raise ValueError('Local Genius state changed')
     report = dict(schema_version=1, **plan['audit'], library_track_count=len(saved),
                   changed_relation_rows=len(plan['relation_deltas']), changed_id_slots=changes,
+                  changed_sync_revision_slots=revision_changes,
+                  sync_revision_algorithm='opengenius-crc32-v1',
+                  sync_revision_track_count=len(ids),
                   source_file_sha256={name: sha(blob) for name, blob in files.items()},
                   output_file_sha256={name: sha(blob) for name, blob in output.items()},
                   config_and_auxiliary_tables_preserved=True, local_genius_state_preserved=True,

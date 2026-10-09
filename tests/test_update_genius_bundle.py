@@ -9,10 +9,12 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from genius_format import pack_config
+from genius_format import pack_similarities
 from music_identity_map import IdentityMap, build_map
 from plan_genius_update import make_synthetic_state, plan_genius_update, _seal
 from rewrite_genius import table_snapshot
-from update_genius_bundle import update_sql, state_rows, read_bundle
+from update_genius_bundle import update_sql, state_rows, read_bundle, update_library_sync
+import struct
 import tempfile
 
 
@@ -50,6 +52,9 @@ class IncrementalSqlTests(unittest.TestCase):
 
     def test_preserves_config_old_metadata_schema_and_original_bytes(self):
         source, before = self.database()
+        no_op, no_op_tables = update_sql(source, self.old, self.old)
+        self.assertEqual(no_op, source)
+        self.assertEqual(no_op_tables, before)
         updated, expected = update_sql(source, self.old, self.new)
         with sqlite3.connect(':memory:') as c:
             c.deserialize(updated)
@@ -62,6 +67,7 @@ class IncrementalSqlTests(unittest.TestCase):
             c.deserialize(source)
             self.assertEqual(table_snapshot(c), before)
         again, after = update_sql(updated, self.new, self.new)
+        self.assertEqual(again, updated)
         self.assertEqual(after, expected)
 
     def test_baseline_mismatch_auxiliary_data_and_trigger_side_effect_refused(self):
@@ -85,6 +91,40 @@ class IncrementalSqlTests(unittest.TestCase):
             invalid = _seal({k: v for k, v in invalid.items() if k != 'state_sha256'})
             with self.subTest(field=field), self.assertRaises(ValueError):
                 update_sql(source, self.old, invalid)
+
+    def test_relation_only_state_refreshes_revision_and_is_idempotent(self):
+        ids, _, relations = state_rows(self.old)
+        target_pid = next(pid for pid, gid in ids.items() if relations[gid] != pack_similarities(0, []))
+        target_gid = ids[target_pid]
+        changed = copy.deepcopy(self.old)
+        row = next(row for row in changed['rows'] if row['genius_id'] == target_gid)
+        row['similarities_hex'] = pack_similarities(0, []).hex()
+        changed = _seal({key: value for key, value in changed.items() if key != 'state_sha256'})
+        self.assertEqual(set(state_rows(changed)[0]), set(ids))
+
+        records = bytearray(12 + 3 * 376)
+        records[:4] = b'ltma'
+        struct.pack_into('<II', records, 4, 12, 3)
+        pids = list(ids) + [self.pids[3]]
+        for index, pid_value in enumerate(pids):
+            offset = 12 + index * 376
+            records[offset:offset + 4] = b'itma'
+            struct.pack_into('<II', records, offset + 4, 376, 376)
+            struct.pack_into('<Q', records, offset + 16, int(pid_value, 16))
+        unindexed_offset = 12 + 2 * 376
+        struct.pack_into('<I', records, unindexed_offset + 0x68, 0x12345678)
+
+        original, _ = update_library_sync(bytes(records), self.old)
+        refreshed, changes = update_library_sync(original, changed)
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]['persistent_id'], target_pid)
+        self.assertEqual(struct.unpack_from('<I', refreshed, 12 + pids.index(target_pid) * 376 + 0xCC)[0], target_gid)
+        self.assertNotEqual(struct.unpack_from('<I', refreshed, 12 + pids.index(target_pid) * 376 + 0x68)[0],
+                            struct.unpack_from('<I', original, 12 + pids.index(target_pid) * 376 + 0x68)[0])
+        self.assertEqual(struct.unpack_from('<I', refreshed, unindexed_offset + 0x68)[0], 0x12345678)
+        again, no_changes = update_library_sync(refreshed, changed)
+        self.assertEqual(again, refreshed)
+        self.assertEqual(no_changes, [])
 
     def test_bundle_reader_preserves_nested_files_and_rejects_symlinks(self):
         with tempfile.TemporaryDirectory() as directory:
