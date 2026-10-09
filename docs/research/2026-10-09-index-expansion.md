@@ -45,6 +45,6 @@ Music.appとiPodの検証はユーザーが別環境で実施済みと報告し�
 
 出力は `data/incremental-bundle-20261009-v01/Music Library.musiclibrary`。独立監査は `data/incremental-bundle-20261009-v01-independent-audit.json`。全61起点のオフライン評価は `data/ytmusic/index-expansion-evaluation-20261009-v01.json` に保存した。
 
-次の20起点は `data/ytmusic/index-expansion-next-plan-20261009-v01.json`。すべて登録済みでincoming-onlyの曲を選び、検索未解決などの試行済みPIDを除外した。collectorのplan-onlyによる受理を確認済みで、この次バッチのHTTP取得はまだ行っていない。
+次の20起点は `data/ytmusic/index-expansion-next-plan-20261009-v01.json`。すべて登録済みでincoming-onlyの曲を選び、検索未解決などの試行済みPIDを除外した。この時点ではcollectorのplan-onlyによる受理まで確認した。その後の連続取得・実DB保存は[大量拡張の記録](2026-10-09-large-index-expansion.md)にまとめた。
 
 新規計画と監査の14テスト、既存のDB updaterの5テストが通過。個人の観測・DB・認証情報はGitの追跡対象外に置く。

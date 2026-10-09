@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import requests
@@ -83,6 +84,9 @@ class BatchTests(unittest.TestCase):
             manifest = json.loads((output / 'seeds.json').read_text())
             self.assertEqual(manifest['seed_plan_sha256'], hashlib.sha256(plan.read_bytes()).hexdigest())
             self.assertEqual(manifest['selection'], 'explicit_diverse_library_seed_plan')
+            self.assertNotIn('seed_video_evidence_sha256', manifest)
+            self.assertNotIn('seed_video_evidence_sources', manifest)
+            self.assertNotIn('candidate_limit', manifest)
             self.assertEqual(manifest['seeds'][0]['title'], track['title'])
             self.assertEqual(manifest['seeds'][0]['seed_series'], 'Series')
             summary = json.loads(next(output.glob('summary-*.json')).read_text())
@@ -95,6 +99,80 @@ class BatchTests(unittest.TestCase):
                     main()
                 self.assertEqual(rejected.exception.code, 2)
                 library.assert_not_called()
+
+    def test_candidate_limit_expands_radio_only_and_records_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            track = {'persistent_id': '0000000000000001', 'title': 'Original song', 'artist': 'Artist',
+                     'album': 'Album', 'duration_ms': 100000}
+            snapshot = root / 'tracks.json'
+            snapshot.write_text(json.dumps({'source_sha256': 'a' * 64, 'tracks': [track]}))
+            plan = root / 'plan.json'
+            plan.write_text(json.dumps({'schema_version': 1, 'source_library_sha256': 'a' * 64, 'seeds': [
+                {'persistent_id': track['persistent_id'], 'series': 'Series', 'sample_kind': 'track'}]}))
+            output = root / 'experiment'
+            video = {'videoId': 'seedvideo01', 'title': track['title'],
+                     'artists': [{'name': track['artist']}], 'duration_seconds': 100}
+            calls = []
+
+            class FakeMusicClient:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def get_account_info(self):
+                    return {'accountName': 'private'}
+
+                def search(self, **kwargs):
+                    calls.append(('search', kwargs))
+                    return [video]
+
+                def get_watch_playlist(self, **kwargs):
+                    calls.append(('watch', kwargs.copy()))
+                    return {'tracks': [video], 'related': None}
+
+            class FakeSession:
+                count = 0
+
+            argv = ['probe', '--track-snapshot', str(snapshot), '--seed-plan', str(plan), '--seeds', '1',
+                    '--candidate-limit', '100', '--output', str(output), '--auth', str(root / 'absent-auth')]
+            with patch.dict(sys.modules, {'ytmusicapi': SimpleNamespace(YTMusic=FakeMusicClient)}), \
+                    patch.object(sys, 'argv', argv), patch('sys.stdout', new=io.StringIO()), \
+                    patch('probe_ytmusic_batch.create_paced_session', return_value=FakeSession()):
+                self.assertEqual(main(), 0)
+
+            manifest = json.loads((output / 'seeds.json').read_text())
+            self.assertEqual(manifest['candidate_limit'], 100)
+            search_args = next(kwargs for endpoint, kwargs in calls if endpoint == 'search')
+            self.assertEqual(search_args['limit'], 5)
+            watch_args = [kwargs for endpoint, kwargs in calls if endpoint == 'watch']
+            self.assertEqual([(row['radio'], row['limit']) for row in watch_args], [(True, 100), (False, 25)])
+            saved = json.loads((output / (track['persistent_id'] + '.json')).read_text())
+            evidence_watch = [e['arguments'] for e in saved['request_evidence']
+                              if e['endpoint'] == 'get_watch_playlist']
+            self.assertEqual([(row['radio'], row['limit']) for row in evidence_watch], [(True, 100), (False, 25)])
+
+            # A new observation window cannot silently resume the same output folder.
+            changed_argv = argv.copy()
+            changed_argv[changed_argv.index('--candidate-limit') + 1] = '50'
+            with patch.dict(sys.modules, {'ytmusicapi': SimpleNamespace(YTMusic=FakeMusicClient)}), \
+                    patch.object(sys, 'argv', changed_argv), patch('sys.stdout', new=io.StringIO()), \
+                    patch('probe_ytmusic_batch.create_paced_session', side_effect=AssertionError('No HTTP')):
+                self.assertEqual(main(), 1)
+
+    def test_candidate_limit_validation_precedes_library_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for limit in ('24', '101'):
+                argv = ['probe', str(root / 'library'), '--candidate-limit', limit,
+                        '--output', str(root / 'output'), '--plan-only']
+                with self.subTest(limit=limit), patch.object(sys, 'argv', argv), \
+                        patch('sys.stderr', new=io.StringIO()), \
+                        patch('probe_ytmusic_batch.load_library') as load:
+                    with self.assertRaises(SystemExit) as stopped:
+                        main()
+                    self.assertEqual(stopped.exception.code, 2)
+                    load.assert_not_called()
+            self.assertFalse((root / 'output').exists())
 
     def test_redirects_stop_without_an_unpaced_followup_send(self):
         for status in (300, 301, 302, 303, 304, 307, 308):

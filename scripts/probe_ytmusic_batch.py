@@ -16,6 +16,7 @@ import traceback
 
 from music_identity_map import IdentityMap, group_candidate_observations, load_library
 from probe_ytmusic import collect, local_candidates, normalize
+from seed_video_evidence import select_seed_video_evidence
 
 
 SAFE_KEYS = {'videoId', 'title', 'artists', 'name', 'id', 'album', 'length',
@@ -215,6 +216,10 @@ class CachedClient:
         return self.call('search', kwargs)
 
     def get_watch_playlist(self, **kwargs):
+        # The candidate window applies to radio results only. Preserve the
+        # fixed seed watch request used to discover the related-browse ID.
+        if not kwargs.get('radio'):
+            kwargs['limit'] = 25
         return self.call('get_watch_playlist', kwargs)
 
     def get_song_related(self, browse_id):
@@ -244,11 +249,15 @@ def main():
     seed_source = parser.add_mutually_exclusive_group()
     seed_source.add_argument('--seed-observations', type=Path, help='Saved search observations; re-match seeds without new searches')
     seed_source.add_argument('--seed-plan', type=Path, help='Explicit Library PID plan; must contain exactly --seeds records')
+    parser.add_argument('--seed-video-evidence', type=Path,
+                        help='Validated sidecar of saved radio video IDs for exact Library PIDs')
     parser.add_argument('--auth', type=Path, default=Path('../browser.json'))
     parser.add_argument('--output', type=Path, required=True, help='Experiment directory; reuse to resume cached requests')
     parser.add_argument('--plan-only', action='store_true', help='Select local seeds without network access')
     parser.add_argument('--language', choices=('ja', 'en'), default='en')
     parser.add_argument('--seeds', type=int, default=10)
+    parser.add_argument('--candidate-limit', type=int, default=25,
+                        help='Radio candidate observation window (25..100); seed search and watch request stay at 25')
     parser.add_argument('--interval', type=float, default=5, help='Minimum seconds between HTTP request starts')
     parser.add_argument('--request-budget', type=int, default=45)
     args = parser.parse_args()
@@ -257,9 +266,10 @@ def main():
         parser.error('Specify either bundle or --track-snapshot')
     if (args.bundle and output.is_relative_to(args.bundle.resolve())) or output == args.auth.resolve():
         parser.error('output must be outside the library and auth file')
-    if (not 1 <= args.seeds <= 20 or not math.isfinite(args.interval)
+    if (not 1 <= args.seeds <= 20 or not 25 <= args.candidate_limit <= 100
+            or not math.isfinite(args.interval)
             or args.interval < 2 or not 1 <= args.request_budget <= 100):
-        parser.error('seeds: 1..20; interval: finite and >=2; request-budget: 1..100')
+        parser.error('seeds: 1..20; candidate-limit: 25..100; interval: finite and >=2; request-budget: 1..100')
     if args.language != 'en' and not args.plan_only and not args.seed_observations:
         parser.error('Filtered songs search requires --language en with the current YTMusic adapter; localized shelf headings may be discarded')
     output.mkdir(parents=True, exist_ok=True)
@@ -268,7 +278,9 @@ def main():
     report = {'schema_version': 1, 'account_authentication_verified': False,
               'status': 'running', 'results': [], 'http_requests': 0,
               'minimum_request_interval_seconds': args.interval,
-              'request_budget': args.request_budget, 'identity_status': 'unverified'}
+              'request_budget': args.request_budget, 'identity_status': 'unverified',
+              'radio_candidate_limit': args.candidate_limit,
+              'radio_window_note': 'The service may paginate or return fewer candidates; added coverage is uncertain.'}
     session = None
     try:
         tracks, library_hash, provenance = load_library(args.bundle, args.track_snapshot)
@@ -297,6 +309,29 @@ def main():
         else:
             seeds = select_seeds(tracks, args.seeds)
             selection = 'distinct_exact_artist_and_album_labels'
+        seed_video_evidence_hash, seed_video_sources = None, []
+        if args.seed_video_evidence:
+            if matcher is None or map_hash is None:
+                raise ValueError('Seed-video evidence requires the identity map')
+            evidence_bytes = args.seed_video_evidence.read_bytes()
+            evidence_doc = json.loads(evidence_bytes)
+            hints = select_seed_video_evidence(
+                evidence_doc, args.seed_video_evidence, seeds, tracks, matcher,
+                library_hash, map_hash)
+            seed_video_evidence_hash = hashlib.sha256(evidence_bytes).hexdigest()
+            for seed in seeds:
+                hint = hints.get(seed['persistent_id'])
+                if hint:
+                    seed.update(seed_video_id=hint['video_id'],
+                                seed_video_source=hint['source'],
+                                seed_video_evidence_input_path=hint['input_path'],
+                                seed_video_evidence_input_sha256=hint['input_sha256'])
+                    seed_video_sources.append({
+                        'persistent_id': seed['persistent_id'],
+                        'video_id': hint['video_id'], 'source': hint['source'],
+                        'input_path': hint['input_path'],
+                        'input_sha256': hint['input_sha256'],
+                    })
         if not seeds:
             raise ValueError('No usable seeds')
         manifest = {'library_sha256': library_hash, 'library_input': provenance,
@@ -304,8 +339,13 @@ def main():
                     'language': args.language, 'seeds': seeds,
                     'seed_evidence_sha256': seed_evidence_hash,
                     'selection': selection}
+        if args.seed_video_evidence:
+            manifest['seed_video_evidence_sha256'] = seed_video_evidence_hash
+            manifest['seed_video_evidence_sources'] = seed_video_sources
         if args.seed_plan:
             manifest['seed_plan_sha256'] = seed_plan_hash
+        if args.candidate_limit != 25:
+            manifest['candidate_limit'] = args.candidate_limit
         manifest_path = output / 'seeds.json'
         if manifest_path.exists():
             if json.loads(manifest_path.read_text()) != manifest:
@@ -332,7 +372,9 @@ def main():
                 cached.evidence = []
                 if seed.get('seed_video_id'):
                     ids = {seed['seed_video_id']}
-                    candidate_count, seed_status = 1, 'unique_metadata_candidate_unverified'
+                    candidate_count = 1
+                    seed_status = seed.get('seed_video_source',
+                                           'unique_metadata_candidate_unverified')
                 else:
                     found = cached.search(query=seed['title'] + ' ' + seed['artist'], filter='songs', limit=5)
                     selected_video, candidate_count, seed_status = resolve_seed_search(found, seed, tracks, matcher)
@@ -343,7 +385,7 @@ def main():
                                           'candidate_video_ids': candidate_count}), flush=True)
                         continue
                     ids = {selected_video}
-                snapshot = collect(cached, seed, tracks, next(iter(ids)), 25,
+                snapshot = collect(cached, seed, tracks, next(iter(ids)), args.candidate_limit,
                                    candidate_matcher=matcher.match if matcher else None)
                 snapshot['library_sha256'] = library_hash
                 snapshot['library_input'] = provenance

@@ -52,7 +52,7 @@ class PlanIndexExpansionTests(unittest.TestCase):
                                            self.state, self.relations, 3)
         selected = [seed['persistent_id'] for seed in plan['seeds']]
         self.assertEqual(selected[:2], self.pids[1:3])
-        self.assertEqual(selected[2], self.pids[4])
+        self.assertIn(selected[2], self.pids[4:6])
         self.assertEqual([seed['sample_kind'] for seed in plan['seeds']],
                          ['indexed_target_only_no_outgoing_relation'] * 2 + ['unindexed_track'])
         self.assertEqual(self.tracks, untouched)
@@ -66,7 +66,8 @@ class PlanIndexExpansionTests(unittest.TestCase):
         state = self.make_state(graph, self.pids[:2])
         relations = self.make_relations(graph, state)
         plan, audit = plan_index_expansion(self.tracks, self.library_hash, state, relations, 2)
-        self.assertEqual([seed['persistent_id'] for seed in plan['seeds']], self.pids[4:6])
+        self.assertEqual(len(plan['seeds']), 2)
+        self.assertTrue(set(seed['persistent_id'] for seed in plan['seeds']) <= set(self.pids[3:6]))
         self.assertEqual(audit['current_directed_relation_count'], 0)
         self.assertEqual(audit['selected_indexed_target_only_count'], 0)
 
@@ -92,6 +93,47 @@ class PlanIndexExpansionTests(unittest.TestCase):
         self.assertNotIn(self.pids[4], selected)
         self.assertEqual(audit['excluded_counts']['previously_attempted_pid'], 2)
         self.assertEqual(audit['excluded_pids'], sorted([self.pids[1], self.pids[4]]))
+
+    def test_unindexed_quota_selects_new_frontiers_and_is_deterministic(self):
+        first, audit = plan_index_expansion(
+            self.tracks, self.library_hash, self.state, self.relations, 3,
+            unindexed_count=1)
+        second, _ = plan_index_expansion(
+            self.tracks, self.library_hash, self.state, self.relations, 3,
+            unindexed_count=1)
+        self.assertEqual(first, second)
+        self.assertEqual(audit['requested_unindexed_seed_count'], 1)
+        self.assertEqual(audit['selected_unindexed_track_count'], 1)
+        self.assertEqual(audit['selected_indexed_target_only_count'], 2)
+        reasons = [seed['sample_kind'] for seed in first['seeds']]
+        self.assertEqual(reasons.count('unindexed_track'), 1)
+        self.assertEqual(reasons.count('indexed_target_only_no_outgoing_relation'), 2)
+
+    def test_unavailable_unindexed_quota_is_filled_by_incoming_targets(self):
+        tracks = copy.deepcopy(self.tracks)
+        tracks[5]['duration_ms'] = 0
+        state = self.make_state(self.graph, self.pids[:4], tracks=tracks)
+        relations = self.make_relations(self.graph, state)
+        plan, audit = plan_index_expansion(
+            tracks, self.library_hash, state, relations, 3, unindexed_count=2)
+        self.assertEqual(audit['requested_unindexed_seed_count'], 2)
+        self.assertEqual(audit['selected_unindexed_track_count'], 1)
+        self.assertEqual(audit['selected_indexed_target_only_count'], 2)
+        self.assertIn(self.pids[1], [seed['persistent_id'] for seed in plan['seeds']])
+        self.assertIn(self.pids[2], [seed['persistent_id'] for seed in plan['seeds']])
+
+    def test_artist_with_fewer_observed_roots_is_preferred_over_alphabetical_order(self):
+        tracks = copy.deepcopy(self.tracks)
+        tracks[0]['artist'] = 'A Artist'
+        tracks[1]['artist'] = 'A Artist'
+        tracks[2]['artist'] = 'Z Artist'
+        tracks[3]['artist'] = 'A Artist'
+        graph = {self.pids[0]: [self.pids[1], self.pids[2]], self.pids[3]: []}
+        state = self.make_state(graph, self.pids[:4], tracks=tracks)
+        relations = self.make_relations(graph, state)
+        plan, _ = plan_index_expansion(tracks, self.library_hash, state, relations, 1)
+        # A Artist sorts first, but already has two observed roots in this fixture.
+        self.assertEqual(plan['seeds'][0]['persistent_id'], self.pids[2])
 
     def test_unknown_or_duplicate_excluded_pids_are_rejected(self):
         for excluded in ([self.pids[1], self.pids[1]], ['FFFFFFFFFFFFFFFF'], 'not-a-list'):
@@ -132,6 +174,10 @@ class PlanIndexExpansionTests(unittest.TestCase):
             with self.subTest(count=count), self.assertRaises(ValueError):
                 plan_index_expansion(self.tracks, self.library_hash,
                                      self.state, self.relations, count)
+        for unindexed_count in (-1, 3, True):
+            with self.subTest(unindexed_count=unindexed_count), self.assertRaises(ValueError):
+                plan_index_expansion(self.tracks, self.library_hash, self.state,
+                                     self.relations, 2, unindexed_count=unindexed_count)
 
     def test_audit_describes_synthetic_evidence_without_db_trust_claim(self):
         _, audit = plan_index_expansion(self.tracks, self.library_hash,

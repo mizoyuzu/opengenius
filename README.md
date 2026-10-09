@@ -548,3 +548,4 @@ Webビューの `--track-context` で曲の詳細と作品名検索に使える�
 
 Geniusの登録曲・出方向の関連性を増やす際は、次の起点計画と保存後のDB監査を使える。
 [継続バッチとindex拡張の検証](docs/research/2026-10-09-index-expansion.md)。
+大量取得には[予算付き連続バッチと保存済み動画IDの利用](docs/research/2026-10-09-large-index-expansion.md)を使える。
