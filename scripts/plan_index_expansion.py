@@ -104,7 +104,9 @@ def plan_index_expansion(tracks, library_hash, state, relations, count, excluded
     graph = _validate_relation_document(relations, by_pid, state, state_ids,
                                         state_relations, library_hash)
     incoming = Counter(target for targets in graph.values() for target in targets)
-    roots = set(graph)
+    # Explicit empty rows represent indexed incoming targets, not observed
+    # recommendation roots. Treat only nonempty outgoing rows as sampled.
+    roots = {pid for pid, targets in graph.items() if targets}
     indexed = set(state_ids)
     target_only = (set(incoming) & indexed) - roots
     unindexed = set(by_pid) - indexed

@@ -173,6 +173,11 @@ def feedback_context(evaluation):
         'input_provenance_sha256': provenance_hashes,
         'input_provenance_observation_sha256': provenance_observations,
     }
+    affinity = evaluation.get('affinity_preference') or _common_root_value(evaluation, 'affinity_preference')
+    # Absent and neutral preserve historical feedback contexts; active reranks
+    # are separate conditions even when they happen to return the same order.
+    if affinity not in (None, 'neutral'):
+        semantic['affinity_preference'] = affinity
     encoded = json.dumps(semantic, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
     return hashlib.sha256(encoded).hexdigest()
 

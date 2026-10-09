@@ -111,6 +111,25 @@ class BatchEvaluationTests(unittest.TestCase):
         self.assertEqual(len(FakeCore.instances), 1)
         self.assertEqual(len(FakeCore.instances[0].calls), 2)
 
+    def test_application_affinity_reranks_only_generated_pids_and_keeps_observed_paths(self):
+        self.tracks[0]['album'] = 'Seed Album'
+        self.tracks[2]['album'] = 'Another Album'
+        self.tracks[3]['album'] = 'Seed Album'
+        graph = self.graph(1, [4, 3])
+        original = evaluate_graphs([graph], self.matcher, config(), 'unused', core_factory=FakeCore)
+        tuned = evaluate_graphs([graph], self.matcher, config(), 'unused', core_factory=FakeCore,
+                                affinity_preference='moderate')
+        before, after = original['root_results'][0], tuned['root_results'][0]
+        self.assertEqual(before['playlist_pids'], [f'{1:016X}', f'{4:016X}', f'{3:016X}'])
+        self.assertEqual(after['playlist_pids'], [f'{1:016X}', f'{3:016X}', f'{4:016X}'])
+        self.assertEqual(after['core_result']['result_genius_ids'], before['core_result']['result_genius_ids'])
+        self.assertEqual(after['playlist'][1]['observed_relation_hops'], 1)
+        self.assertEqual(after['playlist'][1]['observed_relation_path'], [f'{1:016X}', f'{3:016X}'])
+        self.assertEqual(set(after['playlist_pids']), set(before['playlist_pids']))
+        self.assertFalse(after['native_selection_order_verified'])
+        self.assertEqual(after['selection_policy'], 'application_seed_affinity')
+        self.assertEqual(tuned['relation_rows'], original['relation_rows'])
+
     def test_root_subset_calls_only_selected_core_with_full_metadata_and_two_hops(self):
         class ExpandedCore(FakeCore):
             def generate(self, root, limit):

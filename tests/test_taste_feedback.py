@@ -188,6 +188,15 @@ class TasteFeedbackTests(unittest.TestCase):
         self.assertEqual(compared['baseline']['counts']['fits'], 1)
         self.assertEqual(compared['variant']['counts']['fits'], 1)
 
+    def test_affinity_conditions_are_distinct_without_invalidating_neutral_feedback(self):
+        neutral = copy.deepcopy(self.evaluation)
+        neutral['affinity_preference'] = 'neutral'
+        self.assertEqual(feedback_context(neutral), self.context)
+        slight = {**neutral, 'affinity_preference': 'slight'}
+        moderate = {**neutral, 'affinity_preference': 'moderate'}
+        self.assertNotEqual(feedback_context(slight), self.context)
+        self.assertNotEqual(feedback_context(moderate), feedback_context(slight))
+
     def test_bounded_fallback_settings_change_feedback_context(self):
         report = copy.deepcopy(self.evaluation)
         report['cluster_scope'].update(mode='prefer', fallback_tags=['Game', 'Ambient'], fallback_limit=2)

@@ -74,6 +74,24 @@ class ClusterSelectionTests(unittest.TestCase):
         self.assertEqual(result['relation_rows'][0]['ordered_target_pids'], self.pids[1:3])
         self.assertEqual(result['root_overlaps'], [])
 
+    def test_affinity_preference_is_forwarded_as_a_separate_selection_control(self):
+        result, _ = self.evaluate(affinity_preference='moderate')
+        self.assertEqual(result['affinity_preference'], 'moderate')
+        self.assertEqual(result['root_results'][0]['affinity_preference'], 'moderate')
+        self.assertEqual(result['root_results'][0]['application_affinity']['preference'], 'moderate')
+
+    def test_affinity_composition_keeps_preferred_scope_ahead_of_closer_fallback(self):
+        by_pid = {track['persistent_id']: track for track in self.matcher.tracks}
+        by_pid[self.pids[0]].update(artist='Seed Artist', album='Seed Album')
+        by_pid[self.pids[1]].update(artist='Seed Artist', album='Seed Album')
+        by_pid[self.pids[2]].update(artist='Different Artist', album='Different Album')
+        result, _ = self.evaluate(affinity_preference='moderate')
+        row = result['root_results'][0]
+        self.assertEqual(row['playlist_pids'], [self.pids[0], self.pids[2], self.pids[1]])
+        self.assertTrue(row['post_composition_affinity']['preferred_before_fallback_preserved'])
+        self.assertEqual(row['post_composition_affinity']['policy'],
+                         'bounded_affinity_with_preferred_scope_before_fallback')
+
     def test_bounded_fallback_counts_nonroot_only_and_restricts_family(self):
         result, _ = self.evaluate(fallback_limit=0)
         self.assertEqual(result['root_results'][0]['playlist_pids'], [self.pids[0], self.pids[2]])

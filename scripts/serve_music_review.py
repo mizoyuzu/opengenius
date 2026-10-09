@@ -180,7 +180,7 @@ class ReviewSession:
     def evaluate(self, payload):
         if self.engine is None:
             raise ValueError('Offline evaluation inputs were not configured')
-        if not isinstance(payload, dict) or set(payload) - {'tags', 'kind', 'excluded_kinds', 'profile', 'root_pid', 'artist_preference', 'cluster_mode'}:
+        if not isinstance(payload, dict) or set(payload) - {'tags', 'kind', 'excluded_kinds', 'profile', 'root_pid', 'artist_preference', 'affinity_preference', 'cluster_mode'}:
             raise ValueError('Invalid evaluation fields')
         tags, kind = payload.get('tags', []), payload.get('kind')
         profile = payload.get('profile', PROFILES[0])
@@ -189,6 +189,9 @@ class ReviewSession:
         artist_preference = payload.get('artist_preference', 'moderate')
         if artist_preference not in ('neutral', 'slight', 'moderate'):
             raise ValueError('Unsupported artist preference')
+        affinity_preference = payload.get('affinity_preference', 'neutral')
+        if affinity_preference not in ('neutral', 'slight', 'moderate'):
+            raise ValueError('Unsupported affinity preference')
         graphs, matcher, config, executable, provenance = self.engine
         labels = classify_tracks(self.config, self.tracks, self.library_hash)
         mode = payload.get('cluster_mode', 'only')
@@ -204,13 +207,13 @@ class ReviewSession:
         evaluated, scope = evaluate_clusters(graphs, matcher, config, executable, labels,
                                     tags=tags, kind=kind, excluded_kinds=payload.get('excluded_kinds', []), mode=mode,
                                     profile=profile, root_pids=[root] if root is not None else None,
-                                    artist_preference=artist_preference)
+                                    artist_preference=artist_preference, affinity_preference=affinity_preference)
         report = {'schema_version': 1, 'library_sha256': self.library_hash, 'library_input': self.provenance,
                   'cluster_config_sha256': self.config_hash(),
                   'cluster_config_semantic_sha256': self.config_hash(), 'cluster_config': copy.deepcopy(self.config),
                   'cluster_scope': scope, 'cluster_mode': mode,
                   'input_provenance': provenance, 'profile': profile,
-                  'artist_preference': artist_preference, **evaluated,
+                  'artist_preference': artist_preference, 'affinity_preference': affinity_preference, **evaluated,
                   'network_requests': 0, 'identity_status': 'unverified',
                   'music_app_acceptance_verified': False, 'ipod_acceptance_verified': False}
         path = self._save('evaluation', report)

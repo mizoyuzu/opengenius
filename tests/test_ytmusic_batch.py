@@ -144,6 +144,7 @@ class BatchTests(unittest.TestCase):
 
             manifest = json.loads((output / 'seeds.json').read_text())
             self.assertEqual(manifest['candidate_limit'], 100)
+            self.assertNotIn('seed_query_fallback', manifest)
             search_args = next(kwargs for endpoint, kwargs in calls if endpoint == 'search')
             self.assertEqual(search_args['limit'], 5)
             watch_args = [kwargs for endpoint, kwargs in calls if endpoint == 'watch']
@@ -160,6 +161,66 @@ class BatchTests(unittest.TestCase):
                     patch.object(sys, 'argv', changed_argv), patch('sys.stdout', new=io.StringIO()), \
                     patch('probe_ytmusic_batch.create_paced_session', side_effect=AssertionError('No HTTP')):
                 self.assertEqual(main(), 1)
+
+    def test_opt_in_title_fallback_is_single_cached_query_and_uses_same_strict_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            track = {'persistent_id': '0000000000000001', 'title': 'Exact Song', 'artist': 'Exact Artist',
+                     'album': 'Exact Album', 'duration_ms': 100000}
+            snapshot = root / 'tracks.json'
+            snapshot.write_text(json.dumps({'source_sha256': 'a' * 64, 'tracks': [track]}))
+            plan = root / 'plan.json'
+            plan.write_text(json.dumps({'schema_version': 1, 'source_library_sha256': 'a' * 64, 'seeds': [
+                {'persistent_id': track['persistent_id'], 'series': 'Series', 'sample_kind': 'track'}]}))
+            output = root / 'experiment'
+            calls = []
+            exact = {'videoId': 'seedvideo01', 'title': track['title'],
+                     'artists': [{'name': track['artist']}], 'album': {'name': track['album']},
+                     'duration_seconds': 100}
+            unrelated = {'videoId': 'othervideo01', 'title': 'Different Song',
+                         'artists': [{'name': 'Different Artist'}], 'duration_seconds': 100}
+
+            class FakeMusicClient:
+                def __init__(self, *args, **kwargs):
+                    pass
+                def get_account_info(self):
+                    return {'accountName': 'private'}
+                def search(self, **kwargs):
+                    calls.append(('search', kwargs.copy()))
+                    return [exact] if kwargs['query'] == track['title'] else [unrelated]
+                def get_watch_playlist(self, **kwargs):
+                    calls.append(('watch', kwargs.copy()))
+                    return {'tracks': [exact], 'related': None}
+
+            class FakeSession:
+                count = 0
+
+            argv = ['probe', '--track-snapshot', str(snapshot), '--seed-plan', str(plan), '--seeds', '1',
+                    '--seed-query-fallback', '--output', str(output), '--auth', str(root / 'absent-auth')]
+            with patch.dict(sys.modules, {'ytmusicapi': SimpleNamespace(YTMusic=FakeMusicClient)}), \
+                    patch.object(sys, 'argv', argv), patch('sys.stdout', new=io.StringIO()), \
+                    patch('probe_ytmusic_batch.create_paced_session', return_value=FakeSession()):
+                self.assertEqual(main(), 0)
+
+            searches = [kwargs for endpoint, kwargs in calls if endpoint == 'search']
+            self.assertEqual(searches, [
+                {'query': track['title'] + ' ' + track['artist'], 'filter': 'songs', 'limit': 5},
+                {'query': track['title'], 'filter': 'songs', 'limit': 5},
+            ])
+            manifest = json.loads((output / 'seeds.json').read_text())
+            self.assertTrue(manifest['seed_query_fallback'])
+            saved = json.loads((output / (track['persistent_id'] + '.json')).read_text())
+            self.assertEqual(saved['seed_identity_status'], 'unique_metadata_candidate_unverified')
+            self.assertEqual(saved['selected_video_id'], 'seedvideo01')
+            self.assertTrue(saved['seed_query_fallback_used'])
+            evidence_queries = [row['arguments']['query'] for row in saved['request_evidence']
+                               if row['endpoint'] == 'search']
+            self.assertEqual(evidence_queries, [track['title'] + ' ' + track['artist'], track['title']])
+            cached_searches = [json.loads(path.read_text()) for path in (output / 'requests').glob('*.json')
+                               if json.loads(path.read_text())['endpoint'] == 'search']
+            self.assertEqual({row['arguments']['query'] for row in cached_searches}, set(evidence_queries))
+            self.assertTrue(all(row['arguments']['filter'] == 'songs' and row['arguments']['limit'] == 5
+                                for row in cached_searches))
 
     def test_candidate_limit_validation_precedes_library_access(self):
         with tempfile.TemporaryDirectory() as directory:

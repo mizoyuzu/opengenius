@@ -186,9 +186,9 @@ def _validate_catalog_seed_row(row, sidecar_dir, tracks, matcher,
             or type(source_key.get('track_position')) is not int
             or source_key['track_position'] < 1):
         raise ValueError('Invalid album-catalog request key provenance')
-    response_path = _resolve_source(row['input_path'], sidecar_dir)
+    catalog_response_path = _resolve_source(row['input_path'], sidecar_dir)
     try:
-        response_bytes = response_path.read_bytes()
+        response_bytes = catalog_response_path.read_bytes()
         if _sha(response_bytes) != row['input_sha256']:
             raise ValueError('Album-catalog response hash changed')
         cached = json.loads(response_bytes)
@@ -249,15 +249,15 @@ def _validate_catalog_seed_row(row, sidecar_dir, tracks, matcher,
                     or not isinstance(source['arguments'].get('query'), str)):
                 raise ValueError('Malformed saved album-search browse-ID provenance')
             evidence_path = _resolve_source(source['evidence_path'], sidecar_dir)
-            response_path = _resolve_source(source['response_path'], sidecar_dir)
+            search_response_path = _resolve_source(source['response_path'], sidecar_dir)
             try:
                 evidence_bytes = evidence_path.read_bytes()
-                response_bytes = response_path.read_bytes()
+                search_response_bytes = search_response_path.read_bytes()
                 if (_sha(evidence_bytes) != source['evidence_sha256']
-                        or _sha(response_bytes) != source['response_sha256']):
+                        or _sha(search_response_bytes) != source['response_sha256']):
                     raise ValueError('Saved album-search source hash changed')
                 evidence_doc = json.loads(evidence_bytes)
-                response_doc = json.loads(response_bytes)
+                response_doc = json.loads(search_response_bytes)
                 result = response_doc['response'][source['result_position']]
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError):
                 raise ValueError('Saved album-search source is unreadable') from None
@@ -302,7 +302,7 @@ def _validate_catalog_seed_row(row, sidecar_dir, tracks, matcher,
                     or sorted([list(credit) for credit in remote_credits]) != declared_credits
                     or row['persistent_id'] not in search_candidate.get('candidate_pids', [])):
                 raise ValueError('Album-search artist/title evidence no longer uniquely matches the local track')
-            source_identity = (str(response_path), source['response_sha256'], source['result_position'])
+            source_identity = (str(search_response_path), source['response_sha256'], source['result_position'])
             if source_identity in seen_sources:
                 raise ValueError('Duplicate saved album-search provenance')
             seen_sources.add(source_identity)
@@ -344,7 +344,7 @@ def _validate_catalog_seed_row(row, sidecar_dir, tracks, matcher,
                 or observation['track'].get('video_id') != source.get('source_video_id')):
             raise ValueError('Album browse ID was not read from the saved radio album field')
     return {'persistent_id': row['persistent_id'], 'video_id': row['video_id'],
-            'input_path': str(response_path), 'input_sha256': row['input_sha256'],
+            'input_path': str(catalog_response_path), 'input_sha256': row['input_sha256'],
             'source_relation': 'album_catalog_candidate', 'album_id': row['album_id']}
 
 
@@ -555,8 +555,8 @@ def main():
             if not source_path.is_absolute():
                 source_path = Path(__file__).resolve().parents[1] / source_path
             paths.append({'input': {**source, 'path': str(source_path.resolve())}})
-    if not paths:
-        parser.error('Supply at least one --snapshot or --snapshot-directory')
+    if not paths and not args.catalog_evidence:
+        parser.error('Supply at least one --snapshot or --snapshot-directory, or --catalog-evidence')
     document = build_seed_video_evidence(paths, matcher, library_hash, map_hash)
     document['identity_map_input_sha256'] = map_hash
     if args.catalog_evidence:

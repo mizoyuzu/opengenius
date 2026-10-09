@@ -15,7 +15,8 @@ from probe_ytmusic_batch import main as batch_main
 from seed_video_evidence import (PRODUCER, build_seed_video_evidence,
                                  combine_seed_video_evidence,
                                  select_seed_video_evidence,
-                                 validate_album_catalog_evidence)
+                                 validate_album_catalog_evidence,
+                                 main as evidence_main)
 
 
 LIBRARY_HASH = 'a' * 64
@@ -197,10 +198,10 @@ class SeedVideoEvidenceTests(unittest.TestCase):
                          str(self.source_path.resolve()))
 
     def catalog_fixture(self, *, persistent_id='0000000000000002', video=CATALOG_VIDEO,
-                        duration=100, album='Album', relation='radio'):
+                        duration=100, album='Album', relation='radio', map_hash=MAP_HASH):
         tracks = [track(), track('0000000000000002', 'Catalog song')]
         matcher = IdentityMap(build_map(tracks, LIBRARY_HASH), tracks, LIBRARY_HASH)
-        source = snapshot(map_hash=MAP_HASH)
+        source = snapshot(map_hash=map_hash)
         source['observations'][0]['track']['album']['id'] = ALBUM_ID
         source['observations'][0]['track']['album']['name'] = 'Album'
         source['observations'][0]['relation'] = relation
@@ -228,7 +229,7 @@ class SeedVideoEvidenceTests(unittest.TestCase):
                 'source_video_id': source['observations'][0]['track']['video_id']}]}
         catalog = {'schema_version': 1,
             'producer': 'opengenius-album-catalog-seed-evidence-v1',
-            'library_sha256': LIBRARY_HASH, 'identity_map_sha256': MAP_HASH,
+            'library_sha256': LIBRARY_HASH, 'identity_map_sha256': map_hash,
             'source_plan_producer': 'opengenius-saved-radio-album-plan-v1',
             'album_plan_sha256': 'c' * 64, 'rows': [row],
             'catalog_observations': [{'relation': 'album_catalog_candidate'}],
@@ -256,6 +257,33 @@ class SeedVideoEvidenceTests(unittest.TestCase):
         self.assertEqual(hints['0000000000000002']['source_relation'], 'album_catalog_candidate')
         self.assertEqual(hints['0000000000000002']['source'],
                          'saved_album_catalog_metadata_candidate_unverified')
+
+    def test_catalog_evidence_alone_can_build_seed_video_sidecar(self):
+        tracks = [track(), track('0000000000000002', 'Catalog song')]
+        map_path = self.root / 'identity-map.json'
+        map_path.write_text(json.dumps(build_map(tracks, LIBRARY_HASH)), encoding='utf-8')
+        map_hash = hashlib.sha256(map_path.read_bytes()).hexdigest()
+        tracks_path = self.root / 'tracks.json'
+        tracks_path.write_text(json.dumps({'source_sha256': LIBRARY_HASH,
+                                           'tracks': tracks}), encoding='utf-8')
+        _, _, catalog, catalog_path = self.catalog_fixture(map_hash=map_hash)
+        output_path = self.root / 'catalog-only-seed-evidence.json'
+        argv = ['seed-video-evidence', '--track-snapshot', str(tracks_path),
+                '--identity-map', str(map_path), '--catalog-evidence', str(catalog_path),
+                '--output', str(output_path)]
+        with patch('sys.argv', argv), patch('sys.stdout', new=io.StringIO()):
+            self.assertEqual(evidence_main(), None)
+        output = json.loads(output_path.read_text(encoding='utf-8'))
+        self.assertEqual(output['audit']['radio_observation_count'], 0)
+        self.assertEqual(output['audit']['edges_created'], 0)
+        self.assertEqual(output['audit']['accepted_seed_video_count'], 1)
+        hints = select_seed_video_evidence(
+            output, output_path, tracks, tracks,
+            IdentityMap(build_map(tracks, LIBRARY_HASH), tracks, LIBRARY_HASH),
+            LIBRARY_HASH, map_hash)
+        self.assertEqual(hints['0000000000000002']['video_id'], CATALOG_VIDEO)
+        self.assertEqual(hints['0000000000000002']['source_relation'],
+                         'album_catalog_candidate')
 
     def test_album_catalog_hint_accepts_separately_typed_saved_search_provenance(self):
         tracks, matcher, catalog, catalog_path = self.catalog_fixture()
@@ -289,9 +317,13 @@ class SeedVideoEvidenceTests(unittest.TestCase):
         source['evidence_sha256'] = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
         catalog['rows'][0]['source_album_id_inputs'] = [source]
         catalog_path.write_text(json.dumps(catalog), encoding='utf-8')
+        original_catalog_input = catalog['rows'][0]['input_path']
+        original_catalog_hash = catalog['rows'][0]['input_sha256']
         validated = validate_album_catalog_evidence(
             catalog, catalog_path, tracks, matcher, LIBRARY_HASH, MAP_HASH)
         self.assertEqual(validated[0]['persistent_id'], '0000000000000002')
+        self.assertEqual(validated[0]['input_path'], str(Path(original_catalog_input).resolve()))
+        self.assertEqual(validated[0]['input_sha256'], original_catalog_hash)
 
     def test_album_catalog_rejects_search_result_browse_id_mismatch(self):
         tracks, matcher, catalog, catalog_path = self.catalog_fixture()

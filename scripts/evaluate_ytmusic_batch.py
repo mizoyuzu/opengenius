@@ -195,12 +195,13 @@ def relation_distances(root_pid, edges):
     return _relation_tree(root_pid, edges)[0]
 
 
-def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=None, profile='without-compatible-genre', root_pids=None, artist_preference='neutral', id_space_roots=None):
+def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=None, profile='without-compatible-genre', root_pids=None, artist_preference='neutral', affinity_preference='neutral', id_space_roots=None):
     """Generate selected roots while retaining the full observed graph and ID space."""
     if not 1 <= limit <= 100:
         raise ValueError('Limit must be 1..100')
     if profile not in ('without-compatible-genre', 'relations-only', 'artist-album-minimum-one'):
         raise ValueError('Unsupported configuration profile')
+    from genius_profiles import seed_affinity_order
     roots = merge_graphs(graphs)
     selected_roots = roots
     if root_pids is not None:
@@ -241,12 +242,18 @@ def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=
             playlist = [by_id[int(identifier, 16)] for identifier in generated['result_genius_ids']]
             result['status'] = 'generated'
         distances, parents = _relation_tree(root['root_pid'], edges)
+        playlist, affinity = seed_affinity_order(playlist, matcher.tracks, matcher, root['root_pid'],
+                                                 affinity_preference, distances)
         credits = [matcher.artist_credits(tracks[pid].get('artist') or '') for pid in playlist]
         adjacent = sum(left == right for left, right in zip(credits, credits[1:]))
+        affinity_by_pid = {item['persistent_id']: item for item in affinity['candidates']}
         result.update(core_result=generated, playlist_pids=playlist,
                       playlist=[{'persistent_id': pid, 'title': tracks[pid].get('title'),
                                  'artist': tracks[pid].get('artist'), 'observed_relation_hops': distances.get(pid),
                                  'observed_relation_path': _observed_path(pid, parents),
+                                 'seed_artist_credit_match': affinity_by_pid[pid]['artist_credit_match'],
+                                 'seed_album_title_match': affinity_by_pid[pid]['album_title_match'],
+                                 'seed_affinity_rank_movement': affinity_by_pid[pid]['rank_movement'],
                                  'identity_status': 'unverified'} for pid in playlist],
                       direct_candidate_count=sum(distances.get(pid) == 1 for pid in playlist),
                       indirect_candidate_count=sum(distances.get(pid, 0) > 1 for pid in playlist),
@@ -254,6 +261,9 @@ def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=
                       generated_count=len(playlist), generated_nonroot_count=sum(pid != root['root_pid'] for pid in playlist),
                       unique_artist_count=len(set(credits)), adjacent_same_artist_count=adjacent,
                       adjacent_same_artist_rate=adjacent / (len(credits) - 1) if len(credits) > 1 else None,
+                      affinity_preference=affinity_preference, application_affinity=affinity,
+                      selection_policy=('application_seed_affinity' if affinity['changed'] else 'music_core_order'),
+                      native_selection_order_verified=False,
                       identity_status='unverified')
         results.append(result)
     root_pids = {root['root_pid'] for root in roots}
@@ -266,7 +276,7 @@ def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=
                              'nonroot_playlist_pid_jaccard': jaccard(set(left['playlist_pids']) - root_pids,
                                                                     set(right['playlist_pids']) - root_pids)})
     return {'temporary_id_mapping': mapping, 'root_results': results, 'root_overlaps': overlaps,
-            'artist_preference': artist_preference,
+            'artist_preference': artist_preference, 'affinity_preference': affinity_preference,
             'controlled_config_sha256': hashlib.sha256(controlled).hexdigest(),
             'relation_rows': [{'root_pid': root['root_pid'], 'ordered_target_pids': root['ordered_target_pids']} for root in roots],
             'shared_metadata_count': len(metadata), 'total_instructions': core.steps if core is not None else 0}
@@ -274,7 +284,7 @@ def evaluate_graphs(graphs, matcher, config, executable, limit=25, core_factory=
 
 def evaluate_graph_comparison(baseline_graphs, expanded_graphs, matcher, config, executable,
                               limit=25, core_factory=None, profile='without-compatible-genre',
-                              root_pids=None, artist_preference='neutral'):
+                              root_pids=None, artist_preference='neutral', affinity_preference='neutral'):
     """Hold IDs and metadata groups fixed; each side retains only its own edges.
 
     Both sides use the union of observed nodes, including empty relation rows
@@ -293,7 +303,8 @@ def evaluate_graph_comparison(baseline_graphs, expanded_graphs, matcher, config,
         raise ValueError('Comparison root subset must be observed on both sides')
     universe = [*baseline_roots, *expanded_roots]
     options = dict(limit=limit, core_factory=core_factory, profile=profile, root_pids=selected,
-                   artist_preference=artist_preference, id_space_roots=universe)
+                   artist_preference=artist_preference, affinity_preference=affinity_preference,
+                   id_space_roots=universe)
     baseline = evaluate_graphs(baseline_graphs, matcher, config, executable, **options)
     expanded = evaluate_graphs(expanded_graphs, matcher, config, executable, **options)
     if (baseline['temporary_id_mapping'] != expanded['temporary_id_mapping']
@@ -363,6 +374,8 @@ def main():
     parser.add_argument('--profile', choices=('without-compatible-genre', 'relations-only', 'artist-album-minimum-one'),
                         default='without-compatible-genre')
     parser.add_argument('--artist-preference', choices=('neutral', 'slight', 'moderate'), default='neutral')
+    parser.add_argument('--affinity-preference', choices=('neutral', 'slight', 'moderate'), default='neutral',
+                        help='bounded app-level artist-credit and album-title reranking of generated tracks')
     args = parser.parse_args()
     if (args.cluster_tag or args.track_kind or args.exclude_kind) and not args.cluster_config:
         parser.error('Cluster scope requires --cluster-config')
@@ -413,11 +426,13 @@ def main():
     if baseline_graphs is not None:
         comparison = evaluate_graph_comparison(baseline_graphs, graphs, matcher, config, paths['executable'],
                                                args.limit, profile=args.profile, root_pids=args.root_pid,
-                                               artist_preference=args.artist_preference)
+                                               artist_preference=args.artist_preference,
+                                               affinity_preference=args.affinity_preference)
         evaluation = comparison['expanded']
     else:
         evaluation = evaluate_graphs(graphs, matcher, config, paths['executable'], args.limit, profile=args.profile,
-                                     root_pids=args.root_pid, artist_preference=args.artist_preference)
+                                     root_pids=args.root_pid, artist_preference=args.artist_preference,
+                                     affinity_preference=args.affinity_preference)
     report = {'schema_version': 1, 'library_sha256': library_hash, 'library_input': provenance,
               'input_sha256': {'track_snapshot': provenance['snapshot_sha256'], 'identity_map': hashlib.sha256(map_data).hexdigest(),
                                'seed_manifest': manifest_hash, 'genius_reference': hashlib.sha256(reference).hexdigest(),
@@ -432,6 +447,7 @@ def main():
                                   'empty_candidates': 'No MusicCore call; empty playlist',
                                   'observed_relation_hops': 'Shortest directed path from root; not a Music core execution trace; null if unreachable',
                                   'artist_metrics': 'Canonical artist credit sets; complete generated playlist including seed',
+                                  'affinity_policy': 'Optional bounded rerank of generated tracks using exact nonempty seed artist credits and normalized full album titles; generic Various Artists album labels do not match; observed graph and shortest directed hops remain unchanged',
                                   'overlap': 'PID set Jaccard; empty union is null; nonroot overlap excludes all batch roots'},
               'network_requests': 0, 'account_authentication_rechecked': False, 'identity_status': 'unverified', 'verified_recordings': 0,
               'music_app_acceptance_verified': False, 'ipod_acceptance_verified': False}

@@ -225,6 +225,12 @@ class ReviewTests(unittest.TestCase):
             result = self.session.evaluate({'root_pid': pid})
             self.assertEqual(evaluate.call_args.kwargs['artist_preference'], 'moderate')
             self.assertEqual(result['evaluation']['artist_preference'], 'moderate')
+            self.assertEqual(evaluate.call_args.kwargs['affinity_preference'], 'neutral')
+            tuned = self.session.evaluate({'root_pid': pid, 'affinity_preference': 'slight'})
+            self.assertEqual(evaluate.call_args.kwargs['affinity_preference'], 'slight')
+            self.assertEqual(tuned['evaluation']['affinity_preference'], 'slight')
+            with self.assertRaisesRegex(ValueError, 'affinity'):
+                self.session.evaluate({'root_pid': pid, 'affinity_preference': 'strong'})
             neutral = self.session.evaluate({'root_pid': pid, 'artist_preference': 'neutral'})
             self.assertEqual(evaluate.call_args.kwargs['artist_preference'], 'neutral')
             self.assertEqual(neutral['evaluation']['artist_preference'], 'neutral')

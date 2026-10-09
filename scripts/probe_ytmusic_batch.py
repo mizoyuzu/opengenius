@@ -291,6 +291,8 @@ def main():
     parser.add_argument('--seeds', type=int, default=10)
     parser.add_argument('--candidate-limit', type=int, default=25,
                         help='Radio candidate observation window (25..100); seed search and watch request stay at 25')
+    parser.add_argument('--seed-query-fallback', action='store_true',
+                        help='After an unresolved title+artist search, try one cached title-only songs search (limit 5) with the same strict identity matcher')
     parser.add_argument('--interval', type=float, default=5, help='Minimum seconds between HTTP request starts')
     parser.add_argument('--request-budget', type=int, default=45)
     parser.add_argument('--deadline', help='Optional timezone-aware ISO timestamp; stop before requests at or after it')
@@ -388,6 +390,8 @@ def main():
             manifest['seed_plan_sha256'] = seed_plan_hash
         if args.candidate_limit != 25:
             manifest['candidate_limit'] = args.candidate_limit
+        if args.seed_query_fallback:
+            manifest['seed_query_fallback'] = True
         if args.deadline is not None:
             manifest['deadline'] = args.deadline
         manifest_path = output / 'seeds.json'
@@ -422,13 +426,34 @@ def main():
                     seed_status = seed.get('seed_video_source',
                                            'unique_metadata_candidate_unverified')
                 else:
-                    found = cached.search(query=seed['title'] + ' ' + seed['artist'], filter='songs', limit=5)
+                    full_query = seed['title'] + ' ' + seed['artist']
+                    found = cached.search(query=full_query, filter='songs', limit=5)
                     selected_video, candidate_count, seed_status = resolve_seed_search(found, seed, tracks, matcher)
+                    fallback_attempted = False
+                    fallback_candidate_count = None
+                    if (selected_video is None and args.seed_query_fallback
+                            and seed['title'] != full_query):
+                        # One additional query only, and exactly the same strict
+                        # identity/credit/duration matcher. Never accept a looser
+                        # title resemblance as an edge or seed identity.
+                        fallback_attempted = True
+                        fallback = cached.search(query=seed['title'], filter='songs', limit=5)
+                        selected_video, fallback_candidate_count, fallback_status = resolve_seed_search(
+                            fallback, seed, tracks, matcher)
+                        if selected_video is not None:
+                            candidate_count = fallback_candidate_count
+                            seed_status = fallback_status
                     if selected_video is None:
                         report['results'].append({'persistent_id': seed['persistent_id'],
-                                                  'status': 'search_unresolved', 'candidate_video_ids': candidate_count})
+                                                  'status': 'search_unresolved', 'candidate_video_ids': candidate_count,
+                                                  'title_fallback_attempted': fallback_attempted,
+                                                  **({'title_fallback_candidate_video_ids': fallback_candidate_count}
+                                                     if fallback_attempted else {})})
                         print(json.dumps({'seed': seed['persistent_id'], 'status': 'search_unresolved',
-                                          'candidate_video_ids': candidate_count}), flush=True)
+                                          'candidate_video_ids': candidate_count,
+                                          'title_fallback_attempted': fallback_attempted,
+                                          **({'title_fallback_candidate_video_ids': fallback_candidate_count}
+                                             if fallback_attempted else {})}), flush=True)
                         continue
                     ids = {selected_video}
                 snapshot = collect(cached, seed, tracks, next(iter(ids)), args.candidate_limit,
@@ -456,6 +481,11 @@ def main():
                                 observation['observed_at'] = evidence['observed_at']
                 snapshot['seed_identity_status'] = seed_status
                 snapshot['seed_search_candidate_video_count'] = candidate_count
+                if not seed.get('seed_video_id'):
+                    snapshot['seed_query_fallback_enabled'] = args.seed_query_fallback
+                    snapshot['seed_query_fallback_used'] = bool(
+                        args.seed_query_fallback and len(cached.evidence) > 1
+                        and cached.evidence[1].get('endpoint') == 'search')
                 snapshot['account_authentication_verified'] = True
                 save(path, snapshot)
             row = {'status': 'collected', **summary(snapshot)}

@@ -61,6 +61,13 @@ class PlanIndexExpansionTests(unittest.TestCase):
         self.assertEqual(audit['selected_unindexed_track_count'], 1)
         self.assertEqual(audit['selected'][0]['current_incoming_relation_count'], 1)
 
+    def test_explicit_empty_target_rows_remain_eligible_for_outgoing_collection(self):
+        graph = {**self.graph, self.pids[1]: [], self.pids[2]: []}
+        relations = self.make_relations(graph, self.state)
+        plan, audit = plan_index_expansion(self.tracks, self.library_hash, self.state, relations, 2)
+        self.assertEqual({row['persistent_id'] for row in plan['seeds']}, set(self.pids[1:3]))
+        self.assertEqual(audit['selected_indexed_target_only_count'], 2)
+
     def test_excluded_track_without_artist_does_not_break_fairness_counts(self):
         tracks = copy.deepcopy(self.tracks)
         tracks[-1].pop('artist')
@@ -76,7 +83,7 @@ class PlanIndexExpansionTests(unittest.TestCase):
         relations = self.make_relations(graph, state)
         plan, audit = plan_index_expansion(self.tracks, self.library_hash, state, relations, 2)
         self.assertEqual(len(plan['seeds']), 2)
-        self.assertTrue(set(seed['persistent_id'] for seed in plan['seeds']) <= set(self.pids[3:6]))
+        self.assertTrue(set(seed['persistent_id'] for seed in plan['seeds']) <= set(self.pids[2:6]))
         self.assertEqual(audit['current_directed_relation_count'], 0)
         self.assertEqual(audit['selected_indexed_target_only_count'], 0)
 

@@ -10,7 +10,7 @@ from music_clusters import scope_graphs
 
 def evaluate_clusters(graphs, matcher, config, executable, classifications, *, tags=(), kind=None,
                       excluded_kinds=(), mode='only', profile='without-compatible-genre',
-                      artist_preference='moderate', root_pids=None, limit=25, core_factory=None,
+                      artist_preference='moderate', affinity_preference='neutral', root_pids=None, limit=25, core_factory=None,
                       fallback_tags=(), fallback_limit=None):
     from evaluate_ytmusic_batch import evaluate_graphs
     if fallback_limit is not None and (type(fallback_limit) is not int or not 0 <= fallback_limit <= 25):
@@ -26,6 +26,7 @@ def evaluate_clusters(graphs, matcher, config, executable, classifications, *, t
         scope.update(fallback_tags=fallback_scope['tags'], fallback_limit=fallback_limit)
 
     options = dict(profile=profile, artist_preference=artist_preference,
+                   affinity_preference=affinity_preference,
                    root_pids=root_pids, limit=limit, core_factory=core_factory)
     if mode == 'only' or not (tags or kind is not None):
         evaluated = evaluate_graphs(filtered, matcher, config, executable, **options)
@@ -61,10 +62,53 @@ def evaluate_clusters(graphs, matcher, config, executable, classifications, *, t
                 outside_count += 1
             order.append(pid)
         playlist = [items[pid] for pid in order]
+        post_composition_affinity = None
+        if affinity_preference != 'neutral' and order:
+            from genius_profiles import seed_affinity_order
+            before_affinity = list(order)
+            seed_in_order = seed in order
+            preferred_order = [pid for pid in order if pid != seed and pid in preferred]
+            fallback_order = [pid for pid in order if pid != seed and pid not in preferred]
+            hops = {item['persistent_id']: item.get('observed_relation_hops') for item in playlist}
+            if seed_in_order:
+                preferred_order, preferred_affinity = seed_affinity_order(
+                    [seed, *preferred_order], matcher.tracks, matcher, seed,
+                    affinity_preference, hops)
+                preferred_order = [pid for pid in preferred_order if pid != seed]
+            else:
+                preferred_affinity = {'version': 1, 'preference': affinity_preference,
+                                      'changed': False, 'candidates': []}
+            fallback_order, fallback_affinity = seed_affinity_order(
+                fallback_order, matcher.tracks, matcher, seed, affinity_preference, hops)
+            order = ([seed] if seed_in_order else []) + preferred_order + fallback_order
+            final_affinity = {item['persistent_id']: item for item in
+                              [*preferred_affinity.get('candidates', []),
+                               *fallback_affinity.get('candidates', [])]}
+            playlist = [items[pid] for pid in order]
+            for item in playlist:
+                detail = final_affinity.get(item['persistent_id'])
+                if detail:
+                    item['seed_artist_credit_match'] = detail['artist_credit_match']
+                    item['seed_album_title_match'] = detail['album_title_match']
+                    item['seed_affinity_rank_movement'] = detail['rank_movement']
+            post_composition_affinity = {
+                'version': 1, 'preference': affinity_preference,
+                'policy': 'bounded_affinity_with_preferred_scope_before_fallback',
+                'maximum_promoted_positions_within_scope': (
+                    preferred_affinity.get('maximum_promoted_positions', 0),
+                    fallback_affinity['maximum_promoted_positions']),
+                'preferred_scope': preferred_affinity,
+                'fallback_scope': fallback_affinity,
+                'changed': order != before_affinity,
+                'preferred_before_fallback_preserved': all(
+                    pid in preferred for pid in order[1:1 + len(preferred_order)]),
+            }
+            if not post_composition_affinity['preferred_before_fallback_preserved']:
+                raise ValueError('Affinity composition violated preferred scope priority')
         for item in playlist:
             item['cluster_preferred'] = item['persistent_id'] in preferred
-        credits = [matcher.artist_credits(next(t for t in matcher.tracks if t['persistent_id'] == pid).get('artist') or '')
-                   for pid in order]
+        tracks_by_pid = {track['persistent_id']: track for track in matcher.tracks}
+        credits = [matcher.artist_credits(tracks_by_pid[pid].get('artist') or '') for pid in order]
         adjacent = sum(left == right for left, right in zip(credits, credits[1:]))
         row.update(playlist_pids=order, playlist=playlist, generated_count=len(order),
                    generated_nonroot_count=sum(pid != seed for pid in order),
@@ -75,6 +119,7 @@ def evaluate_clusters(graphs, matcher, config, executable, classifications, *, t
                    selection_policy='user_cluster_preferred_bounded_fallback' if bounded else 'user_cluster_preferred_then_fill',
                    fallback_tags=list(fallback_tags), fallback_limit=fallback_limit,
                    core_result=None, core_passes={'preferred': early['core_result'], 'fallback': original['core_result']},
+                   post_composition_affinity=post_composition_affinity,
                    unscoped_playlist_pids=original['playlist_pids'],
                    preferred_count=sum(pid in preferred for pid in order),
                    preferred_nonroot_count=sum(pid in preferred and pid != seed for pid in order),
