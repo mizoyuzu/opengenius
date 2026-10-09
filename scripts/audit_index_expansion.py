@@ -14,6 +14,7 @@ import sqlite3
 from decrypt_genius import derive_key, decrypt_pages, extract_key_header, validate_database
 from emulate_genius import MusicCore, database_rows
 from genius_format import parse_similarities
+from genius_sync_revision import revisions_for_assignments
 from inspect_music_library import decode_musicdb, parse_tracks
 from music_identity_map import IdentityMap, load_library
 from plan_genius_update import _source
@@ -98,6 +99,98 @@ def _track_rows(files):
     return parse_tracks(decode_musicdb(files['Library.musicdb']))[0]
 
 
+def _sync_revision_audit(expanded, ids, metadata, relations, require_sync_revisions=False):
+    """Verify the saved itma revision fields against independently read SQL BLOBs."""
+    assignments = [dict(persistent_id=pid, genius_id=gid) for pid, gid in ids.items()]
+    expected = revisions_for_assignments(assignments, metadata, relations)
+    expected = {(int(pid, 16) if isinstance(pid, str) else pid): value
+                for pid, value in expected.items()}
+    start = expanded.find(b'ltma')
+    if start < 0 or start + 12 > len(expanded):
+        raise ValueError('Output Library has no ltma track list')
+    import struct
+    list_header, count = struct.unpack_from('<II', expanded, start + 4)
+    if list_header < 12 or count > 100000 or start + list_header > len(expanded):
+        raise ValueError('Output Library has invalid ltma bounds')
+    cursor = start + list_header
+    actual, seen = {}, set()
+    for _ in range(count):
+        if cursor + 24 > len(expanded) or expanded[cursor:cursor + 4] != b'itma':
+            raise ValueError('Output Library has an invalid itma record')
+        header, total = struct.unpack_from('<II', expanded, cursor + 4)
+        if header != 376 or total < header or cursor + total > len(expanded):
+            raise ValueError('Output Library has unsupported itma bounds')
+        pid = struct.unpack_from('<Q', expanded, cursor + 16)[0]
+        if pid in seen:
+            raise ValueError('Output Library has duplicate track PIDs')
+        seen.add(pid)
+        if pid in expected:
+            actual[pid] = struct.unpack_from('<I', expanded, cursor + 0x68)[0]
+        cursor += total
+    missing = set(expected) - actual.keys()
+    mismatched = [pid for pid, revision in expected.items()
+                  if pid in actual and (actual[pid] == 0 or actual[pid] != revision)]
+    nonzero = sum(value != 0 for value in actual.values())
+    matched = len(expected) - len(missing) - len(mismatched)
+    if require_sync_revisions and (missing or mismatched):
+        raise ValueError('Output Library sync revisions differ from Genius SQL BLOBs')
+    return {
+        'sync_revision_algorithm': 'opengenius-crc32-v1',
+        'sync_revision_target_count': len(expected),
+        'sync_revision_matching_count': matched,
+        'sync_revision_nonzero_count': nonzero,
+        'sync_revision_missing_count': len(missing),
+        'sync_revision_mismatch_count': len(mismatched),
+        'sync_revision_strict': bool(require_sync_revisions),
+    }
+
+
+def _library_record_offsets(expanded, label):
+    import struct
+    start = expanded.find(b'ltma')
+    if start < 0 or start + 12 > len(expanded):
+        raise ValueError(label + ' Library has no ltma track list')
+    list_header, count = struct.unpack_from('<II', expanded, start + 4)
+    if list_header < 12 or count > 100000 or start + list_header > len(expanded):
+        raise ValueError(label + ' Library has invalid ltma bounds')
+    cursor = start + list_header
+    offsets = {}
+    for _ in range(count):
+        if cursor + 24 > len(expanded) or expanded[cursor:cursor + 4] != b'itma':
+            raise ValueError(label + ' Library has an invalid itma record')
+        header, total = struct.unpack_from('<II', expanded, cursor + 4)
+        if header != 376 or total < header or cursor + total > len(expanded):
+            raise ValueError(label + ' Library has unsupported itma bounds')
+        pid = struct.unpack_from('<Q', expanded, cursor + 16)[0]
+        if pid in offsets:
+            raise ValueError(label + ' Library has duplicate track PIDs')
+        offsets[pid] = cursor
+        cursor += total
+    return offsets
+
+
+def _audit_library_change_scope(baseline_expanded, output_expanded, target_pids):
+    """Require identical expanded bytes outside target itma ID and revision fields."""
+    import struct
+    target_pids = {int(pid, 16) if isinstance(pid, str) else pid for pid in target_pids}
+    before_offsets = _library_record_offsets(baseline_expanded, 'Baseline')
+    after_offsets = _library_record_offsets(output_expanded, 'Output')
+    if before_offsets.keys() != after_offsets.keys():
+        raise ValueError('Baseline and output Library PID sets differ')
+    restored = bytearray(output_expanded)
+    for pid, offset in after_offsets.items():
+        before = before_offsets[pid]
+        if (offset != before or struct.unpack_from('<II', output_expanded, offset + 4)
+                != struct.unpack_from('<II', baseline_expanded, before + 4)):
+            raise ValueError('Library record layout changed')
+        if pid in target_pids:
+            restored[offset + 0x68:offset + 0x6C] = baseline_expanded[before + 0x68:before + 0x6C]
+            restored[offset + 0xCC:offset + 0xD0] = baseline_expanded[before + 0xCC:before + 0xD0]
+    if restored != baseline_expanded:
+        raise ValueError('Unexpected expanded Library changes outside Genius ID and sync revision fields')
+    return True
+
+
 def _sql_snapshot(clear):
     with sqlite3.connect(':memory:') as connection:
         connection.deserialize(clear)
@@ -151,7 +244,8 @@ def _core_sample(executable, config, metadata, relations, pid_to_gid, root_pids)
 
 
 def audit_bundles(baseline_bundle, output_bundle, baseline_state, output_state,
-                  track_snapshot, identity_map, executable, sample_roots=()):
+                  track_snapshot, identity_map, executable, sample_roots=(),
+                  require_sync_revisions=False):
     paths = [Path(p) for p in (baseline_bundle, output_bundle, baseline_state,
                                output_state, track_snapshot, identity_map, executable)]
     input_hashes_before = {str(path): _sha(path.read_bytes()) for path in paths
@@ -181,11 +275,20 @@ def audit_bundles(baseline_bundle, output_bundle, baseline_state, output_state,
         if base_tables[table] != out_tables[table]:
             raise ValueError('Genius configuration or auxiliary SQL rows changed')
     base_tracks, out_tracks = _track_rows(baseline_files), _track_rows(output_files)
+    baseline_expanded = decode_musicdb(baseline_files['Library.musicdb'])
+    output_expanded = decode_musicdb(output_files['Library.musicdb'])
     _assert_snapshot(base_tracks, tracks, 'Baseline')
     _assert_snapshot(out_tracks, tracks, 'Output')
     audit = audit_rows(baseline_state_doc, output_state_doc, base_config, out_config,
                        base_metadata, base_relations, out_metadata, out_relations,
                        base_tracks, out_tracks)
+    sync_audit = _sync_revision_audit(output_expanded, state_rows(output_state_doc)[0],
+                                      out_metadata, out_relations,
+                                      require_sync_revisions=require_sync_revisions)
+    sync_audit['expanded_library_change_scope_verified'] = _audit_library_change_scope(
+        baseline_expanded, output_expanded,
+        {int(pid, 16) if isinstance(pid, str) else pid
+         for pid in state_rows(output_state_doc)[0]})
     if set(baseline_files) != set(output_files):
         raise ValueError('Bundle file set changed')
     changed_files = [name for name in sorted(baseline_files)
@@ -220,6 +323,7 @@ def audit_bundles(baseline_bundle, output_bundle, baseline_state, output_state,
         'sqlite_integrity': {'baseline': 'ok', 'output': 'ok'},
         'table_counts': {'baseline': base_counts, 'output': out_counts},
         **audit,
+        **sync_audit,
         'music_core_sample': sampled,
         'network_requests': 0,
         'music_app_launched': False,
@@ -235,6 +339,8 @@ def main():
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--sample-root', action='append', default=[],
                         help='optional output-state root PID; repeat at most five times')
+    parser.add_argument('--require-sync-revisions', action='store_true',
+                        help='reject output copies whose saved itma revisions do not match Genius SQL BLOBs')
     args = parser.parse_args()
     destination = args.output.resolve()
     inputs = [getattr(args, name.replace('-', '_')).resolve() for name in
@@ -250,7 +356,7 @@ def main():
         report = audit_bundles(args.baseline_bundle, args.output_bundle,
                                args.baseline_state, args.output_state,
                                args.track_snapshot, args.identity_map, args.executable,
-                               args.sample_root)
+                               args.sample_root, require_sync_revisions=args.require_sync_revisions)
         report['input_sha256'] = {str(path): _sha(path.read_bytes()) for path in inputs
                                   if path.is_file()}
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -263,6 +369,8 @@ def main():
                       'existing_pid_count': report['existing_pid_count'],
                       'output_indexed_pid_count': report['output_indexed_pid_count'],
                       'output_directed_edge_count': report['output_directed_edge_count'],
+                      'sync_revision_matching_count': report['sync_revision_matching_count'],
+                      'sync_revision_mismatch_count': report['sync_revision_mismatch_count'],
                       'music_core_sample_count': len(report['music_core_sample'] or [])}))
 
 

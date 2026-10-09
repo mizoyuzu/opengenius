@@ -6,7 +6,9 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from audit_index_expansion import audit_rows, _core_sample
+from audit_index_expansion import (audit_rows, _core_sample, _sync_revision_audit,
+                                   _audit_library_change_scope)
+from genius_sync_revision import revisions_for_assignments
 from genius_format import pack_config
 from music_identity_map import IdentityMap, build_map
 from plan_genius_update import make_synthetic_state, plan_genius_update
@@ -119,6 +121,49 @@ class AuditIndexExpansionTests(unittest.TestCase):
                 'result_genius_ids': [f'{ids[pid(2)]:016X}', f'{ids[pid(1)]:016X}'], 'instructions': 10}
             sampled = _core_sample('unused', self.config, metadata, relations, ids, [pid(2)])
             self.assertTrue(sampled[0]['all_generated_tracks_reachable'])
+
+    def test_independent_revision_audit_reports_counts_and_strictly_rejects_mismatch(self):
+        ids, metadata, relations = state_rows(self.expanded)
+        expected = revisions_for_assignments(
+            [dict(persistent_id=pid_value, genius_id=gid) for pid_value, gid in ids.items()],
+            metadata, relations)
+        expanded = bytearray(12 + len(ids) * 376)
+        expanded[:4] = b'ltma'
+        import struct
+        struct.pack_into('<II', expanded, 4, 12, len(ids))
+        for index, (pid_value, revision) in enumerate(expected.items()):
+            offset = 12 + index * 376
+            expanded[offset:offset + 4] = b'itma'
+            struct.pack_into('<II', expanded, offset + 4, 376, 376)
+            struct.pack_into('<Q', expanded, offset + 16,
+                             int(pid_value, 16) if isinstance(pid_value, str) else pid_value)
+            struct.pack_into('<I', expanded, offset + 0x68, revision)
+        report = _sync_revision_audit(bytes(expanded), ids, metadata, relations)
+        self.assertEqual(report['sync_revision_target_count'], len(ids))
+        self.assertEqual(report['sync_revision_matching_count'], len(ids))
+        self.assertEqual(report['sync_revision_nonzero_count'], len(ids))
+        self.assertEqual(report['sync_revision_mismatch_count'], 0)
+        self.assertTrue(_audit_library_change_scope(bytes(expanded), bytes(expanded), set(ids)))
+        authorized_change = bytearray(expanded)
+        authorized_change[12 + 0x68] ^= 1
+        authorized_change[12 + 0xCC:12 + 0xD0] = b'\x07\x00\x00\x00'
+        self.assertTrue(_audit_library_change_scope(bytes(expanded), bytes(authorized_change), set(ids)))
+        opaque_mutation = bytearray(expanded)
+        opaque_mutation[12 + 0x120] ^= 1
+        with self.assertRaisesRegex(ValueError, 'outside Genius ID'):
+            _audit_library_change_scope(bytes(expanded), bytes(opaque_mutation), set(ids))
+        if len(ids) > 1:
+            non_target = bytearray(expanded)
+            non_target[12 + 376 + 0x68] ^= 1
+            one_target = {next(iter(ids))}
+            with self.assertRaisesRegex(ValueError, 'outside Genius ID'):
+                _audit_library_change_scope(bytes(expanded), bytes(non_target), one_target)
+        expanded[12 + 0x68] ^= 1
+        legacy = _sync_revision_audit(bytes(expanded), ids, metadata, relations)
+        self.assertEqual(legacy['sync_revision_mismatch_count'], 1)
+        with self.assertRaisesRegex(ValueError, 'sync revisions differ'):
+            _sync_revision_audit(bytes(expanded), ids, metadata, relations,
+                                 require_sync_revisions=True)
 
 
 if __name__ == '__main__':
