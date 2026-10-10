@@ -13,6 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from music_identity_map import IdentityMap, build_map
 from probe_ytmusic_batch import main as batch_main
 from seed_video_evidence import (PRODUCER, build_seed_video_evidence,
+                                 build_rebound_radio_hints,
+                                 build_rebound_catalog_hints,
+                                 build_combined_rebound_seed_video_evidence,
                                  combine_seed_video_evidence,
                                  select_seed_video_evidence,
                                  validate_album_catalog_evidence,
@@ -153,6 +156,306 @@ class SeedVideoEvidenceTests(unittest.TestCase):
             [self.source_path], self.matcher, LIBRARY_HASH, MAP_HASH)
         self.assertEqual(result['rows'], [])
 
+    def test_rebound_radio_hint_requires_authenticated_old_map_source_and_rematches(self):
+        self.write_snapshot(snapshot())
+        receipt = {'path': str(self.source_path.resolve()),
+                   'sha256': hashlib.sha256(self.source_path.read_bytes()).hexdigest()}
+        rows = build_rebound_radio_hints([receipt], self.matcher, LIBRARY_HASH, MAP_HASH)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['persistent_id'], PID)
+        self.assertEqual(rows[0]['video_id'], VIDEO)
+        self.assertEqual(rows[0]['source_relation'], 'rebound_radio_candidate')
+        self.assertEqual(build_rebound_radio_hints([], self.matcher, LIBRARY_HASH, MAP_HASH), [])
+        audit = {}
+        self.assertEqual(build_rebound_radio_hints(
+            [receipt], self.matcher, LIBRARY_HASH, 'f' * 64, audit=audit), [])
+        self.assertEqual(audit['foreign_source_hash_count'], 1)
+
+    def test_rebound_radio_hint_rejects_source_changed_after_transition_receipt(self):
+        receipt = {'path': str(self.source_path.resolve()), 'sha256': 'f' * 64}
+        with self.assertRaisesRegex(ValueError, 'changed after transition'):
+            build_rebound_radio_hints([receipt], self.matcher, LIBRARY_HASH, MAP_HASH)
+
+    def test_typed_rebound_sidecar_replays_sources_and_rejects_tampering(self):
+        from seed_video_evidence import (build_rebound_seed_video_evidence,
+                                         select_seed_video_evidence)
+        tracks_path = self.root / 'tracks.json'
+        tracks_path.write_text(json.dumps({'source_sha256': LIBRARY_HASH,
+                                           'tracks': self.tracks}), encoding='utf-8')
+        identity = build_map(self.tracks, LIBRARY_HASH)
+        old_map_path = self.root / 'old-map.json'
+        current_map_path = self.root / 'current-map.json'
+        old_map_path.write_text(json.dumps(identity), encoding='utf-8')
+        current_map_path.write_text(json.dumps(identity), encoding='utf-8')
+        old_hash = hashlib.sha256(old_map_path.read_bytes()).hexdigest()
+        current_hash = hashlib.sha256(current_map_path.read_bytes()).hexdigest()
+        source = snapshot(map_hash=old_hash)
+        self.write_snapshot(source)
+        source_receipt = {'path': str(self.source_path.resolve()),
+                          'sha256': hashlib.sha256(self.source_path.read_bytes()).hexdigest()}
+        transition = {}
+        for key, path in (('old_identity_map', old_map_path),
+                          ('new_identity_map', current_map_path)):
+            transition[key] = {'path': str(path.resolve()),
+                               'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        for key in ('graph_export', 'rebase_report', 'state'):
+            path = self.root / (key + '.json')
+            path.write_text(json.dumps({'artifact': key}), encoding='utf-8')
+            transition[key] = {'path': str(path.resolve()),
+                               'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        verified = {'old_identity_map_sha256': old_hash,
+                    'new_identity_map_sha256': current_hash,
+                    'library_sha256': LIBRARY_HASH,
+                    'accepted_snapshot_receipts': [source_receipt],
+                    'track_snapshot_receipt': {
+                        'path': str(tracks_path.resolve()),
+                        'sha256': hashlib.sha256(tracks_path.read_bytes()).hexdigest()}}
+        with patch('seed_video_evidence.verify_typed_map_transition',
+                   return_value=(transition, verified)):
+            document = build_rebound_seed_video_evidence(
+                track_snapshot=tracks_path, old_identity_map=old_map_path,
+                current_identity_map=current_map_path, typed_transition=transition)
+            sidecar = self.root / 'rebound.json'
+            sidecar.write_text(json.dumps(document), encoding='utf-8')
+            matcher = IdentityMap(identity, self.tracks, LIBRARY_HASH)
+            selected = select_seed_video_evidence(
+                document, sidecar, [self.tracks[0]], self.tracks, matcher,
+                LIBRARY_HASH, current_hash)
+            self.assertEqual(selected[PID]['video_id'], VIDEO)
+            self.assertEqual(document['audit']['recommendation_edges_created'], 0)
+            self.assertEqual(document['audit']['outgoing_roots_created'], 0)
+            altered = copy.deepcopy(document)
+            altered['rows'][0]['video_id'] = 'changed0001'
+            with self.assertRaisesRegex(ValueError, 'differs from its typed source replay'):
+                select_seed_video_evidence(altered, sidecar, [self.tracks[0]],
+                                           self.tracks, matcher, LIBRARY_HASH,
+                                           current_hash)
+
+    def test_typed_transition_rejects_mutated_old_or_current_map_receipts(self):
+        import types
+        from seed_video_evidence import verify_typed_map_transition
+        old_map = self.root / 'transition-old-map.json'
+        new_map = self.root / 'transition-new-map.json'
+        old_map.write_text('{}', encoding='utf-8')
+        new_map.write_text('{}', encoding='utf-8')
+        paths = {}
+        for key in ('graph_export', 'rebase_report', 'state'):
+            path = self.root / ('transition-' + key + '.json')
+            path.write_text(json.dumps({'key': key}), encoding='utf-8')
+            paths[key] = path
+        transition = {
+            'old_identity_map': {'path': str(old_map),
+                                 'sha256': hashlib.sha256(old_map.read_bytes()).hexdigest()},
+            'new_identity_map': {'path': str(new_map),
+                                 'sha256': hashlib.sha256(new_map.read_bytes()).hexdigest()},
+        }
+        transition.update({key: {'path': str(path),
+                                 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+                           for key, path in paths.items()})
+        fake_merge = types.ModuleType('merge_rebased_radio_growth')
+        fake_merge.verify_typed_identity_map_rebinding = lambda **kwargs: {
+            'old_identity_map_sha256': transition['old_identity_map']['sha256'],
+            'new_identity_map_sha256': transition['new_identity_map']['sha256'],
+            'library_sha256': LIBRARY_HASH,
+            'accepted_snapshot_receipts': [],
+            'track_snapshot_receipt': {'path': str(self.root / 'tracks.json'),
+                                       'sha256': 'a' * 64}}
+        with patch.dict(sys.modules, {'merge_rebased_radio_growth': fake_merge}):
+            old_map.write_text('{"tampered":true}', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'input changed'):
+                verify_typed_map_transition(
+                    transition, transition['old_identity_map']['sha256'],
+                    transition['new_identity_map']['sha256'], LIBRARY_HASH)
+
+    def test_typed_transition_cache_rehashes_all_sources_on_each_reuse(self):
+        import types
+        from seed_video_evidence import (_TYPED_TRANSITION_PROOF_CACHE,
+                                         verify_typed_map_transition)
+        _TYPED_TRANSITION_PROOF_CACHE.clear()
+        files = {}
+        for key in ('old_identity_map', 'new_identity_map', 'graph_export',
+                    'rebase_report', 'state', 'track_snapshot', 'accepted_snapshot',
+                    'nested_alias_decision'):
+            path = self.root / ('cached-' + key + '.json')
+            path.write_text(json.dumps({'key': key}), encoding='utf-8')
+            files[key] = path
+        transition = {
+            key: {'path': str(files[key].resolve()),
+                  'sha256': hashlib.sha256(files[key].read_bytes()).hexdigest()}
+            for key in ('old_identity_map', 'new_identity_map', 'graph_export',
+                        'rebase_report', 'state')}
+        calls = []
+        fake_merge = types.ModuleType('merge_rebased_radio_growth')
+        def verifier(**kwargs):
+            calls.append(kwargs)
+            return {
+                'verified': True, 'library_sha256': LIBRARY_HASH,
+                'old_identity_map_path': str(files['old_identity_map'].resolve()),
+                'old_identity_map_sha256': transition['old_identity_map']['sha256'],
+                'new_identity_map_path': str(files['new_identity_map'].resolve()),
+                'new_identity_map_sha256': transition['new_identity_map']['sha256'],
+                'report_path': str(files['rebase_report'].resolve()),
+                'report_sha256': transition['rebase_report']['sha256'],
+                'graph_export_path': str(files['graph_export'].resolve()),
+                'graph_export_sha256': transition['graph_export']['sha256'],
+                'state_path': str(files['state'].resolve()),
+                'state_file_sha256': transition['state']['sha256'],
+                'authenticated_observation_inputs': [{
+                    'path': str(files['accepted_snapshot'].resolve()),
+                    'sha256': hashlib.sha256(
+                        files['accepted_snapshot'].read_bytes()).hexdigest()}],
+                'track_snapshot_receipt': {
+                    'path': str(files['track_snapshot'].resolve()),
+                    'sha256': hashlib.sha256(files['track_snapshot'].read_bytes()).hexdigest()},
+                'proof_input_receipts': [
+                    {'path': str(path.resolve()),
+                     'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+                    for path in files.values()],
+            }
+        fake_merge.verify_typed_identity_map_rebinding = verifier
+        with patch.dict(sys.modules, {'merge_rebased_radio_growth': fake_merge}):
+            old_hash = transition['old_identity_map']['sha256']
+            new_hash = transition['new_identity_map']['sha256']
+            accepted_original = files['accepted_snapshot'].read_bytes()
+            verify_typed_map_transition(transition, old_hash, new_hash, LIBRARY_HASH)
+            verify_typed_map_transition(transition, old_hash, new_hash, LIBRARY_HASH)
+            self.assertEqual(len(calls), 1)
+            files['accepted_snapshot'].write_text('{"changed":true}', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'cached typed-transition source changed'):
+                verify_typed_map_transition(transition, old_hash, new_hash, LIBRARY_HASH)
+            self.assertEqual(len(calls), 1)
+            files['accepted_snapshot'].write_bytes(accepted_original)
+            verify_typed_map_transition(transition, old_hash, new_hash, LIBRARY_HASH)
+            self.assertEqual(len(calls), 2)
+            proof_original = files['nested_alias_decision'].read_bytes()
+            files['nested_alias_decision'].write_text('{"decision_changed":true}',
+                                                       encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'cached typed-transition source changed'):
+                verify_typed_map_transition(transition, old_hash, new_hash, LIBRARY_HASH)
+            self.assertEqual(len(calls), 2)
+            files['nested_alias_decision'].write_bytes(proof_original)
+            verify_typed_map_transition(transition, old_hash, new_hash, LIBRARY_HASH)
+            self.assertEqual(len(calls), 3)
+            files['new_identity_map'].write_text('{"alias_tamper":true}', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'input changed'):
+                verify_typed_map_transition(transition, old_hash, new_hash, LIBRARY_HASH)
+            self.assertEqual(len(calls), 3)
+
+    def test_legacy_transition_proof_may_omit_only_replayed_auxiliary_receipts(self):
+        from seed_video_evidence import _typed_transition_verification_matches
+        current = {'verified': True, 'old_identity_map_sha256': 'a' * 64,
+                   'new_identity_map_sha256': 'b' * 64,
+                   'proof_input_receipts': [{'path': '/proof.json',
+                                             'sha256': 'c' * 64}]}
+        legacy = {key: value for key, value in current.items()
+                  if key != 'proof_input_receipts'}
+        self.assertTrue(_typed_transition_verification_matches(legacy, current))
+        self.assertTrue(_typed_transition_verification_matches(current, current))
+        self.assertFalse(_typed_transition_verification_matches(
+            {'verified': True, 'old_identity_map_sha256': 'a' * 64}, current))
+        self.assertFalse(_typed_transition_verification_matches(
+            dict(legacy, new_identity_map_sha256='d' * 64), current))
+        self.assertFalse(_typed_transition_verification_matches(
+            dict(legacy, unverified_extra=True), current))
+
+    def test_rebound_deduplication_preserves_cached_search_release_proof(self):
+        from seed_video_evidence import _dedupe_rebound_hints
+        radio = {'persistent_id': PID, 'video_id': VIDEO,
+                 'source_relation': 'rebound_radio_candidate',
+                 'input_path': '/radio.json', 'input_sha256': 'a' * 64}
+        cached = {'persistent_id': PID, 'video_id': VIDEO,
+                  'source_relation': 'rebound_cached_search_candidate',
+                  'input_path': '/search.json', 'input_sha256': 'b' * 64,
+                  'historical_result_status': 'search_unresolved',
+                  'historical_old_identity_map_sha256': 'c' * 64}
+        merged, = _dedupe_rebound_hints([radio, cached])
+        self.assertEqual(merged['source_relation'], 'rebound_radio_candidate')
+        self.assertEqual(merged['additional_source_evidence'], [cached])
+
+    def test_combined_rebound_builder_preserves_rebound_rows_and_filters_current_conflicts(self):
+        from seed_video_evidence import REBOUND_PRODUCER, COMBINED_REBOUND_PRODUCER
+        rebound_path = self.root / 'rebound.json'
+        rebound_rows = [
+            {'persistent_id': PID, 'video_id': VIDEO,
+             'source_relation': 'rebound_radio_candidate',
+             'input_path': '/old-map-radio.json', 'input_sha256': 'c' * 64},
+            {'persistent_id': '0000000000000002', 'video_id': 'other000001',
+             'source_relation': 'rebound_album_catalog_candidate',
+             'input_path': '/old-map-catalog.json', 'input_sha256': 'd' * 64},
+        ]
+        rebound_path.write_text(json.dumps({
+            'schema_version': 1, 'producer': REBOUND_PRODUCER,
+            'library_sha256': LIBRARY_HASH, 'identity_map_sha256': MAP_HASH,
+            'rows': rebound_rows,
+        }), encoding='utf-8')
+        current_path = self.root / 'current-radio.json'
+        current_rows = [
+            {'persistent_id': PID, 'video_id': 'different000',
+             'source_relation': 'radio', 'input_path': '/current-a.json',
+             'input_sha256': 'e' * 64},  # same PID, conflicting video
+            {'persistent_id': '0000000000000003', 'video_id': 'other000001',
+             'source_relation': 'radio', 'input_path': '/current-b.json',
+             'input_sha256': 'f' * 64},  # same video, conflicting PID
+            {'persistent_id': '0000000000000004', 'video_id': 'safe0000001',
+             'source_relation': 'radio', 'input_path': '/current-c.json',
+             'input_sha256': '1' * 64},
+        ]
+        current_path.write_text(json.dumps({
+            'schema_version': 1, 'producer': PRODUCER,
+            'library_sha256': LIBRARY_HASH, 'identity_map_sha256': MAP_HASH,
+            'rows': current_rows,
+        }), encoding='utf-8')
+        combined = build_combined_rebound_seed_video_evidence(
+            rebound_path, current_path, LIBRARY_HASH, MAP_HASH)
+        self.assertEqual(combined['producer'], COMBINED_REBOUND_PRODUCER)
+        self.assertEqual(combined['rows'], [*rebound_rows, current_rows[2]])
+        self.assertEqual(combined['rows'][:2], rebound_rows)
+        self.assertEqual(combined['rebound_evidence']['sha256'],
+                         hashlib.sha256(rebound_path.read_bytes()).hexdigest())
+        self.assertEqual(combined['current_radio_source']['sha256'],
+                         hashlib.sha256(current_path.read_bytes()).hexdigest())
+        self.assertEqual(combined['audit']['recommendation_edges_created'], 0)
+        self.assertEqual(combined['audit']['outgoing_roots_created'], 0)
+
+    def test_combined_selector_rejects_tampered_rebound_or_current_source(self):
+        from seed_video_evidence import REBOUND_PRODUCER
+        rebound_path = self.root / 'rebound.json'
+        rebound_doc = {
+            'schema_version': 1, 'producer': REBOUND_PRODUCER,
+            'library_sha256': LIBRARY_HASH, 'identity_map_sha256': MAP_HASH,
+            'rows': [{'persistent_id': PID, 'video_id': VIDEO,
+                      'source_relation': 'rebound_radio_candidate',
+                      'input_path': '/radio.json', 'input_sha256': 'a' * 64}],
+        }
+        rebound_path.write_text(json.dumps(rebound_doc), encoding='utf-8')
+        current_path = self.root / 'current-radio.json'
+        current_doc = copy.deepcopy(self.document)
+        current_doc['rows'][0]['input_path'] = 'radio.json'
+        current_path.write_text(json.dumps(current_doc), encoding='utf-8')
+        combined = build_combined_rebound_seed_video_evidence(
+            rebound_path, current_path, LIBRARY_HASH, MAP_HASH)
+        combined_path = self.root / 'combined.json'
+        combined_path.write_text(json.dumps(combined), encoding='utf-8')
+        with patch('seed_video_evidence._select_rebound_seed_video_evidence',
+                   return_value={PID: {'video_id': VIDEO, 'source': 'rebound'}}):
+            result = select_seed_video_evidence(
+                combined, combined_path, self.seeds, self.tracks, self.matcher,
+                LIBRARY_HASH, MAP_HASH)
+            self.assertEqual(result[PID]['video_id'], VIDEO)
+            rebound_path.write_text(json.dumps({**rebound_doc, 'tampered': True}),
+                                    encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'rebound source changed'):
+                select_seed_video_evidence(
+                    combined, combined_path, self.seeds, self.tracks,
+                    self.matcher, LIBRARY_HASH, MAP_HASH)
+            rebound_path.write_text(json.dumps(rebound_doc), encoding='utf-8')
+            current_path.write_text(json.dumps({**current_doc, 'tampered': True}),
+                                    encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'current-radio source changed'):
+                select_seed_video_evidence(
+                    combined, combined_path, self.seeds, self.tracks,
+                    self.matcher, LIBRARY_HASH, MAP_HASH)
+
     def test_loader_rejects_a_source_that_is_not_saved_radio_evidence(self):
         changed = snapshot(relation='related')
         self.write_snapshot(changed)
@@ -284,6 +587,18 @@ class SeedVideoEvidenceTests(unittest.TestCase):
         self.assertEqual(hints['0000000000000002']['video_id'], CATALOG_VIDEO)
         self.assertEqual(hints['0000000000000002']['source_relation'],
                          'album_catalog_candidate')
+
+    def test_rebound_catalog_hints_revalidate_old_proof_then_match_current_map(self):
+        tracks, matcher, catalog, catalog_path = self.catalog_fixture()
+        rows = build_rebound_catalog_hints(
+            catalog, catalog_path, tracks, matcher, matcher, LIBRARY_HASH, MAP_HASH)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row['persistent_id'], '0000000000000002')
+        self.assertEqual(row['video_id'], CATALOG_VIDEO)
+        self.assertEqual(row['source_relation'], 'rebound_album_catalog_candidate')
+        self.assertEqual(row['prior_catalog_evidence_sha256'],
+                         hashlib.sha256(catalog_path.read_bytes()).hexdigest())
 
     def test_album_catalog_hint_accepts_separately_typed_saved_search_provenance(self):
         tracks, matcher, catalog, catalog_path = self.catalog_fixture()

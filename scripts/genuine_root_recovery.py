@@ -114,6 +114,23 @@ def _valid_collector(summary):
     return _valid_boundary(summary)
 
 
+def _known_selector_preflight_failure(summary):
+    location = summary.get('error_location')
+    return (type(summary.get('schema_version')) is int
+            and summary.get('schema_version') == 1
+            and summary.get('status') == 'stopped'
+            and summary.get('account_authentication_verified') is False
+            and type(summary.get('http_requests')) is int
+            and summary.get('http_requests') == 0
+            and summary.get('results') == []
+            and summary.get('partial_seed_persistent_id') is None
+            and summary.get('error_type') == 'ValueError'
+            and isinstance(location, dict)
+            and location.get('file') == 'merge_rebased_radio_growth.py'
+            and location.get('function') == '_replay_previous_growth'
+            and 'http_error_status' not in summary)
+
+
 def _snapshot_is_genuine(snapshot):
     endpoints = {row.get('endpoint') for row in snapshot.get('requests', [])
                  if isinstance(row, dict)}
@@ -145,11 +162,40 @@ def _verify_growth_output(path, intent, collector_receipt, manifest_receipt,
         raise RecoveryUnsafe('Orphan growth output does not bind this collector batch')
     expected_parent = intent.get('previous_growth')
     actual_parent = graph.get('previous_growth_receipt')
-    if expected_parent != actual_parent:
+
+    def normalized_parent(receipt):
+        if receipt is None:
+            return None
+        if (not isinstance(receipt, dict)
+                or set(receipt) != {'path', 'accepted_graphs_sha256'}
+                or not isinstance(receipt.get('path'), str)
+                or not isinstance(receipt.get('accepted_graphs_sha256'), str)):
+            return receipt
+        parent_path = Path(receipt['path']).resolve()
+        if parent_path.name == 'accepted-graphs.json':
+            parent_path = parent_path.parent
+        return {'path': str(parent_path),
+                'accepted_graphs_sha256': receipt['accepted_graphs_sha256']}
+
+    if normalized_parent(expected_parent) != normalized_parent(actual_parent):
         raise RecoveryUnsafe('Orphan growth output has a different parent checkpoint')
     return {'path': str(graph_path.resolve()), 'sha256': sha(graph_path),
             'active_outgoing_roots': sum(bool(row.get('ordered_target_pids'))
                                          for row in graph.get('accepted_roots', []))}
+
+
+def _verify_dynamic_current_radio_binding(intent, evidence, config):
+    """Require each dynamic composite to bind the batch's immutable radio file."""
+    if config.get('dynamic_current_radio_hints') is True:
+        current_receipt = intent.get('current_radio_evidence')
+        current_path = _check_file_receipt(current_receipt, 'current-radio evidence')
+        bound_current = evidence.get('current_radio_source')
+        if (evidence.get('producer') != 'opengenius-combined-rebound-seed-evidence-v1'
+                or bound_current != {'path': str(current_path),
+                                     'sha256': current_receipt['sha256']}):
+            raise RecoveryUnsafe('Dynamic composite does not bind its intent current-radio evidence')
+    elif 'current_radio_evidence' in intent:
+        raise RecoveryUnsafe('Static evidence intent unexpectedly includes current-radio evidence')
 
 
 def recover_orphan_batch(batch_dir, *, expected_config_sha256,
@@ -188,12 +234,15 @@ def recover_orphan_batch(batch_dir, *, expected_config_sha256,
             raise RecoveryUnsafe('Runner config lacks a bound ' + key + ' source')
         configured_sources.append({'path': receipt.get('path'),
                                    'sha256': receipt.get('sha256')})
-    optional_source = config.get('external_seed_video_evidence')
-    if optional_source is not None:
-        if not isinstance(optional_source, dict):
-            raise RecoveryUnsafe('Runner config has malformed external evidence source')
-        configured_sources.append({'path': optional_source.get('path'),
-                                   'sha256': optional_source.get('sha256')})
+    for optional_key, label in (
+            ('external_seed_video_evidence', 'external evidence'),
+            ('prior_attempt_ledger', 'prior-attempt ledger')):
+        optional_source = config.get(optional_key)
+        if optional_source is not None:
+            if not isinstance(optional_source, dict):
+                raise RecoveryUnsafe('Runner config has malformed ' + label + ' source')
+            configured_sources.append({'path': optional_source.get('path'),
+                                       'sha256': optional_source.get('sha256')})
     normalized_sources = []
     for receipt in source_receipts:
         source_path = _check_file_receipt(receipt, 'source input')
@@ -211,10 +260,16 @@ def recover_orphan_batch(batch_dir, *, expected_config_sha256,
     # their evolving parent through intent.previous_growth and typed replay.
     if intent.get('batch') == 1:
         configured_parent = config.get('previous_growth')
-        expected_parent = (None if configured_parent is None else {
-            'path': str(Path(configured_parent['path']).resolve()),
-            'accepted_graphs_sha256': configured_parent['sha256'],
-        })
+        if configured_parent is None:
+            expected_parent = None
+        else:
+            configured_path = Path(configured_parent['path'])
+            if configured_path.is_dir():
+                configured_path = configured_path / 'accepted-graphs.json'
+            expected_parent = {
+                'path': str(configured_path.resolve()),
+                'accepted_graphs_sha256': configured_parent['sha256'],
+            }
         if expected_parent != expected_previous_growth:
             raise RecoveryUnsafe('Runner config parent receipt differs from first checkpoint')
     plan_path = _check_file_receipt(intent.get('seed_plan'), 'seed plan')
@@ -232,6 +287,7 @@ def recover_orphan_batch(batch_dir, *, expected_config_sha256,
     if (evidence.get('library_sha256') != library_sha256
             or evidence.get('identity_map_sha256') != identity_map_sha256):
         raise RecoveryUnsafe('Orphan seed-video evidence has foreign source hashes')
+    _verify_dynamic_current_radio_binding(intent, evidence, config)
 
     collector_dir = batch_dir / 'collector'
     summaries = sorted(collector_dir.glob('summary-*.json'))
@@ -241,7 +297,8 @@ def recover_orphan_batch(batch_dir, *, expected_config_sha256,
         raise RecoveryUnsafe('Multiple collector summaries make the orphan batch ambiguous')
     summary_path = summaries[0]
     summary = _read(summary_path)
-    if not _valid_collector(summary):
+    preflight_failure = _known_selector_preflight_failure(summary)
+    if not _valid_collector(summary) and not preflight_failure:
         raise RecoveryUnsafe('Collector did not finish or stop at an authenticated request boundary')
     if summary.get('library_sha256') != library_sha256:
         raise RecoveryUnsafe('Collector summary is bound to a different Library')
@@ -254,6 +311,32 @@ def recover_orphan_batch(batch_dir, *, expected_config_sha256,
     collector_receipt = {'path': str(summary_path.resolve()), 'sha256': sha(summary_path),
                          'http_requests': summary['http_requests'],
                          'request_budget': summary['request_budget']}
+    if preflight_failure:
+        # This exact historical selector failure occurs before auth or request
+        # setup. Recover it only when the collector directory contains no
+        # manifest, cache/request records, snapshots, or any other output.
+        unexpected = [path for path in collector_dir.rglob('*')
+                      if path.is_file() and path != summary_path]
+        if unexpected:
+            raise RecoveryUnsafe('Preflight failure has request, cache, or collector output files')
+        return {
+            'batch': intent.get('batch'),
+            'seed_pids': planned,
+            'attempted_pids': [],
+            'http_requests': 0,
+            'status': 'preflight_failed',
+            'outcome': 'preflight_failed',
+            'collector_summary': collector_receipt,
+            'preflight_intent_receipt': {
+                'path': str(intent_path.resolve()), 'sha256': sha(intent_path)},
+            'seed_plan': intent['seed_plan'],
+            'seed_manifest': None,
+            'seed_video_evidence': intent['seed_video_evidence'],
+            'snapshot_inputs': [],
+            'genuine_snapshot_inputs': [],
+            'growth_receipt': None,
+            'requires_typed_growth_replay': False,
+        }
     manifest_path = collector_dir / 'seeds.json'
     manifest_bytes = manifest_path.read_bytes()
     manifest = json.loads(manifest_bytes)

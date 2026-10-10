@@ -281,6 +281,49 @@ class IdentityMap:
                 self.credit_sets[key] = credits
         if any(component in self.credit_sets for credits in self.credit_sets.values() for component in credits):
             raise ValueError('Nested or cyclic artist credit declarations are unsupported')
+        # Album aliases are exact, directed metadata mappings.  They only change
+        # album_match; canonical Library album fields and recording identity stay
+        # untouched.  Requiring targets to be unique existing Library values
+        # prevents chains, cycles, and ambiguous destinations.
+        local_album_values = {}
+        for track in tracks:
+            album = track.get('album') or ''
+            if normalize(album):
+                local_album_values.setdefault(normalize(album), set()).add(album)
+        self.album_title_aliases = {}
+        normalized_album_aliases = {}
+        for declaration in document.get('album_title_aliases', []):
+            if not isinstance(declaration, dict):
+                raise ValueError('Invalid album title alias declaration')
+            if not declaration.get('enabled'):
+                continue
+            canonical = declaration.get('canonical_library_album')
+            aliases = declaration.get('exact_remote_album_aliases')
+            if (not isinstance(canonical, str) or not normalize(canonical)
+                    or not isinstance(aliases, list) or not aliases):
+                raise ValueError('Invalid whole album title alias')
+            canonical_key = normalize(canonical)
+            target_values = local_album_values.get(canonical_key, set())
+            if len(target_values) != 1:
+                raise ValueError('Album alias target is not one existing canonical Library album')
+            canonical_value = next(iter(target_values))
+            if canonical_value != canonical:
+                raise ValueError('Album alias target must use the exact canonical Library album value')
+            for alias in aliases:
+                if not isinstance(alias, str) or not normalize(alias):
+                    raise ValueError('Invalid exact remote album alias')
+                alias_key = normalize(alias)
+                if alias_key == canonical_key:
+                    raise ValueError('Album alias source and canonical target are equivalent')
+                existing_album_values = local_album_values.get(alias_key, set())
+                if existing_album_values:
+                    raise ValueError('Album alias shadows an existing local album value')
+                if alias in self.album_title_aliases or alias_key in normalized_album_aliases:
+                    raise ValueError('Duplicate or conflicting whole album title aliases')
+                self.album_title_aliases[alias] = canonical_value
+                normalized_album_aliases[alias_key] = canonical_value
+        if any(normalize(target) in normalized_album_aliases for target in self.album_title_aliases.values()):
+            raise ValueError('Album alias chains or cycles are unsupported')
         self.artist_credit_aliases = {}
         local_artist_keys = {self.artist_key(track.get('artist') or '') for track in tracks}
         for declaration in document.get('artist_credit_aliases', []):
@@ -404,6 +447,10 @@ class IdentityMap:
             exact_artist = normalize(local.get('artist') or '') in {
                 normalize(a.get('name') or '') for a in remote.get('artists') or []}
             remote_album = (remote.get('album') or {}).get('name')
+            album_match = None
+            if remote_album:
+                remote_album_target = self.album_title_aliases.get(remote_album, remote_album)
+                album_match = normalize(remote_album_target) == normalize(local.get('album') or '')
             candidates.append({'persistent_id': pid,
                                'local_metadata': {key: local.get(key) for key in ('title', 'artist', 'album', 'duration_ms')},
                                'title_match': 'exact' if exact_title else ('proposed_alias' if pending_title else 'explicit_alias'),
@@ -415,7 +462,7 @@ class IdentityMap:
                                # credit. Report that evidence without assuming its role.
                                'artist_credit_match': 'complete' if self.artist_credits(local_artist) == artists else 'partial',
                                'duration_difference_seconds': round(delta, 3),
-                               'album_match': (normalize(remote_album) == normalize(local.get('album') or '')) if remote_album else None,
+                               'album_match': album_match,
                                'identity_status': 'unverified'})
         return candidates
 

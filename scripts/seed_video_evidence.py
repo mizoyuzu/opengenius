@@ -14,6 +14,9 @@ from music_identity_map import IdentityMap, load_library, normalize, version_sig
 
 
 PRODUCER = 'opengenius-seed-video-evidence-v1'
+CACHED_HINT_PRODUCER = 'opengenius-cached-seed-hint-revalidation-v1'
+REBOUND_PRODUCER = 'opengenius-map-transition-rebound-seed-evidence-v1'
+COMBINED_REBOUND_PRODUCER = 'opengenius-combined-rebound-seed-evidence-v1'
 VIDEO_RE = re.compile(r'[A-Za-z0-9_-]{11}\Z')
 SHA_RE = re.compile(r'[a-f0-9]{64}\Z')
 ROW_KEYS = {'persistent_id', 'video_id', 'input_path', 'input_sha256', 'source_relation'}
@@ -24,10 +27,158 @@ CATALOG_ROW_KEYS = ROW_KEYS | {
 ALBUM_ID_RE = re.compile(r'MPRE[A-Za-z0-9_-]+\Z')
 CATALOG_SAFE_KEYS = {'videoId', 'title', 'artists', 'name', 'id', 'album', 'length',
                      'duration_seconds', 'videoType', 'related', 'tracks', 'contents'}
+_TYPED_TRANSITION_PROOF_CACHE = {}
+
+
+def _typed_transition_verification_matches(recorded, verified):
+    """Accept the pre-proof-input-receipt verifier shape after full replay.
+
+    Earlier immutable hint artifacts recorded the complete map-transition
+    verification except for ``proof_input_receipts``. The current verifier
+    independently rebuilds and hashes those receipts before this comparison;
+    only that one additive auxiliary field may be absent from a recorded copy.
+    """
+    if not isinstance(recorded, dict) or not isinstance(verified, dict):
+        return False
+    if recorded == verified:
+        return True
+    if set(verified) != set(recorded) | {'proof_input_receipts'}:
+        return False
+    return recorded == {key: value for key, value in verified.items()
+                        if key != 'proof_input_receipts'}
 
 
 def _sha(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def verify_typed_map_transition(transition, old_map_hash, new_map_hash,
+                                library_hash):
+    """Verify the typed old→new map receipt through the merge verifier."""
+    required = {'old_identity_map', 'new_identity_map', 'graph_export',
+                'rebase_report', 'state'}
+    if not isinstance(transition, dict) or set(transition) != required:
+        raise ValueError('Cached seed hints require a complete typed map transition')
+    checked = {}
+    for key, receipt in transition.items():
+        if (not isinstance(receipt, dict) or set(receipt) != {'path', 'sha256'}
+                or not isinstance(receipt.get('path'), str)
+                or not SHA_RE.fullmatch(receipt.get('sha256') or '')):
+            raise ValueError('Malformed typed map transition receipt: ' + key)
+        path = Path(receipt['path']).resolve()
+        data = path.read_bytes()
+        if _sha(data) != receipt['sha256']:
+            raise ValueError('Typed map transition input changed: ' + key)
+        checked[key] = {'path': str(path), 'sha256': receipt['sha256']}
+    if (checked['old_identity_map']['sha256'] != old_map_hash
+            or checked['new_identity_map']['sha256'] != new_map_hash):
+        raise ValueError('Typed map transition does not bind the requested map hashes')
+    cache_key = (old_map_hash, new_map_hash, library_hash,
+                 tuple((key, checked[key]['path'], checked[key]['sha256'])
+                       for key in sorted(checked)))
+    cached = _TYPED_TRANSITION_PROOF_CACHE.get(cache_key)
+    if cached is not None:
+        for receipt in cached['hash_inputs']:
+            path = Path(receipt['path'])
+            try:
+                current_sha = _sha(path.read_bytes())
+            except OSError:
+                raise ValueError('A cached typed-transition source disappeared') from None
+            if current_sha != receipt['sha256']:
+                _TYPED_TRANSITION_PROOF_CACHE.pop(cache_key, None)
+                raise ValueError('A cached typed-transition source changed')
+        return checked, json.loads(json.dumps(cached['verified']))
+    try:
+        from merge_rebased_radio_growth import verify_typed_identity_map_rebinding
+    except ImportError:
+        raise ValueError('Typed map transition verifier is unavailable') from None
+    verified = verify_typed_identity_map_rebinding(
+        graph_export_path=checked['graph_export']['path'],
+        rebase_report_path=checked['rebase_report']['path'],
+        state_path=checked['state']['path'],
+        old_identity_map_path=checked['old_identity_map']['path'],
+        new_identity_map_path=checked['new_identity_map']['path'],
+        library_sha256=library_hash)
+    if (not isinstance(verified, dict)
+            or verified.get('verified') is not True
+            or verified.get('old_identity_map_sha256') != old_map_hash
+            or verified.get('new_identity_map_sha256') != new_map_hash
+            or verified.get('library_sha256') != library_hash
+            or Path(verified.get('old_identity_map_path', '')).resolve()
+               != Path(checked['old_identity_map']['path'])
+            or Path(verified.get('new_identity_map_path', '')).resolve()
+               != Path(checked['new_identity_map']['path'])
+            or Path(verified.get('report_path', '')).resolve()
+               != Path(checked['rebase_report']['path'])
+            or Path(verified.get('graph_export_path', '')).resolve()
+               != Path(checked['graph_export']['path'])
+            or Path(verified.get('state_path', '')).resolve()
+               != Path(checked['state']['path'])
+            or verified.get('report_sha256') != checked['rebase_report']['sha256']
+            or verified.get('graph_export_sha256') != checked['graph_export']['sha256']
+            or verified.get('state_file_sha256') != checked['state']['sha256']
+            or not isinstance(verified.get('authenticated_observation_inputs'), list)
+            or not isinstance(verified.get('proof_input_receipts'), list)):
+        raise ValueError('Typed map transition verifier returned incomplete source proof')
+    accepted = verified['authenticated_observation_inputs']
+    normalized, seen = [], set()
+    for receipt in accepted:
+        if (not isinstance(receipt, dict) or set(receipt) != {'path', 'sha256'}
+                or not isinstance(receipt.get('path'), str)
+                or not SHA_RE.fullmatch(receipt.get('sha256') or '')):
+            raise ValueError('Typed map verifier returned a malformed accepted snapshot receipt')
+        path = Path(receipt['path']).resolve()
+        pair = (str(path), receipt['sha256'])
+        if pair in seen or _sha(path.read_bytes()) != receipt['sha256']:
+            raise ValueError('Typed map verifier returned duplicate or changed snapshot input')
+        seen.add(pair)
+        normalized.append({'path': str(path), 'sha256': receipt['sha256']})
+    verified = dict(verified)
+    verified['accepted_snapshot_receipts'] = sorted(
+        normalized, key=lambda row: (row['path'], row['sha256']))
+    track_receipt = verified.get('track_snapshot_receipt')
+    if (not isinstance(track_receipt, dict)
+            or set(track_receipt) != {'path', 'sha256'}
+            or not isinstance(track_receipt.get('path'), str)
+            or not SHA_RE.fullmatch(track_receipt.get('sha256') or '')):
+        raise ValueError('Typed map verifier omitted its bound Library snapshot receipt')
+    track_path = Path(track_receipt['path']).resolve()
+    if _sha(track_path.read_bytes()) != track_receipt['sha256']:
+        raise ValueError('Typed map verifier returned a changed Library snapshot')
+    verified['track_snapshot_receipt'] = {'path': str(track_path),
+                                          'sha256': track_receipt['sha256']}
+    proof_inputs = []
+    for receipt in verified['proof_input_receipts']:
+        if (not isinstance(receipt, dict) or set(receipt) != {'path', 'sha256'}
+                or not isinstance(receipt.get('path'), str)
+                or not SHA_RE.fullmatch(receipt.get('sha256') or '')):
+            raise ValueError('Typed map verifier returned malformed transitive proof inputs')
+        path = Path(receipt['path']).resolve()
+        if _sha(path.read_bytes()) != receipt['sha256']:
+            raise ValueError('Typed map verifier returned a changed transitive proof input')
+        proof_inputs.append({'path': str(path), 'sha256': receipt['sha256']})
+    if len({(row['path'], row['sha256']) for row in proof_inputs}) != len(proof_inputs):
+        raise ValueError('Typed map verifier returned duplicate transitive proof inputs')
+    proof_pairs = {(row['path'], row['sha256']) for row in proof_inputs}
+    required_proof_inputs = list(checked.values()) + verified['accepted_snapshot_receipts'] + [
+        verified['track_snapshot_receipt']]
+    if any((row['path'], row['sha256']) not in proof_pairs
+           for row in required_proof_inputs):
+        raise ValueError('Typed map verifier omitted explicit inputs from transitive proof receipts')
+    hash_inputs = proof_inputs
+    unique_hash_inputs = {}
+    for receipt in hash_inputs:
+        unique_hash_inputs[(receipt['path'], receipt['sha256'])] = receipt
+    hash_inputs = [unique_hash_inputs[key] for key in sorted(unique_hash_inputs)]
+    # Detect source replacement during the proof replay before memoizing it.
+    for receipt in hash_inputs:
+        if _sha(Path(receipt['path']).read_bytes()) != receipt['sha256']:
+            raise ValueError('A typed-transition source changed during full verification')
+    _TYPED_TRANSITION_PROOF_CACHE[cache_key] = {
+        'hash_inputs': hash_inputs,
+        'verified': json.loads(json.dumps(verified)),
+    }
+    return checked, verified
 
 
 def _candidate_for_video(snapshot, video_id, persistent_id, matcher):
@@ -46,6 +197,62 @@ def _candidate_for_video(snapshot, video_id, persistent_id, matcher):
         if version_signature(local.get('title') or '') != version_signature(row['track'].get('title') or ''):
             return False
     return True
+
+
+def strict_cached_search_match(results, seed, matcher):
+    """Resolve cached search rows only on a unique, strict metadata match.
+
+    This resolver is intentionally stricter than the live collector's seed
+    resolver: cached alias-rematch hints must carry a complete credit, active
+    title, same version signature, duration within the matcher limit, and an
+    exact album label. It returns no recording verification or graph evidence.
+    """
+    if not isinstance(results, list):
+        return None
+    selected = {}
+    for position, remote in enumerate(results):
+        if not isinstance(remote, dict):
+            continue
+        video_id = remote.get('videoId')
+        if not isinstance(video_id, str) or not VIDEO_RE.fullmatch(video_id):
+            continue
+        match_row = dict(remote)
+        if isinstance(match_row.get('album'), str):
+            match_row['album'] = {'name': match_row['album']}
+        found = matcher.match(match_row)
+        if not found:
+            continue
+        matching_pids = {candidate.get('persistent_id') for candidate in found}
+        if seed.get('persistent_id') not in matching_pids:
+            continue
+        if (len(found) != 1
+                or found[0].get('artist_credit_match') != 'complete'
+                or found[0].get('title_match') not in ('exact', 'explicit_alias')
+                or found[0].get('duration_difference_seconds') is None
+                or found[0]['duration_difference_seconds'] > 3
+                or found[0].get('album_match') is not True):
+            return None
+        local = found[0].get('local_metadata') or {}
+        remote_title = remote.get('title')
+        if (not isinstance(remote_title, str)
+                or version_signature(local.get('title') or '') != version_signature(remote_title)
+                or normalize(local.get('album') or '') != normalize(
+                    (match_row.get('album') or {}).get('name') or '')):
+            return None
+        selected.setdefault(video_id, []).append({
+            'position': position,
+            'title_match': found[0]['title_match'],
+            'artist_match': found[0].get('artist_match'),
+            'artist_credit_match': found[0]['artist_credit_match'],
+            'duration_difference_seconds': found[0]['duration_difference_seconds'],
+            'album_match': found[0]['album_match'],
+            'version_signature': sorted(version_signature(remote_title)),
+        })
+    if len(selected) != 1:
+        return None
+    video_id, evidence = next(iter(selected.items()))
+    return {'video_id': video_id, 'result_positions': [row['position'] for row in evidence],
+            'matches': evidence}
 
 
 def build_seed_video_evidence(graph_paths, matcher, library_hash, identity_map_sha256):
@@ -146,6 +353,270 @@ def build_seed_video_evidence(graph_paths, matcher, library_hash, identity_map_s
             'skipped_snapshots': skipped,
             'identity_status': 'unverified_metadata_candidate',
             'edges_created': 0,
+        },
+    }
+
+
+def build_rebound_radio_hints(snapshot_receipts, matcher, library_hash,
+                              old_identity_map_sha256, audit=None):
+    """Rematch typed-transition-authenticated old-map snapshots as hints.
+
+    `snapshot_receipts` must come from the typed map verifier's accepted input
+    list. Each snapshot remains bound to its old map; only its metadata matches
+    are recomputed under the current matcher.
+    """
+    candidates = {}
+    for receipt in snapshot_receipts:
+        path = Path(receipt['path']).resolve()
+        data = path.read_bytes()
+        if _sha(data) != receipt.get('sha256'):
+            raise ValueError('Authenticated radio snapshot changed after transition verification')
+        try:
+            snapshot = json.loads(data)
+            if (snapshot.get('library_sha256') != library_hash
+                    or snapshot.get('identity_map_sha256') != old_identity_map_sha256):
+                if audit is not None:
+                    audit['foreign_source_hash_count'] = audit.get('foreign_source_hash_count', 0) + 1
+                continue
+            validate_observations(snapshot, library_hash)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            if audit is not None:
+                audit['invalid_source_snapshot_count'] = audit.get('invalid_source_snapshot_count', 0) + 1
+            continue
+        by_video = {}
+        for observation in snapshot['observations']:
+            if observation.get('source') == 'ytmusic' and observation.get('relation') == 'radio':
+                by_video.setdefault(observation['track']['video_id'], []).append(observation)
+        for video_id, observations in by_video.items():
+            matching = []
+            for observation in observations:
+                found = matcher.match(observation['track'])
+                if (len(found) != 1 or found[0].get('artist_credit_match') != 'complete'
+                        or found[0].get('title_match') not in ('exact', 'explicit_alias')
+                        or version_signature(found[0].get('local_metadata', {}).get('title') or '')
+                           != version_signature(observation['track'].get('title') or '')):
+                    matching = []
+                    break
+                matching.append(found[0]['persistent_id'])
+            if not matching or len(set(matching)) != 1:
+                continue
+            pid = matching[0]
+            candidates.setdefault((pid, video_id), []).append({
+                'persistent_id': pid, 'video_id': video_id,
+                'input_path': str(path), 'input_sha256': receipt['sha256'],
+                'source_library_sha256': snapshot['library_sha256'],
+                'source_identity_map_sha256': snapshot['identity_map_sha256'],
+                'source_relation': 'rebound_radio_candidate',
+            })
+    by_video, by_pid = {}, {}
+    for pid, video_id in candidates:
+        by_pid.setdefault(pid, set()).add(video_id)
+        by_video.setdefault(video_id, set()).add(pid)
+    ambiguous_pids = {pid for pid, videos in by_pid.items() if len(videos) != 1}
+    ambiguous_videos = {video for video, pids in by_video.items() if len(pids) != 1}
+    rows = []
+    for (pid, video_id), receipts in candidates.items():
+        if pid in ambiguous_pids or video_id in ambiguous_videos:
+            continue
+        rows.append(min(receipts, key=lambda row: (row['input_path'], row['input_sha256'])))
+    return sorted(rows, key=lambda row: (row['persistent_id'], row['video_id']))
+
+
+def build_rebound_catalog_hints(document, evidence_path, tracks, old_matcher,
+                                current_matcher, library_hash, old_map_hash):
+    """Revalidate old strict catalog hints under the new matcher."""
+    evidence_path = Path(evidence_path).resolve()
+    sidecar_dir = evidence_path.parent
+    if not isinstance(document, dict):
+        raise ValueError('Prior catalog evidence must be an object')
+    catalog_document, catalog_path = document, evidence_path
+    if document.get('producer') == PRODUCER:
+        # Validate the complete prior sidecar first, including any radio rows
+        # and the exact catalog document receipt it embeds.
+        select_seed_video_evidence(document, evidence_path, [], tracks, old_matcher,
+                                   library_hash, old_map_hash)
+        source = document.get('catalog_evidence')
+        if not isinstance(source, dict):
+            return []
+        catalog_path = _resolve_source(source['path'], sidecar_dir)
+        catalog_document = json.loads(catalog_path.read_text(encoding='utf-8'))
+    if catalog_document.get('producer') != CATALOG_PRODUCER:
+        raise ValueError('Prior evidence does not contain typed album-catalog hints')
+    validated = validate_album_catalog_evidence(
+        catalog_document, catalog_path, tracks, old_matcher,
+        library_hash, old_map_hash)
+    rows_by_pid = {row['persistent_id']: row for row in catalog_document['rows']}
+    rebound = []
+    for checked in validated:
+        source_row = rows_by_pid[checked['persistent_id']]
+        response_path = Path(checked['input_path']).resolve()
+        response_bytes = response_path.read_bytes()
+        if _sha(response_bytes) != checked['input_sha256']:
+            raise ValueError('Prior catalog response changed after old-map validation')
+        envelope = json.loads(response_bytes)
+        position = source_row['source_key']['track_position']
+        remote = envelope['response']['tracks'][position - 1]
+        match_row = dict(remote)
+        if isinstance(match_row.get('album'), str):
+            match_row['album'] = {'name': match_row['album']}
+        matches = current_matcher.match(match_row)
+        if (len(matches) != 1 or matches[0].get('persistent_id') != checked['persistent_id']
+                or matches[0].get('artist_credit_match') != 'complete'
+                or matches[0].get('title_match') not in ('exact', 'explicit_alias')
+                or matches[0].get('duration_difference_seconds') is None
+                or matches[0]['duration_difference_seconds'] > 3
+                or matches[0].get('album_match') is not True):
+            continue
+        local = matches[0].get('local_metadata') or {}
+        if (normalize(local.get('album') or '') != normalize(envelope['response'].get('title') or '')
+                or version_signature(local.get('title') or '')
+                   != version_signature(remote.get('title') or '')):
+            continue
+        rebound.append({
+            'persistent_id': checked['persistent_id'],
+            'video_id': checked['video_id'],
+            'source_relation': 'rebound_album_catalog_candidate',
+            'input_path': str(response_path),
+            'input_sha256': checked['input_sha256'],
+            'album_id': source_row['album_id'],
+            'track_position': position,
+            'prior_catalog_evidence_path': str(catalog_path),
+            'prior_catalog_evidence_sha256': _sha(catalog_path.read_bytes()),
+        })
+    return sorted(rebound, key=lambda row: (row['persistent_id'], row['video_id']))
+
+
+def _dedupe_rebound_hints(rows):
+    by_pid, by_video = {}, {}
+    for row in rows:
+        by_pid.setdefault(row['persistent_id'], set()).add(row['video_id'])
+        by_video.setdefault(row['video_id'], set()).add(row['persistent_id'])
+    ambiguous_pids = {pid for pid, videos in by_pid.items() if len(videos) != 1}
+    ambiguous_videos = {video for video, pids in by_video.items() if len(pids) != 1}
+    priority = {'rebound_radio_candidate': 0,
+                'rebound_album_catalog_candidate': 1,
+                'rebound_cached_search_candidate': 2}
+    grouped = {}
+    for row in rows:
+        pid, video = row['persistent_id'], row['video_id']
+        if pid in ambiguous_pids or video in ambiguous_videos:
+            continue
+        grouped.setdefault(pid, []).append(row)
+    selected = []
+    for pid in sorted(grouped):
+        candidates = sorted(grouped[pid], key=lambda row: (
+            priority[row['source_relation']], row['input_path'], row['input_sha256']))
+        primary = dict(candidates[0])
+        if len(candidates) > 1:
+            primary['additional_source_evidence'] = candidates[1:]
+        selected.append(primary)
+    return selected
+
+
+def build_rebound_seed_video_evidence(*, track_snapshot, old_identity_map,
+                                      current_identity_map, typed_transition,
+                                      catalog_evidence=None,
+                                      cached_hint_evidence=None):
+    """Build current-map hints from typed old-map snapshots and cache sources.
+
+    All graph snapshots come from the typed verifier's accepted source-input
+    set. Catalog and search hints keep their original immutable evidence and
+    are fully revalidated under both maps. The result contains no graph edges.
+    """
+    tracks, library_hash, library_input = load_library(
+        track_snapshot=Path(track_snapshot))
+    old_path, current_path = Path(old_identity_map).resolve(), Path(current_identity_map).resolve()
+    old_bytes, current_bytes = old_path.read_bytes(), current_path.read_bytes()
+    old_hash, current_hash = _sha(old_bytes), _sha(current_bytes)
+    old_matcher = IdentityMap(json.loads(old_bytes), tracks, library_hash)
+    current_matcher = IdentityMap(json.loads(current_bytes), tracks, library_hash)
+    transition_receipts, verified = verify_typed_map_transition(
+        typed_transition, old_hash, current_hash, library_hash)
+    if (Path(verified['track_snapshot_receipt']['path']).resolve() != Path(track_snapshot).resolve()
+            or verified['track_snapshot_receipt']['sha256'] != _sha(Path(track_snapshot).read_bytes())):
+        raise ValueError('Typed transition Library snapshot differs from requested input')
+    radio_source_audit = {}
+    radio_rows = build_rebound_radio_hints(
+        verified['accepted_snapshot_receipts'], current_matcher, library_hash,
+        old_hash, audit=radio_source_audit)
+    catalog_rows = []
+    catalog_receipt = None
+    if catalog_evidence is not None:
+        catalog_path = Path(catalog_evidence).resolve()
+        catalog_bytes = catalog_path.read_bytes()
+        catalog_document = json.loads(catalog_bytes)
+        catalog_rows = build_rebound_catalog_hints(
+            catalog_document, catalog_path, tracks, old_matcher, current_matcher,
+            library_hash, old_hash)
+        catalog_receipt = {'path': str(catalog_path), 'sha256': _sha(catalog_bytes)}
+    cached_rows = []
+    cached_receipt = None
+    if cached_hint_evidence is not None:
+        from revalidate_cached_seed_hints import revalidate_cached_seed_hints
+        cached_path = Path(cached_hint_evidence).resolve()
+        cached_bytes = cached_path.read_bytes()
+        cached_doc = json.loads(cached_bytes)
+        if (cached_doc.get('schema_version') != 1
+                or cached_doc.get('producer') != CACHED_HINT_PRODUCER
+                or cached_doc.get('prior_identity_map', {}).get('sha256') != old_hash
+                or cached_doc.get('revalidated_identity_map', {}).get('sha256') != current_hash
+                or cached_doc.get('typed_map_transition') != transition_receipts
+                or not _typed_transition_verification_matches(
+                    cached_doc.get('typed_transition_verification'), verified)):
+            raise ValueError('Cached search hint artifact is not bound to this typed map transition')
+        collector_dirs = list(dict.fromkeys(
+            run['collector_dir'] for run in cached_doc.get('source_runs', [])
+            if isinstance(run, dict) and isinstance(run.get('collector_dir'), str)))
+        replayed = revalidate_cached_seed_hints(
+            track_snapshot=track_snapshot, old_identity_map=old_path,
+            current_identity_map=current_path, collector_dirs=collector_dirs,
+            typed_transition=transition_receipts)
+        if (replayed.get('rows') != cached_doc.get('rows')
+                or replayed.get('source_runs') != cached_doc.get('source_runs')):
+            raise ValueError('Cached search hint artifact differs from its immutable source replay')
+        for row in replayed['rows']:
+            cached_rows.append({
+                'persistent_id': row['persistent_id'], 'video_id': row['video_id'],
+                'source_relation': 'rebound_cached_search_candidate',
+                'input_path': row['input_path'], 'input_sha256': row['input_sha256'],
+                'historical_summary': row['historical_summary'],
+                'historical_seed_manifest': row['historical_seed_manifest'],
+                'historical_result_status': row['historical_result_status'],
+                'historical_old_identity_map_sha256': row['historical_old_identity_map_sha256'],
+                'revalidated_identity_map_sha256': row['revalidated_identity_map_sha256'],
+                'request_arguments': row['request_arguments'],
+                'strict_match_evidence': row['strict_match_evidence'],
+                'resolver': row['resolver'],
+                'typed_transition_report_sha256': transition_receipts['rebase_report']['sha256'],
+            })
+        cached_receipt = {'path': str(cached_path), 'sha256': _sha(cached_bytes)}
+    rows = _dedupe_rebound_hints(radio_rows + catalog_rows + cached_rows)
+    return {
+        'schema_version': 1, 'producer': REBOUND_PRODUCER,
+        'library_sha256': library_hash, 'library_input': library_input,
+        'prior_identity_map_sha256': old_hash,
+        'identity_map_sha256': current_hash,
+        'track_snapshot': verified['track_snapshot_receipt'],
+        'typed_map_transition': transition_receipts,
+        'typed_transition_verification': verified,
+        'catalog_evidence': catalog_receipt,
+        'cached_hint_evidence': cached_receipt,
+        'rows': rows,
+        'audit': {
+            'authenticated_radio_snapshot_count': len(verified['accepted_snapshot_receipts']),
+            'foreign_source_hash_snapshot_count': radio_source_audit.get('foreign_source_hash_count', 0),
+            'invalid_authenticated_snapshot_count': radio_source_audit.get('invalid_source_snapshot_count', 0),
+            'revalidated_radio_seed_count': len(radio_rows),
+            'revalidated_catalog_seed_count': len(catalog_rows),
+            'revalidated_cached_search_seed_count': len(cached_rows),
+            'accepted_seed_video_count': len(rows),
+            'ambiguous_pid_or_video_hints_excluded': len(radio_rows) + len(catalog_rows)
+                                                 + len(cached_rows) - len(rows),
+            'recording_identity_verified': 0,
+            'recommendation_observations_created': 0,
+            'recommendation_edges_created': 0,
+            'outgoing_roots_created': 0,
+            'network_requests': 0,
         },
     }
 
@@ -417,9 +888,267 @@ def combine_seed_video_evidence(radio_document, radio_evidence_path,
     return combined
 
 
+def build_combined_rebound_seed_video_evidence(rebound_evidence_path,
+                                               current_radio_evidence_path,
+                                               library_hash,
+                                               identity_map_sha256):
+    """Build a typed composite while preserving rebound and current proofs.
+
+    The rebound evidence remains an external immutable receipt. Current-map
+    radio evidence is embedded intact and separately bound to its source file.
+    Rows are a convenience index only; the selector revalidates both typed
+    producers and reconstructs this exact, conflict-filtered union.
+    """
+    rebound_path = Path(rebound_evidence_path).resolve()
+    current_path = Path(current_radio_evidence_path).resolve()
+    try:
+        rebound_bytes = rebound_path.read_bytes()
+        rebound = json.loads(rebound_bytes)
+        current_bytes = current_path.read_bytes()
+        current = json.loads(current_bytes)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError('Combined seed evidence source is unreadable') from None
+    if (not isinstance(rebound, dict)
+            or rebound.get('producer') != REBOUND_PRODUCER
+            or type(rebound.get('schema_version')) is not int
+            or rebound.get('schema_version') != 1
+            or rebound.get('library_sha256') != library_hash
+            or rebound.get('identity_map_sha256') != identity_map_sha256
+            or not isinstance(rebound.get('rows'), list)):
+        raise ValueError('Combined evidence requires typed rebound rows for this map')
+    if (not isinstance(current, dict)
+            or current.get('producer') != PRODUCER
+            or type(current.get('schema_version')) is not int
+            or current.get('schema_version') != 1
+            or current.get('library_sha256') != library_hash
+            or current.get('identity_map_sha256') != identity_map_sha256
+            or not isinstance(current.get('rows'), list)):
+        raise ValueError('Combined evidence requires current-map radio evidence')
+
+    rebound_pids, rebound_videos = set(), set()
+    for row in rebound['rows']:
+        if (not isinstance(row, dict)
+                or not isinstance(row.get('persistent_id'), str)
+                or not isinstance(row.get('video_id'), str)):
+            raise ValueError('Malformed rebound hint row in combined evidence')
+        if (row['persistent_id'] in rebound_pids
+                or row['video_id'] in rebound_videos):
+            raise ValueError('Rebound evidence contains duplicate PID or video ID')
+        rebound_pids.add(row['persistent_id'])
+        rebound_videos.add(row['video_id'])
+
+    current_rows = current['rows']
+    current_pids, current_videos = set(), set()
+    for row in current_rows:
+        if (not isinstance(row, dict)
+                or not isinstance(row.get('persistent_id'), str)
+                or not isinstance(row.get('video_id'), str)):
+            raise ValueError('Malformed current-radio hint row in combined evidence')
+        if (row['persistent_id'] in current_pids
+                or row['video_id'] in current_videos):
+            raise ValueError('Current-radio evidence contains duplicate PID or video ID')
+        current_pids.add(row['persistent_id'])
+        current_videos.add(row['video_id'])
+
+    filtered_current = [row for row in current_rows
+                        if row['persistent_id'] not in rebound_pids
+                        and row['video_id'] not in rebound_videos]
+    return {
+        'schema_version': 1,
+        'producer': COMBINED_REBOUND_PRODUCER,
+        'library_sha256': library_hash,
+        'identity_map_sha256': identity_map_sha256,
+        'rebound_evidence': {'path': str(rebound_path),
+                             'sha256': _sha(rebound_bytes)},
+        'current_radio_source': {'path': str(current_path),
+                                 'sha256': _sha(current_bytes)},
+        'current_radio_evidence': current,
+        'rows': rebound['rows'] + filtered_current,
+        'audit': {
+            'rebound_hint_count': len(rebound['rows']),
+            'current_radio_hint_count': len(filtered_current),
+            'recommendation_edges_created': 0,
+            'recommendation_observations_created': 0,
+            'outgoing_roots_created': 0,
+        },
+    }
+
+
+def _select_rebound_seed_video_evidence(document, evidence_path, seeds, tracks,
+                                        matcher, library_hash, identity_map_sha256):
+    if (not isinstance(document, dict) or document.get('producer') != REBOUND_PRODUCER
+            or type(document.get('schema_version')) is not int
+            or document['schema_version'] != 1
+            or document.get('library_sha256') != library_hash
+            or document.get('identity_map_sha256') != identity_map_sha256):
+        raise ValueError('Rebound seed-video evidence schema or current map hash differs')
+    transition = document.get('typed_map_transition')
+    if not isinstance(transition, dict):
+        raise ValueError('Rebound evidence omits its typed map transition')
+    old_map_path = transition.get('old_identity_map', {}).get('path')
+    new_map_path = transition.get('new_identity_map', {}).get('path')
+    track_snapshot = document.get('track_snapshot')
+    if (not isinstance(track_snapshot, dict)
+            or set(track_snapshot) != {'path', 'sha256'}
+            or not isinstance(track_snapshot.get('path'), str)
+            or not SHA_RE.fullmatch(track_snapshot.get('sha256') or '')):
+        raise ValueError('Rebound evidence omits its bound Library snapshot')
+    snapshot_path = Path(track_snapshot['path']).resolve()
+    if _sha(snapshot_path.read_bytes()) != track_snapshot['sha256']:
+        raise ValueError('Rebound Library snapshot changed')
+    catalog = document.get('catalog_evidence')
+    cached = document.get('cached_hint_evidence')
+    for label, receipt in (('catalog', catalog), ('cached hints', cached)):
+        if receipt is not None and (not isinstance(receipt, dict)
+                or set(receipt) != {'path', 'sha256'}
+                or not isinstance(receipt.get('path'), str)
+                or not SHA_RE.fullmatch(receipt.get('sha256') or '')):
+            raise ValueError('Malformed rebound ' + label + ' receipt')
+    expected = build_rebound_seed_video_evidence(
+        track_snapshot=snapshot_path, old_identity_map=old_map_path,
+        current_identity_map=new_map_path, typed_transition=transition,
+        catalog_evidence=None if catalog is None else catalog['path'],
+        cached_hint_evidence=None if cached is None else cached['path'])
+    if document != expected:
+        recorded_verification = (document.get('typed_transition_verification')
+                                 if isinstance(document, dict) else None)
+        replayed_verification = expected.get('typed_transition_verification')
+        if (not _typed_transition_verification_matches(
+                recorded_verification, replayed_verification)):
+            raise ValueError('Rebound seed-video evidence differs from its typed source replay')
+        normalized_expected = dict(expected)
+        normalized_expected['typed_transition_verification'] = recorded_verification
+        if document != normalized_expected:
+            raise ValueError('Rebound seed-video evidence differs from its typed source replay')
+    requested = {seed.get('persistent_id') for seed in seeds}
+    if None in requested:
+        raise ValueError('Requested seed has no persistent ID')
+    by_pid = {track.get('persistent_id'): track for track in tracks}
+    selected = {}
+    for row in expected['rows']:
+        pid = row['persistent_id']
+        if pid not in by_pid or pid in selected:
+            raise ValueError('Rebound hint contains unknown or duplicate Library PID')
+        if row['source_relation'] == 'rebound_radio_candidate':
+            source = 'rebound_authenticated_radio_metadata_candidate_unverified'
+        elif row['source_relation'] == 'rebound_album_catalog_candidate':
+            source = 'rebound_saved_album_catalog_metadata_candidate_unverified'
+        elif row['source_relation'] == 'rebound_cached_search_candidate':
+            source = 'rebound_cached_search_metadata_candidate_unverified'
+        else:
+            raise ValueError('Unsupported rebound seed-video source relation')
+        selected[pid] = {
+            'video_id': row['video_id'], 'source': source,
+            'source_relation': row['source_relation'],
+            'input_path': row['input_path'], 'input_sha256': row['input_sha256'],
+        }
+    return {pid: selected[pid] for pid in requested if pid in selected}
+
+
+def _select_combined_rebound_seed_video_evidence(document, evidence_path, seeds,
+                                                 tracks, matcher, library_hash,
+                                                 identity_map_sha256):
+    required_keys = {'schema_version', 'producer', 'library_sha256',
+                     'identity_map_sha256', 'rebound_evidence',
+                     'current_radio_source', 'current_radio_evidence',
+                     'rows', 'audit'}
+    if (not isinstance(document, dict) or set(document) != required_keys
+            or document.get('producer') != COMBINED_REBOUND_PRODUCER
+            or type(document.get('schema_version')) is not int
+            or document['schema_version'] != 1
+            or document.get('library_sha256') != library_hash
+            or document.get('identity_map_sha256') != identity_map_sha256):
+        raise ValueError('Combined rebound seed-video evidence schema or map hash differs')
+    receipt = document.get('rebound_evidence')
+    if (not isinstance(receipt, dict) or set(receipt) != {'path', 'sha256'}
+            or not isinstance(receipt.get('path'), str)
+            or not SHA_RE.fullmatch(receipt.get('sha256') or '')):
+        raise ValueError('Combined evidence omits its rebound sidecar receipt')
+    rebound_path = _resolve_source(receipt['path'], Path(evidence_path).resolve().parent)
+    try:
+        rebound_bytes = rebound_path.read_bytes()
+        rebound_doc = json.loads(rebound_bytes)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError('Combined rebound source is unreadable') from None
+    if _sha(rebound_bytes) != receipt['sha256']:
+        raise ValueError('Combined rebound source changed')
+    current_receipt = document.get('current_radio_source')
+    if (not isinstance(current_receipt, dict)
+            or set(current_receipt) != {'path', 'sha256'}
+            or not isinstance(current_receipt.get('path'), str)
+            or not SHA_RE.fullmatch(current_receipt.get('sha256') or '')):
+        raise ValueError('Combined evidence omits its current-radio source receipt')
+    current_path = _resolve_source(current_receipt['path'],
+                                   Path(evidence_path).resolve().parent)
+    try:
+        current_bytes = current_path.read_bytes()
+        current_source_doc = json.loads(current_bytes)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError('Combined current-radio source is unreadable') from None
+    if (_sha(current_bytes) != current_receipt['sha256']
+            or current_source_doc != document.get('current_radio_evidence')):
+        raise ValueError('Combined current-radio source changed or differs from embedded evidence')
+    radio_doc = document.get('current_radio_evidence')
+    rebound_rows = rebound_doc.get('rows') if isinstance(rebound_doc, dict) else None
+    radio_rows = radio_doc.get('rows') if isinstance(radio_doc, dict) else None
+    if not isinstance(rebound_rows, list) or not isinstance(radio_rows, list):
+        raise ValueError('Combined evidence lacks typed rebound and current-radio rows')
+    requested = {seed.get('persistent_id') for seed in seeds}
+    rebound_selected = _select_rebound_seed_video_evidence(
+        rebound_doc, rebound_path, seeds, tracks, matcher, library_hash,
+        identity_map_sha256)
+    radio_selected = select_seed_video_evidence(
+        radio_doc, current_path, seeds, tracks, matcher, library_hash,
+        identity_map_sha256)
+    external_pids = {row.get('persistent_id') for row in rebound_rows
+                     if isinstance(row, dict)}
+    external_videos = {row.get('video_id') for row in rebound_rows
+                       if isinstance(row, dict)}
+    filtered_radio_rows = [row for row in radio_rows
+                           if row.get('persistent_id') not in external_pids
+                           and row.get('video_id') not in external_videos]
+    expected_rows = rebound_rows + filtered_radio_rows
+    if document.get('rows') != expected_rows:
+        raise ValueError('Combined rows differ from their rebound and current-radio source rows')
+    audit = document.get('audit')
+    if (not isinstance(audit, dict)
+            or set(audit) != {'rebound_hint_count', 'current_radio_hint_count',
+                              'recommendation_edges_created',
+                              'recommendation_observations_created',
+                              'outgoing_roots_created'}
+            or audit.get('rebound_hint_count') != len(rebound_rows)
+            or audit.get('current_radio_hint_count') != len(filtered_radio_rows)
+            or audit.get('recommendation_edges_created') != 0
+            or audit.get('recommendation_observations_created') != 0
+            or audit.get('outgoing_roots_created') != 0):
+        raise ValueError('Combined seed-video hints may not assert recommendations or roots')
+    selected = dict(rebound_selected)
+    for pid, hint in radio_selected.items():
+        old = selected.get(pid)
+        other_pid = next((other_pid for other_pid, row in selected.items()
+                          if row['video_id'] == hint['video_id']), None)
+        if old is not None and old['video_id'] != hint['video_id']:
+            raise ValueError('Combined evidence has conflicting video IDs for one PID')
+        if other_pid is not None and other_pid != pid:
+            raise ValueError('Combined evidence maps one video ID to multiple PIDs')
+        if old is None:
+            selected[pid] = hint
+    if None in requested:
+        raise ValueError('Requested seed has no persistent ID')
+    return {pid: selected[pid] for pid in requested if pid in selected}
+
+
 def select_seed_video_evidence(document, evidence_path, seeds, tracks, matcher,
                                library_hash, identity_map_sha256):
     """Validate an evidence sidecar and return exact requested seed hints."""
+    if isinstance(document, dict) and document.get('producer') == REBOUND_PRODUCER:
+        return _select_rebound_seed_video_evidence(
+            document, evidence_path, seeds, tracks, matcher, library_hash,
+            identity_map_sha256)
+    if isinstance(document, dict) and document.get('producer') == COMBINED_REBOUND_PRODUCER:
+        return _select_combined_rebound_seed_video_evidence(
+            document, evidence_path, seeds, tracks, matcher, library_hash,
+            identity_map_sha256)
     if (not isinstance(document, dict) or type(document.get('schema_version')) is not int
             or document['schema_version'] != 1 or document.get('producer') != PRODUCER
             or document.get('library_sha256') != library_hash

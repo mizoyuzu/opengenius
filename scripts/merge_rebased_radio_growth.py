@@ -106,8 +106,11 @@ def _verify_rebase_receipt(graph_path, report_path, state_path,
                 or (str(_resolve_input(pair[0])), pair[1]) not in verified):
             raise ValueError('Accepted input manifest is not contained in verified raw receipts')
     if typed_rebind:
-        _verify_identity_map_rebinding(graph_doc, report, state, library_hash,
-                                       identity_hash, Path(state_path).resolve())
+        proof_inputs = _verify_identity_map_rebinding(
+            graph_doc, report, state, library_hash, identity_hash,
+            Path(state_path).resolve())
+    else:
+        proof_inputs = []
     return graph_doc, report, state, {
         'graph_export_path': str(Path(graph_path).resolve()),
         'graph_export_sha256': sha(graph_bytes),
@@ -115,11 +118,80 @@ def _verify_rebase_receipt(graph_path, report_path, state_path,
         'rebase_report_sha256': sha(report_bytes),
         'state_path': str(Path(state_path).resolve()),
         'state_file_sha256': sha(state_bytes),
+        'proof_input_receipts': proof_inputs,
         'raw_observation_receipt_count': len(raw_inputs),
         'anchored_observation_count': len(manifest['anchored_observation_inputs']),
         'accepted_input_manifest_sha256': sha(json.dumps(
             manifest, ensure_ascii=False, sort_keys=True,
             separators=(',', ':')).encode('utf-8')),
+    }
+
+
+def verify_typed_identity_map_rebinding(*, graph_export_path, rebase_report_path,
+                                        state_path, old_identity_map_path,
+                                        new_identity_map_path, library_sha256):
+    """Public offline verifier for a typed identity-map transition.
+
+    Replays the source graph and all map/title decision receipts, then checks the
+    caller's exact old/new map paths and hashes. Returns authenticated raw
+    observation inputs for consumers that need to rematch those saved sources.
+    """
+    old_path = Path(old_identity_map_path).resolve()
+    new_path = Path(new_identity_map_path).resolve()
+    old_hash, new_hash = sha(old_path.read_bytes()), sha(new_path.read_bytes())
+    graph, report, state, provenance = _verify_rebase_receipt(
+        graph_export_path, rebase_report_path, state_path, library_sha256, new_hash)
+    binding = report.get('identity_map_rebinding') or {}
+    recorded_old = binding.get('old_identity_map') or {}
+    recorded_new = binding.get('new_identity_map') or {}
+    track_snapshot = binding.get('track_snapshot') or {}
+    snapshot_path = _resolve_input(track_snapshot.get('path'))
+    if not snapshot_path.is_file() or sha(snapshot_path.read_bytes()) != track_snapshot.get('sha256'):
+        raise ValueError('Typed map transition track-snapshot receipt is missing or changed')
+    if (recorded_old.get('sha256') != old_hash
+            or _resolve_input(recorded_old.get('path')) != old_path
+            or recorded_new.get('sha256') != new_hash
+            or _resolve_input(recorded_new.get('path')) != new_path
+            or binding.get('old_identity_map_sha256') != old_hash
+            or binding.get('new_identity_map_sha256') != new_hash):
+        raise ValueError('Typed map transition does not bind the expected old/new map inputs')
+    if report.get('producer') != 'opengenius-typed-identity-map-rebinding-v2':
+        raise ValueError('Unsupported typed identity-map transition proof version')
+    proof_inputs = {
+        (str(Path(row['path']).resolve()), row['sha256'])
+        for row in provenance.get('proof_input_receipts', [])
+    }
+    proof_inputs.update({
+        (str(Path(graph_export_path).resolve()), sha(Path(graph_export_path).read_bytes())),
+        (str(Path(rebase_report_path).resolve()), sha(Path(rebase_report_path).read_bytes())),
+        (str(Path(state_path).resolve()), sha(Path(state_path).read_bytes())),
+        (str(snapshot_path), track_snapshot['sha256']),
+        (str(old_path), old_hash), (str(new_path), new_hash),
+    })
+    return {
+        'verified': True,
+        'library_sha256': library_sha256,
+        'old_identity_map_path': str(old_path),
+        'old_identity_map_sha256': old_hash,
+        'new_identity_map_path': str(new_path),
+        'new_identity_map_sha256': new_hash,
+        'report_path': str(Path(rebase_report_path).resolve()),
+        'report_sha256': sha(Path(rebase_report_path).read_bytes()),
+        'graph_export_path': str(Path(graph_export_path).resolve()),
+        'graph_export_sha256': sha(Path(graph_export_path).read_bytes()),
+        'state_path': str(Path(state_path).resolve()),
+        'state_file_sha256': sha(Path(state_path).read_bytes()),
+        'state_sha256': state.get('state_sha256'),
+        'track_snapshot_receipt': {'path': str(snapshot_path),
+                                   'sha256': track_snapshot['sha256']},
+        'accepted_input_manifest_sha256': binding.get('accepted_input_manifest_sha256'),
+        'authenticated_observation_inputs': binding.get('authenticated_observation_inputs'),
+        'proof_input_receipts': [
+            {'path': path, 'sha256': digest}
+            for path, digest in sorted(proof_inputs)
+        ],
+        'recording_identity_verified': False,
+        'recording_edges_added_by_rebinding': 0,
     }
 
 
@@ -131,7 +203,7 @@ def _verify_identity_map_rebinding(graph_doc, report, state, library_hash,
 
     binding = report.get('identity_map_rebinding')
     if (not isinstance(binding, dict)
-            or binding.get('schema_version') != 1
+            or binding.get('schema_version') != 2
             or binding.get('new_identity_map_sha256') != identity_hash
             or binding.get('library_sha256') != library_hash
             or any(binding.get(key) is not True for key in (
@@ -139,6 +211,15 @@ def _verify_identity_map_rebinding(graph_doc, report, state, library_hash,
                 'pid_gid_assignments_unchanged', 'metadata_bytes_unchanged',
                 'relation_bytes_unchanged', 'old_growth_replayed_with_old_map'))):
         raise ValueError('Typed identity-map rebinding proof is incomplete')
+    if (report.get('producer') != 'opengenius-typed-identity-map-rebinding-v2'
+            or binding.get('activated_title_alias_count', 0) < 1):
+        raise ValueError('Typed identity-map rebind proof lacks reviewed title aliases')
+    proof_inputs = {}
+
+    def record_proof_input(path, data):
+        resolved = str(path.resolve())
+        proof_inputs[(resolved, sha(data))] = {'path': resolved, 'sha256': sha(data)}
+
     def checked_file(record, description):
         if not isinstance(record, dict) or not isinstance(record.get('path'), str) or not isinstance(record.get('sha256'), str):
             raise ValueError('Malformed ' + description + ' receipt in identity-map rebinding')
@@ -146,6 +227,7 @@ def _verify_identity_map_rebinding(graph_doc, report, state, library_hash,
         data = path.read_bytes()
         if sha(data) != record['sha256']:
             raise ValueError(description + ' changed after identity-map rebinding')
+        record_proof_input(path, data)
         return path, data
 
     old_map_path, old_map_bytes = checked_file(binding.get('old_identity_map'), 'old identity map')
@@ -157,10 +239,15 @@ def _verify_identity_map_rebinding(graph_doc, report, state, library_hash,
         raise ValueError('Rebound identity maps do not share this Library')
     old_aliases = old_map.pop('artist_credit_aliases', [])
     new_aliases = new_map.pop('artist_credit_aliases', [])
-    if old_map != new_map or new_aliases[:len(old_aliases)] != old_aliases:
-        raise ValueError('Identity-map rebind changed fields other than append-only credit aliases')
+    old_titles = old_map.pop('track_title_aliases', [])
+    new_titles = new_map.pop('track_title_aliases', [])
+    if (old_map != new_map or new_aliases[:len(old_aliases)] != old_aliases
+            or new_titles[:len(old_titles)] != old_titles):
+        raise ValueError('Identity-map rebind changed fields beyond append-only reviewed aliases')
     if len(new_aliases) <= len(old_aliases):
         raise ValueError('Identity-map rebind did not add any reviewed credit aliases')
+    if len(new_titles) <= len(old_titles):
+        raise ValueError('Identity-map rebind did not add any reviewed title aliases')
 
     snapshot_path, snapshot_bytes = checked_file(binding.get('track_snapshot'), 'track snapshot')
     tracks, snapshot_library_hash, _ = load_library(track_snapshot=snapshot_path)
@@ -172,6 +259,92 @@ def _verify_identity_map_rebinding(graph_doc, report, state, library_hash,
     _, new_labels = _identity_source(new_matcher, library_hash, identity_hash)
     if old_labels != new_labels:
         raise ValueError('Local equivalence labels changed during identity-map rebind')
+
+    # Recreate the intermediate 29-credit map from the original root review,
+    # then independently reproduce the title-only stage from its strict receipt.
+    from music_identity_map import apply_artist_credit_alias_review
+    credit_receipt_path, credit_receipt_bytes = checked_file(
+        binding.get('alias_application_receipt'), 'credit alias application receipt')
+    credit_review_path, credit_review_bytes = checked_file(
+        binding.get('review_decisions'), 'credit alias review decisions')
+    credit_proposal_path, credit_proposal_bytes = checked_file(
+        binding.get('proposals'), 'credit alias proposals')
+    credit_receipt = json.loads(credit_receipt_bytes)
+    credit_review = json.loads(credit_review_bytes)
+    credit_proposals = json.loads(credit_proposal_bytes)
+    credit_report_ref = credit_proposals.get('source_report') or {}
+    credit_report_path = _resolve_input(credit_report_ref.get('path'))
+    credit_report_bytes = credit_report_path.read_bytes()
+    record_proof_input(credit_report_path, credit_report_bytes)
+    if (sha(credit_report_bytes) != credit_report_ref.get('sha256')
+            or credit_review.get('source_report_sha256') != credit_report_ref.get('sha256')
+            or credit_receipt.get('operation') != 'apply_reviewed_whole_artist_credit_aliases'
+            or credit_receipt.get('input_identity_map_sha256') != binding.get('old_identity_map_sha256')
+            or credit_receipt.get('review_decisions_sha256') != sha(credit_review_bytes)
+            or credit_receipt.get('proposal_sha256') != sha(credit_proposal_bytes)
+            or credit_receipt.get('recording_identity_verified') is not False):
+        raise ValueError('Whole-credit review/application receipt chain is incomplete')
+    composite = json.loads(credit_report_bytes)
+    audit_refs = {row.get('path'): row.get('sha256') for row in composite.get('source_audits', [])}
+    review_refs = {row.get('path'): row.get('sha256') for row in composite.get('prior_root_reviews', [])}
+    if not audit_refs or not review_refs:
+        raise ValueError('Composite whole-credit provenance omits candidate audits or prior reviews')
+    for refs in (audit_refs, review_refs):
+        for path_value, expected_hash in refs.items():
+            if not isinstance(path_value, str) or not isinstance(expected_hash, str):
+                raise ValueError('Malformed composite whole-credit provenance reference')
+            path = _resolve_input(path_value)
+            data = path.read_bytes()
+            if sha(data) != expected_hash:
+                raise ValueError('A source audit or earlier root review changed')
+            record_proof_input(path, data)
+    candidate_refs = {(row['candidate_audit'].get('path'), row['candidate_audit'].get('sha256'))
+                      for row in credit_proposals.get('proposals', [])
+                      if isinstance(row.get('candidate_audit'), dict)}
+    valid_audits = {(path, digest) for path, digest in audit_refs.items()}
+    if not candidate_refs or not candidate_refs.issubset(valid_audits):
+        raise ValueError('Whole-credit proposals are not bound to the composite candidate audits')
+    expected_credit_map = apply_artist_credit_alias_review(
+        json.loads(old_map_bytes), credit_review, credit_proposals, tracks,
+        library_hash, binding['old_identity_map_sha256'], sha(credit_proposal_bytes))
+    title_receipt_path, title_receipt_bytes = checked_file(
+        binding.get('title_alias_application_receipt'), 'title alias application receipt')
+    title_review_path, title_review_bytes = checked_file(
+        binding.get('title_review_decisions'), 'title review decisions')
+    title_proposal_path, title_proposal_bytes = checked_file(
+        binding.get('title_proposals'), 'title alias proposals')
+    title_receipt = json.loads(title_receipt_bytes)
+    title_intermediate = _resolve_input(title_receipt.get('input_identity_map_path'))
+    intermediate_bytes = title_intermediate.read_bytes()
+    record_proof_input(title_intermediate, intermediate_bytes)
+    if (sha(intermediate_bytes) != credit_receipt.get('output_identity_map_sha256')
+            or json.loads(intermediate_bytes) != expected_credit_map
+            or title_receipt.get('output_identity_map_sha256') != identity_hash
+            or title_receipt.get('review_decisions_sha256') != sha(title_review_bytes)
+            or title_receipt.get('proposal_sha256') != sha(title_proposal_bytes)):
+        raise ValueError('Intermediate credit map does not follow exact reviewed credit aliases')
+    from apply_artist_title_aliases import verify_title_alias_transition
+    verify_title_alias_transition(
+        track_snapshot=snapshot_path,
+        input_identity_map_path=title_intermediate,
+        output_identity_map_path=new_map_path,
+        proposals_path=title_proposal_path,
+        review_decisions_path=title_review_path,
+        receipt_path=title_receipt_path)
+    title_proposals_doc = json.loads(title_proposal_bytes)
+    title_report_ref = title_proposals_doc.get('source_report') or {}
+    title_report_path = _resolve_input(title_report_ref.get('path'))
+    title_report_bytes = title_report_path.read_bytes()
+    if sha(title_report_bytes) != title_report_ref.get('sha256'):
+        raise ValueError('Title candidate source report changed')
+    record_proof_input(title_report_path, title_report_bytes)
+    title_report_doc = json.loads(title_report_bytes)
+    for source in title_report_doc.get('input_files', []):
+        path = _resolve_input(source.get('path'))
+        data = path.read_bytes()
+        if sha(data) != source.get('sha256'):
+            raise ValueError('A cached title-candidate observation changed')
+        record_proof_input(path, data)
 
     baseline = binding.get('source_rebase')
     if not isinstance(baseline, dict):
@@ -185,11 +358,23 @@ def _verify_identity_map_rebinding(graph_doc, report, state, library_hash,
     base_graph, base_report, base_state, base_provenance = _verify_rebase_receipt(
         baseline.get('graph_export_path'), baseline.get('rebase_report_path'),
         baseline.get('state_path'), library_hash, binding['old_identity_map_sha256'])
+    for key, path_key in (('graph_export_sha256', 'graph_export_path'),
+                          ('rebase_report_sha256', 'rebase_report_path'),
+                          ('state_file_sha256', 'state_path')):
+        path = _resolve_input(baseline[path_key])
+        record_proof_input(path, path.read_bytes())
+    for row in base_report['relation_revalidation'].get('raw_input_provenance', []):
+        path = _resolve_input(row['path'])
+        data = path.read_bytes()
+        if sha(data) != row['sha256']:
+            raise ValueError('An authenticated baseline observation changed')
+        record_proof_input(path, data)
     base_roots = base_graph.get('accepted_roots')
     if _relation_map(base_roots, 'Rebinding source baseline') != _relation_map(
             _state_graph_rows(base_state), 'Rebinding source state'):
         raise ValueError('Rebinding source baseline graph differs from its state')
     source_state, source_roots = base_state, base_roots
+    normalized_runs = []
     growth = binding.get('source_growth')
     if growth is not None:
         if not isinstance(growth, dict) or not isinstance(growth.get('path'), str):
@@ -199,11 +384,25 @@ def _verify_identity_map_rebinding(graph_doc, report, state, library_hash,
         accepted_bytes = accepted_path.read_bytes()
         if sha(accepted_bytes) != growth.get('accepted_graphs_sha256'):
             raise ValueError('Old-map growth receipt changed after identity-map rebinding')
-        source_state, source_roots, _, accepted_hash = _replay_previous_growth(
+        source_state, source_roots, normalized_runs, accepted_hash = _replay_previous_growth(
             growth_dir, base_state, base_roots, base_provenance, old_matcher,
             library_hash, binding['old_identity_map_sha256'])
         if accepted_hash != growth.get('accepted_graphs_sha256'):
             raise ValueError('Old-map growth replay used a different receipt')
+        record_proof_input(accepted_path, accepted_bytes)
+        for run in normalized_runs:
+            for key in ('collector_summary', 'seed_manifest'):
+                receipt = run.get(key) or {}
+                if receipt.get('path'):
+                    path = _resolve_input(receipt['path'])
+                    record_proof_input(path, path.read_bytes())
+            sidecar = (run.get('seed_manifest') or {}).get('seed_video_evidence')
+            if sidecar and sidecar.get('path'):
+                path = _resolve_input(sidecar['path'])
+                record_proof_input(path, path.read_bytes())
+            for receipt in run.get('snapshot_inputs', []):
+                path = _resolve_input(receipt['path'])
+                record_proof_input(path, path.read_bytes())
     if source_state['state_sha256'] != binding.get('old_state_sha256'):
         raise ValueError('Old-map state does not match the replayed state in rebinding receipt')
     graph_roots = _relation_map(graph_doc.get('accepted_roots'), 'Rebound accepted roots')
@@ -213,6 +412,27 @@ def _verify_identity_map_rebinding(graph_doc, report, state, library_hash,
             or {pid: edges for pid, edges in graph_roots.items() if edges}
                != {pid: edges for pid, edges in replay_roots.items() if edges}):
         raise ValueError('Rebound graph differs from old-map graph replay')
+    baseline_audit = base_report['relation_revalidation']
+    baseline_manifest = baseline_audit.get('accepted_input_manifest') or {}
+    verified_baseline_raw = {(str(_resolve_input(row['path'])), row['sha256'])
+                             for row in baseline_audit.get('raw_input_provenance', [])}
+    authenticated_inputs = set()
+    for pair in baseline_manifest.get('anchored_observation_inputs', []):
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ValueError('Original rebase has malformed accepted-observation manifest')
+        receipt = (str(_resolve_input(pair[0])), pair[1])
+        if receipt not in verified_baseline_raw:
+            raise ValueError('Original accepted observation lacks its verified raw receipt')
+        authenticated_inputs.add(receipt)
+    if growth is not None:
+        for run in normalized_runs:
+            for source in run.get('snapshot_inputs', []):
+                authenticated_inputs.add((str(_resolve_input(source['path'])), source['sha256']))
+    unique_inputs = [{'path': path, 'sha256': digest}
+                     for path, digest in sorted(authenticated_inputs)]
+    if (binding.get('authenticated_observation_inputs') != unique_inputs
+            or binding.get('authenticated_observation_input_count') != len(unique_inputs)):
+        raise ValueError('Typed transition authenticated-input set differs from accepted replay receipts')
     expected = json.loads(json.dumps(source_state))
     expected['source']['identity_map_sha256'] = identity_hash
     unsigned = {key: value for key, value in expected.items() if key != 'state_sha256'}
@@ -226,6 +446,7 @@ def _verify_identity_map_rebinding(graph_doc, report, state, library_hash,
             _state_graph_rows(state), 'Rebound state relation rows').items() if edges}
             != {pid: edges for pid, edges in replay_roots.items() if edges}):
         raise ValueError('Rebound state relation bytes do not preserve the old graph')
+    return [proof_inputs[key] for key in sorted(proof_inputs)]
 
 
 def _state_graph_rows(state):
@@ -382,11 +603,28 @@ def _replay_previous_growth(previous_dir, baseline_state, baseline_roots,
     accepted_path = previous_dir / 'accepted-graphs.json'
     accepted_bytes = accepted_path.read_bytes()
     accepted = json.loads(accepted_bytes)
+    recorded_provenance = accepted.get('baseline_rebase_provenance')
+    # `proof_input_receipts` was added after some accepted growth outputs had
+    # already been written. The current verifier reconstructs those receipts
+    # from the typed transition and validates their source hashes above, but
+    # their absence in a historical output is not a changed baseline. Keep all
+    # substantive provenance fields exact, and accept no other omission.
+    legacy_provenance = (
+        isinstance(recorded_provenance, dict)
+        and isinstance(baseline_provenance, dict)
+        and 'proof_input_receipts' not in recorded_provenance
+        and set(recorded_provenance) == set(baseline_provenance) - {'proof_input_receipts'}
+        and all(recorded_provenance[key] == value
+                for key, value in baseline_provenance.items()
+                if key != 'proof_input_receipts')
+    )
+    provenance_matches = (recorded_provenance == baseline_provenance
+                          or legacy_provenance)
     if (accepted.get('producer') != 'opengenius-ytmusic-recommendation-growth-rebased-merge-v1'
             or accepted.get('library_sha256') != library_hash
             or accepted.get('identity_map_sha256') != identity_hash
             or accepted.get('baseline_state_sha256') != baseline_state.get('state_sha256')
-            or accepted.get('baseline_rebase_provenance') != baseline_provenance
+            or not provenance_matches
             or _relation_map(accepted.get('baseline_accepted_roots'), 'Previous baseline roots')
                != _relation_map(baseline_roots, 'Current baseline roots')):
         raise ValueError('Previous growth output does not share this exact verified YT Music baseline')

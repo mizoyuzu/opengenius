@@ -128,6 +128,28 @@ class RebasedRadioGrowthTests(unittest.TestCase):
                  if row['root_pid'] == pid)[:len(edges)] == edges
             for pid, edges in old_edges.items()))
 
+    def test_historical_growth_accepts_only_missing_auxiliary_proof_receipts(self):
+        run, snapshot_input, root_pid, targets = self.run_receipt(PID2, [PID3], 'legacy')
+        previous, _, _, graph = self.make_previous_output(
+            run, snapshot_input, root_pid, targets)
+        current_provenance = {
+            **self.baseline_provenance,
+            'proof_input_receipts': [{'path': '/verified/source.json',
+                                      'sha256': '3' * 64}],
+        }
+        with patch.object(merger, 'collect_graphs', return_value=(
+                [graph], [], [snapshot_input])), patch.object(merger, 'merge_graphs',
+                    return_value=[{'root_pid': PID2, 'ordered_target_pids': [PID3]}]):
+            merger._replay_previous_growth(
+                previous, self.baseline, self.baseline_roots, current_provenance,
+                self.matcher, LIBRARY_HASH, self.identity_hash)
+
+            changed = {**current_provenance, 'graph_export_sha256': '4' * 64}
+            with self.assertRaisesRegex(ValueError, 'exact verified YT Music baseline'):
+                merger._replay_previous_growth(
+                    previous, self.baseline, self.baseline_roots, changed,
+                    self.matcher, LIBRARY_HASH, self.identity_hash)
+
     def test_previous_growth_replay_rejects_changed_raw_snapshot(self):
         run, snapshot_input, root_pid, targets = self.run_receipt(PID2, [PID3], 'first')
         previous, _, _, graph = self.make_previous_output(

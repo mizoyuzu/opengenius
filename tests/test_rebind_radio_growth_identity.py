@@ -38,9 +38,10 @@ class RadioGrowthIdentityRebindingTests(unittest.TestCase):
         self.new_matcher = IdentityMap(self.new_map, self.tracks, LIBRARY)
 
     def test_only_append_only_credit_aliases_can_rebind(self):
-        old_aliases, new_aliases = _stable_map_delta(self.old_map, self.new_map)
+        old_aliases, new_aliases, title_delta = _stable_map_delta(self.old_map, self.new_map)
         self.assertEqual(old_aliases, [])
         self.assertEqual(len(new_aliases), 1)
+        self.assertEqual(title_delta, [])
         _, old_labels = _source(self.old_matcher, LIBRARY, self.old_hash)
         _, new_labels = _source(self.new_matcher, LIBRARY, self.new_hash)
         self.assertEqual(old_labels, new_labels)
@@ -53,6 +54,26 @@ class RadioGrowthIdentityRebindingTests(unittest.TestCase):
         removed['artist_credit_aliases'] = []
         with self.assertRaisesRegex(ValueError, 'differ beyond'):
             _stable_map_delta(self.new_map, removed)
+
+    def test_only_append_only_reviewed_title_alias_rows_can_rebind(self):
+        base = copy.deepcopy(self.old_map)
+        base['track_title_aliases'] = [{
+            'persistent_id': PID1, 'original_title': 'Root',
+            'aliases': [{'value': 'Root EN', 'enabled': False, 'status': 'needs_review'}]}]
+        titled = copy.deepcopy(self.new_map)
+        titled['track_title_aliases'] = copy.deepcopy(base['track_title_aliases'])
+        titled['track_title_aliases'].append({
+            'persistent_id': PID2, 'original_title': 'Target',
+            'aliases': [{'value': 'Target - Target EN', 'enabled': True,
+                         'status': 'reviewed_spelling_alias', 'reason': 'Exact title suffix.'}],
+        })
+        old_aliases, new_aliases, title_delta = _stable_map_delta(base, titled)
+        self.assertEqual(len(new_aliases) - len(old_aliases), 1)
+        self.assertEqual(len(title_delta), 1)
+        mutated = copy.deepcopy(titled)
+        mutated['track_title_aliases'][0]['original_title'] = 'Changed'
+        with self.assertRaisesRegex(ValueError, 'append-only'):
+            _stable_map_delta(base, mutated)
 
     def test_rebound_state_changes_only_map_hash_and_preserves_gid_and_edges(self):
         roots = [{'root_pid': PID1, 'ordered_target_pids': [PID2]},
