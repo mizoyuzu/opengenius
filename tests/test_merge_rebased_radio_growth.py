@@ -139,6 +139,108 @@ class RebasedRadioGrowthTests(unittest.TestCase):
                  if row['root_pid'] == pid)[:len(edges)] == edges
             for pid, edges in old_edges.items()))
 
+    def test_replay_and_append_preserves_typed_boundary_across_two_radio_runs(self):
+        legacy_run, legacy_input, legacy_pid, legacy_targets = self.run_receipt(
+            PID2, [PID3], 'boundary-legacy')
+        legacy_parent, state, roots, _ = self.make_previous_output(
+            legacy_run, legacy_input, legacy_pid, legacy_targets)
+        legacy_graph_path = legacy_parent / 'accepted-graphs.json'
+        transition = {
+            'schema_version': 1,
+            'producer': 'opengenius-radio-source-policy-transition-v1',
+            'from_policy': 'legacy-related-required-v1',
+            'to_policy': 'authenticated-watch-radio-only-v1',
+            'legacy_parent_growth': {
+                'path': str(legacy_graph_path.resolve()),
+                'sha256': hashlib.sha256(legacy_graph_path.read_bytes()).hexdigest(),
+            },
+            'legacy_run_count': 1,
+            'promotion_http_requests': 0,
+            'promotion_attempt_delta': 0,
+        }
+
+        def write_growth(directory, growth_runs, state_doc, root_rows):
+            directory.mkdir()
+            accepted = {
+                'schema_version': 1,
+                'producer': 'opengenius-ytmusic-recommendation-growth-rebased-merge-v1',
+                'library_sha256': LIBRARY_HASH,
+                'identity_map_sha256': self.identity_hash,
+                'baseline_state_sha256': self.baseline['state_sha256'],
+                'baseline_rebase_provenance': self.baseline_provenance,
+                'baseline_accepted_roots': self.baseline_roots,
+                'source_policy': 'authenticated-watch-radio-only-v1',
+                'source_policy_transition': transition,
+                'growth_runs': growth_runs,
+                'accepted_roots': root_rows,
+            }
+            self.write_json(directory / 'accepted-graphs.json', accepted)
+            self.write_json(directory / 'state.json', state_doc)
+            self.write_json(directory / 'relations.json', {'relation_rows': root_rows})
+            self.write_json(directory / 'accepted-evaluation.json', {
+                'virtual_state_sha256': state_doc['state_sha256'],
+                'relation_rows': root_rows})
+
+        radio1, radio1_input, radio1_pid, radio1_targets = self.run_receipt(
+            PID3, [PID1], 'boundary-radio-1')
+        radio1.update(source_policy='authenticated-watch-radio-only-v1',
+                      source_policy_transition=transition)
+        rows1, _ = merger._append_graphs(
+            roots, [{'root_pid': radio1_pid,
+                     'ordered_target_pids': radio1_targets}])
+        state1 = plan_genius_update(
+            state, rows1, self.matcher, LIBRARY_HASH,
+            self.identity_hash)['next_state']
+        radio1['resulting_state_sha256'] = state1['state_sha256']
+        first_promotion = self.root / 'first-radio-growth'
+        write_growth(first_promotion, [legacy_run, radio1], state1, rows1)
+
+        graph_by_path = {
+            legacy_input['path']: {'root_pid': legacy_pid,
+                                   'ordered_target_pids': legacy_targets,
+                                   'input': legacy_input, 'observations': [{}],
+                                   'candidate_groups': []},
+            radio1_input['path']: {'root_pid': radio1_pid,
+                                   'ordered_target_pids': radio1_targets,
+                                   'input': radio1_input, 'observations': [{}],
+                                   'candidate_groups': []},
+        }
+
+        def replay_graphs(paths, *_args, **_kwargs):
+            selected = [graph_by_path[str(Path(path).resolve())] for path in paths]
+            return selected, [], [graph['input'] for graph in selected]
+
+        with patch.object(merger, 'collect_graphs', side_effect=replay_graphs):
+            replayed_state, replayed_roots, normalized_runs, _ = merger._replay_previous_growth(
+                first_promotion, self.baseline, self.baseline_roots,
+                self.baseline_provenance, self.matcher, LIBRARY_HASH,
+                self.identity_hash)
+        self.assertEqual(normalized_runs[1]['source_policy_transition'], transition)
+
+        radio2, radio2_input, radio2_pid, radio2_targets = self.run_receipt(
+            PID1, [PID2], 'boundary-radio-2')
+        radio2['source_policy'] = 'authenticated-watch-radio-only-v1'
+        rows2, _ = merger._append_graphs(
+            replayed_roots, [{'root_pid': radio2_pid,
+                              'ordered_target_pids': radio2_targets}])
+        state2 = plan_genius_update(
+            replayed_state, rows2, self.matcher, LIBRARY_HASH,
+            self.identity_hash)['next_state']
+        radio2['resulting_state_sha256'] = state2['state_sha256']
+        second_promotion = self.root / 'second-radio-growth'
+        write_growth(second_promotion, [*normalized_runs, radio2], state2, rows2)
+        graph_by_path[radio2_input['path']] = {
+            'root_pid': radio2_pid, 'ordered_target_pids': radio2_targets,
+            'input': radio2_input, 'observations': [{}], 'candidate_groups': []}
+        with patch.object(merger, 'collect_graphs', side_effect=replay_graphs):
+            _, replayed_final_roots, final_runs, _ = merger._replay_previous_growth(
+                second_promotion, self.baseline, self.baseline_roots,
+                self.baseline_provenance, self.matcher, LIBRARY_HASH,
+                self.identity_hash)
+        self.assertEqual(len(final_runs), 3)
+        self.assertEqual(final_runs[1]['source_policy_transition'], transition)
+        self.assertEqual(replayed_final_roots, rows2)
+
     def test_historical_growth_accepts_only_missing_auxiliary_proof_receipts(self):
         run, snapshot_input, root_pid, targets = self.run_receipt(PID2, [PID3], 'legacy')
         previous, _, _, graph = self.make_previous_output(

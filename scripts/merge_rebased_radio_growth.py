@@ -659,6 +659,12 @@ def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
     }
     if source_policy is not None:
         normalized_run['source_policy'] = source_policy
+    if 'source_policy_transition' in run:
+        # Preserve the typed boundary receipt when a later radio-only run is
+        # appended. The boundary is validated above against the exact
+        # historical parent; dropping it here would make the next replay
+        # unable to prove where legacy runs ended.
+        normalized_run['source_policy_transition'] = run['source_policy_transition']
     if evidence_info is not None:
         normalized_run['seed_manifest']['seed_video_evidence'] = {
             'path': str(evidence_path), 'sha256': evidence_info['sha256']}
