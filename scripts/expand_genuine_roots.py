@@ -516,14 +516,17 @@ def _validate_prior_attempt_ledger(path, library_hash, track_snapshot_sha256,
             authorized_rebound_retry_pids, current_identity_map_sha256)
         has_release_field = 'authorized_retry_release_pids' in prior_config
         releases = prior_config.get('authorized_retry_release_pids', [])
+        expected_releases = (set(authorized_rebound_retry_pids or ()) -
+                             parent_ledger['same_map_attempted_pids'])
+        if prior_config.get('source_policy') == 'authenticated-watch-radio-only-v1':
+            expected_releases = set()
         if (not isinstance(releases, list)
                 or any(not isinstance(pid, str) or not re.fullmatch(r'[0-9A-F]{16}', pid)
                        for pid in releases)
                 or len(releases) != len(set(releases))
                 or (has_release_field and (
                     authorized_rebound_retry_pids is None
-                    or set(releases) != (set(authorized_rebound_retry_pids) -
-                                         parent_ledger['same_map_attempted_pids'])))
+                    or set(releases) != expected_releases))
                 or (not has_release_field and releases)):
             raise RecoveryUnsafe('Prior progress retry releases differ from its parent ledger')
         prior_parent_attempts = parent_ledger['attempted_pids'] - set(releases)
@@ -1123,6 +1126,11 @@ def run(args):
             authorized_rebound_retry_pids=retry_release_pids,
             current_identity_map_sha256=identity_hash)
         retry_release_pids -= prior_ledger['same_map_attempted_pids']
+        if getattr(args, 'source_policy', None) == 'authenticated-watch-radio-only-v1':
+            # The radio-only stage is on the same active map as the imported
+            # attempts. Rebound search-unresolved hints may seed discovery only
+            # after a real map transition; they never release same-map attempts.
+            retry_release_pids.clear()
         if prior_ledger['http_requests'] > args.global_request_budget:
             raise RecoveryUnsafe('Global request budget is below prior-attempt consumption')
         if prior_ledger['outgoing_roots'] != sum(bool(edges) for edges in baseline_roots.values()):

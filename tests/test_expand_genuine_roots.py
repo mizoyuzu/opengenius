@@ -102,6 +102,38 @@ class GenuineRootRunnerTests(unittest.TestCase):
             self.assertNotIn('plan_only_batches', progress['config'])
             self.assertEqual(progress['batches'], [])
 
+    def test_radio_policy_never_releases_same_map_rebound_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args, tracks, _ = self._run_fixture(
+                root, max_attempts=10, request_budget=10, batch_size=1)
+            args.plan_only = True
+            args.plan_only_batches = 1
+            args.source_policy = 'authenticated-watch-radio-only-v1'
+            args.prior_attempt_ledger = root / 'ledger.json'
+            args.prior_attempt_ledger.write_text('{}', encoding='utf-8')
+            pid = '0000000000000001'
+            imported = {
+                'attempted_pids': {pid}, 'same_map_attempted_pids': set(),
+                'http_requests': 1, 'outgoing_roots': 0,
+            }
+            printed = []
+            with patch.object(runner, 'load_library', return_value=(tracks, LIBRARY, {})), \
+                    patch.object(runner, 'IdentityMap', return_value=Matcher()), \
+                    patch.object(runner, '_authorized_rebound_retry_pids',
+                                 return_value={pid}), \
+                    patch.object(runner, '_validate_prior_attempt_ledger',
+                                 return_value=imported), \
+                    patch.object(runner, '_replay_checkpoint',
+                                 return_value={'outgoing_root_count': 0}), \
+                    patch('builtins.print', side_effect=printed.append):
+                progress = runner.run(args)
+            self.assertEqual(progress['config']['authorized_retry_release_pids'], [])
+            self.assertEqual(progress['attempted_pids'], [pid])
+            planned = next(json.loads(line) for line in printed
+                           if json.loads(line).get('batch') == 1)
+            self.assertNotIn(pid, planned['planned_seeds'])
+
     def test_dynamic_rebound_hint_frontier_filters_pid_and_video_collisions(self):
         rebound = {'producer': runner.REBOUND_PRODUCER,
                    'rows': [{'persistent_id': 'A' * 16, 'video_id': 'video-a'}]}
@@ -184,6 +216,46 @@ class GenuineRootRunnerTests(unittest.TestCase):
                     'sha256': runner._sha(staged_raw),
                 }
                 ledger_path.write_text(json.dumps(ledger), encoding='utf-8')
+
+            legacy_staged = json.loads(Path(staged_progress['path']).read_text())
+            radio_staged = json.loads(json.dumps(legacy_staged))
+            radio_staged['config']['source_policy'] = 'authenticated-watch-radio-only-v1'
+            radio_staged['config']['authorized_retry_release_pids'] = []
+            radio_staged['batches'][0]['attempted_pids'] = ['3' * 16]
+            staged_path = Path(staged_progress['path'])
+            staged_raw = json.dumps(radio_staged, sort_keys=True).encode()
+            staged_path.write_bytes(staged_raw)
+            ledger['prior_progress'] = {
+                'path': str(staged_path.resolve()), 'sha256': runner._sha(staged_raw)}
+            ledger_path.write_text(json.dumps(ledger), encoding='utf-8')
+            with patch.object(runner, '_verify_progress_receipts') as replay:
+                radio_result = runner._validate_prior_attempt_ledger(
+                    ledger_path, LIBRARY, track_hash,
+                    authorized_rebound_retry_pids={'2' * 16},
+                    current_identity_map_sha256=map_hash)
+            self.assertEqual(radio_result['attempted_pids'],
+                             {'1' * 16, '2' * 16, '3' * 16})
+            self.assertEqual(replay.call_args_list[-1].args[3],
+                             {'1' * 16, '2' * 16})
+            bad_radio = json.loads(json.dumps(radio_staged))
+            bad_radio['config']['authorized_retry_release_pids'] = ['2' * 16]
+            bad_raw = json.dumps(bad_radio, sort_keys=True).encode()
+            staged_path.write_bytes(bad_raw)
+            ledger['prior_progress'] = {
+                'path': str(staged_path.resolve()), 'sha256': runner._sha(bad_raw)}
+            ledger_path.write_text(json.dumps(ledger), encoding='utf-8')
+            with patch.object(runner, '_verify_progress_receipts'):
+                with self.assertRaisesRegex(
+                        runner.RecoveryUnsafe, 'retry releases differ from its parent ledger'):
+                    runner._validate_prior_attempt_ledger(
+                        ledger_path, LIBRARY, track_hash,
+                        authorized_rebound_retry_pids={'2' * 16},
+                        current_identity_map_sha256=map_hash)
+            legacy_raw = json.dumps(legacy_staged, sort_keys=True).encode()
+            staged_path.write_bytes(legacy_raw)
+            ledger['prior_progress'] = {
+                'path': str(staged_path.resolve()), 'sha256': runner._sha(legacy_raw)}
+            ledger_path.write_text(json.dumps(ledger), encoding='utf-8')
 
             staged = json.loads(Path(staged_progress['path']).read_text())
             staged['config']['prior_attempt_ledger']['sha256'] = '0' * 64
