@@ -199,13 +199,30 @@ def _candidate_for_video(snapshot, video_id, persistent_id, matcher):
     return True
 
 
+def _strict_album_metadata_match(remote_album, local_album, candidate, matcher):
+    """Require exact album metadata or a validated whole-album map alias."""
+    if candidate.get('album_match') is not True:
+        return False
+    if normalize(local_album or '') == normalize(remote_album or ''):
+        return True
+    # IdentityMap validates alias targets against unique canonical Library
+    # album values. Consult its exact raw source key here; do not infer an
+    # alias from normalization, partial text, or the candidate flag alone.
+    if not isinstance(matcher, IdentityMap):
+        return False
+    aliases = matcher.album_title_aliases
+    return bool(remote_album and local_album
+                and aliases.get(remote_album) == local_album)
+
+
 def strict_cached_search_match(results, seed, matcher):
     """Resolve cached search rows only on a unique, strict metadata match.
 
     This resolver is intentionally stricter than the live collector's seed
     resolver: cached alias-rematch hints must carry a complete credit, active
     title, same version signature, duration within the matcher limit, and an
-    exact album label. It returns no recording verification or graph evidence.
+    exact album label or validated whole-album metadata alias. It returns no
+    recording verification or graph evidence.
     """
     if not isinstance(results, list):
         return None
@@ -234,10 +251,11 @@ def strict_cached_search_match(results, seed, matcher):
             return None
         local = found[0].get('local_metadata') or {}
         remote_title = remote.get('title')
+        remote_album = (match_row.get('album') or {}).get('name')
         if (not isinstance(remote_title, str)
                 or version_signature(local.get('title') or '') != version_signature(remote_title)
-                or normalize(local.get('album') or '') != normalize(
-                    (match_row.get('album') or {}).get('name') or '')):
+                or not _strict_album_metadata_match(
+                    remote_album, local.get('album'), found[0], matcher)):
             return None
         selected.setdefault(video_id, []).append({
             'position': position,

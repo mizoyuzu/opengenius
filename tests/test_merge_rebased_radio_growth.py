@@ -57,7 +57,18 @@ class RebasedRadioGrowthTests(unittest.TestCase):
             'identity_map_sha256': self.identity_hash,
             'seeds': [{'persistent_id': root_pid}],
         })
-        snapshot = self.write_json(self.root / (label + '-snapshot.json'), {'saved': label})
+        # Historical growth snapshots must carry the complete v1 source
+        # qualification, even when the rest of the graph replay is mocked.
+        snapshot = self.write_json(self.root / (label + '-snapshot.json'), {
+            'saved': label,
+            'account_authentication_verified': True,
+            'related_status': 'collected',
+            'requests': [{'endpoint': endpoint} for endpoint in
+                         ('watch_radio', 'watch_seed', 'song_related')],
+            # Historical qualification required the related endpoint to have
+            # completed; it did not require a strict related observation row.
+            'observations': [{'relation': 'radio'}],
+        })
         snapshot_input = {'path': str(snapshot.resolve()),
                           'sha256': hashlib.sha256(snapshot.read_bytes()).hexdigest()}
         return {
@@ -213,6 +224,49 @@ class RebasedRadioGrowthTests(unittest.TestCase):
                 run, self.tracks, self.matcher, LIBRARY_HASH, self.identity_hash)
         self.assertEqual(roots, [{'root_pid': PID2, 'ordered_target_pids': [PID3]}])
         self.assertEqual(normalized['skipped_snapshots'], skipped)
+
+    def test_legacy_growth_gate_rejects_proof_stripped_radio_snapshot(self):
+        snapshot = self.write_json(self.root / 'stripped-radio.json', {
+            'account_authentication_verified': True,
+            'related_status': 'parser_error',
+            'requests': [{'endpoint': 'watch_radio'}, {'endpoint': 'watch_seed'}],
+            'observations': [{'relation': 'radio'}],
+            # This models the sanitized envelope after its proof receipt was
+            # removed. The old growth policy cannot admit it as a legacy run.
+        })
+        with self.assertRaisesRegex(ValueError, 'related-required source policy'):
+            merger._require_legacy_source_policy([snapshot])
+
+    def test_policy_transition_requires_exact_zero_call_boundary_and_order(self):
+        transition = {
+            'schema_version': 1,
+            'producer': 'opengenius-radio-source-policy-transition-v1',
+            'from_policy': 'legacy-related-required-v1',
+            'to_policy': 'authenticated-watch-radio-only-v1',
+            'legacy_parent_growth': {'path': '/tmp/legacy/accepted-graphs.json',
+                                     'sha256': 'a' * 64},
+            'legacy_run_count': 1,
+            'promotion_http_requests': 0,
+            'promotion_attempt_delta': 0,
+        }
+        runs = [{'source_policy': None},
+                {'source_policy': 'authenticated-watch-radio-only-v1',
+                 'source_policy_transition': transition}]
+        self.assertEqual(merger._validate_source_policy_history(
+            'authenticated-watch-radio-only-v1', transition, runs), 1)
+
+        changed = {**transition, 'promotion_http_requests': 1}
+        changed_runs = [runs[0], {**runs[1], 'source_policy_transition': changed}]
+        with self.assertRaisesRegex(ValueError, 'zero-call'):
+            merger._validate_source_policy_history(
+                'authenticated-watch-radio-only-v1', changed, changed_runs)
+
+        duplicate = [runs[0], runs[1],
+                     {'source_policy': 'authenticated-watch-radio-only-v1',
+                      'source_policy_transition': transition}]
+        with self.assertRaisesRegex(ValueError, 'one typed policy boundary'):
+            merger._validate_source_policy_history(
+                'authenticated-watch-radio-only-v1', transition, duplicate)
 
 
 if __name__ == '__main__':

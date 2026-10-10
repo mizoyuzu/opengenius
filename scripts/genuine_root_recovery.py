@@ -218,7 +218,8 @@ def recover_orphan_batch(batch_dir, *, expected_config_sha256,
     if (intent.get('schema_version') != 1
             or intent.get('runner_config_sha256') != expected_config_sha256
             or intent.get('library_sha256') != library_sha256
-            or intent.get('identity_map_sha256') != identity_map_sha256):
+            or intent.get('identity_map_sha256') != identity_map_sha256
+            or intent.get('source_policy') != config.get('source_policy')):
         raise RecoveryUnsafe('Orphan batch intent differs from current sources or runner configuration')
     if intent.get('previous_growth') != expected_previous_growth:
         raise RecoveryUnsafe('Orphan batch was planned from a different growth checkpoint')
@@ -370,6 +371,7 @@ def recover_orphan_batch(batch_dir, *, expected_config_sha256,
 
     collected = {row['persistent_id'] for row in results if row.get('status') == 'collected'}
     snapshot_receipts, genuine_receipts = [], []
+    original_snapshot_paths = []
     for path in sorted(collector_dir.glob('[0-9A-F]' * 16 + '.json')):
         pid = path.stem
         if pid not in collected:
@@ -388,10 +390,28 @@ def recover_orphan_batch(batch_dir, *, expected_config_sha256,
             raise RecoveryUnsafe('Orphan snapshot is not bound to its authenticated seed and source map')
         receipt = {'path': str(path.resolve()), 'sha256': hashlib.sha256(raw).hexdigest()}
         snapshot_receipts.append(receipt)
+        original_snapshot_paths.append(path.resolve())
         if _snapshot_is_genuine(snapshot):
             genuine_receipts.append(receipt)
     if collected != {Path(receipt['path']).stem for receipt in snapshot_receipts}:
         raise RecoveryUnsafe('A collected seed is missing its saved snapshot')
+
+    radio_source = None
+    if config.get('source_policy') == 'authenticated-watch-radio-only-v1':
+        try:
+            from radio_source_integration import prepare_radio_only_snapshots
+            radio_source = prepare_radio_only_snapshots(
+                track_snapshot_path=config['track_snapshot']['path'],
+                identity_map_path=config['identity_map']['path'],
+                batch_dir=batch_dir,
+                collector_summary_path=summary_path,
+                collector_seed_manifest_path=manifest_path,
+                snapshot_paths=original_snapshot_paths)
+        except Exception as error:
+            raise RecoveryUnsafe('Radio-only source proofs failed to build or replay') from error
+        genuine_receipts = radio_source['snapshot_inputs']
+    elif config.get('source_policy') is not None:
+        raise RecoveryUnsafe('Orphan runner config has an unsupported source policy')
 
     growth_dir = batch_dir / 'growth'
     growth_receipt = None
@@ -412,6 +432,7 @@ def recover_orphan_batch(batch_dir, *, expected_config_sha256,
         'seed_video_evidence': intent['seed_video_evidence'],
         'snapshot_inputs': snapshot_receipts,
         'genuine_snapshot_inputs': genuine_receipts,
+        'radio_only_source': radio_source,
         'growth_receipt': growth_receipt,
         'requires_typed_growth_replay': growth_receipt is not None,
     }

@@ -77,6 +77,9 @@ def _merge_batch(args, batch_dir, summary_path, evidence_path, snapshot_paths,
                '--collector-summary', str(summary_path), '--seed-manifest',
                str(collector_dir / 'seeds.json'), '--seed-video-evidence',
                str(evidence_path), '--output', str(output)]
+    source_policy = getattr(args, 'source_policy', None)
+    if source_policy is not None:
+        command.extend(['--source-policy', source_policy])
     for snapshot_path in snapshot_paths:
         command.extend(['--snapshot', str(snapshot_path)])
     if active_growth:
@@ -98,6 +101,7 @@ def _replay_checkpoint(args, growth_dir):
 
 def _batch_record_from_recovery(recovered, growth_dir):
     growth_file = Path(growth_dir) / 'accepted-graphs.json' if growth_dir else None
+    radio_source = recovered.get('radio_only_source') or {}
     record = {
         'batch': recovered['batch'],
         'seed_pids': recovered['seed_pids'],
@@ -118,6 +122,9 @@ def _batch_record_from_recovery(recovered, growth_dir):
     }
     if recovered.get('preflight_intent_receipt') is not None:
         record['preflight_intent_receipt'] = recovered['preflight_intent_receipt']
+    if radio_source:
+        record['source_policy'] = radio_source['source_policy']
+        record['radio_only_source'] = radio_source
     return record
 
 
@@ -150,8 +157,17 @@ def _promote_orphan(args, progress, batch_dir, active_growth, config,
         genuine_paths = [Path(row['path']) for row in recovered['genuine_snapshot_inputs']]
         from evaluate_ytmusic_batch import collect_graphs
         try:
-            graphs, _, _ = collect_graphs(genuine_paths, matcher, library_hash)
-        except ValueError:
+            source_policy = config.get('source_policy')
+            if source_policy is None:
+                graphs, _, _ = collect_graphs(genuine_paths, matcher, library_hash)
+            else:
+                graphs, _, _ = collect_graphs(
+                    genuine_paths, matcher, library_hash,
+                    source_policy=source_policy,
+                    identity_map_sha256=identity_hash)
+        except ValueError as error:
+            if config.get('source_policy') is not None:
+                raise RecoveryUnsafe('Proof-backed collector snapshots failed typed merge validation') from error
             graphs = []
         if not graphs:
             # Authenticated endpoints alone do not create an accepted root.
@@ -331,6 +347,27 @@ def _verify_progress_receipts(progress, library_hash, identity_hash,
         for receipt in row.get('snapshot_inputs', []):
             if _sha(Path(receipt['path']).read_bytes()) != receipt['sha256']:
                 raise ValueError('A saved collector snapshot changed')
+        if config.get('source_policy') == 'authenticated-watch-radio-only-v1':
+            from radio_source_integration import prepare_radio_only_snapshots
+            source = row.get('radio_only_source')
+            if (not isinstance(source, dict)
+                    or source.get('source_policy') != config['source_policy']
+                    or not isinstance(source.get('output_dir'), str)):
+                raise ValueError('Radio-policy progress lacks its proof-backed source receipt')
+            reproduced = prepare_radio_only_snapshots(
+                track_snapshot_path=config['track_snapshot']['path'],
+                identity_map_path=config['identity_map']['path'],
+                batch_dir=collector_dir.parent,
+                collector_summary_path=row['collector_summary']['path'],
+                collector_seed_manifest_path=row['seed_manifest']['path'],
+                snapshot_paths=[Path(receipt['path']) for receipt in snapshot_receipts],
+                output_dir=source['output_dir'], create_missing=False)
+            if (reproduced != source
+                    or row.get('snapshots') != [receipt['path']
+                                                for receipt in reproduced['snapshot_inputs']]):
+                raise ValueError('Radio-policy progress differs from full proof and snapshot replay')
+        elif row.get('source_policy') is not None or row.get('radio_only_source') is not None:
+            raise ValueError('Legacy progress contains an unconfigured radio-only source receipt')
         growth = row.get('growth_receipt')
         if growth is not None and _sha(Path(growth['path']).read_bytes()) != growth['sha256']:
             raise ValueError('A saved growth checkpoint changed')
@@ -434,9 +471,15 @@ def _validate_prior_attempt_ledger(path, library_hash, track_snapshot_sha256,
     required = {'schema_version', 'producer', 'prior_progress',
                 'attempt_only_progress', 'interruption_incidents', 'http_requests_total',
                 'excluded_persistent_ids', 'base_outgoing_roots'}
+    ledger_version = ledger.get('schema_version') if isinstance(ledger, dict) else None
+    if ledger_version == 2:
+        required = required | {'promotion_receipt'}
+        expected_producer = 'opengenius-genuine-root-attempt-ledger-v2'
+    else:
+        expected_producer = 'opengenius-genuine-root-attempt-ledger-v1'
     if (not isinstance(ledger, dict) or set(ledger) != required
-            or ledger.get('schema_version') != 1
-            or ledger.get('producer') != 'opengenius-genuine-root-attempt-ledger-v1'
+            or ledger_version not in (1, 2)
+            or ledger.get('producer') != expected_producer
             or type(ledger.get('http_requests_total')) is not int
             or ledger['http_requests_total'] < 0
             or type(ledger.get('base_outgoing_roots')) is not int
@@ -627,13 +670,179 @@ def _validate_prior_attempt_ledger(path, library_hash, track_snapshot_sha256,
     expected_excluded = sorted(prior_attempted | incident_pids | historical_attempts)
     if ledger.get('excluded_persistent_ids') != expected_excluded:
         raise RecoveryUnsafe('Prior-attempt PID exclusions differ from hash-verified receipts')
+    promoted_roots = None
+    if ledger_version == 2:
+        promotion_path = checked_receipt(ledger.get('promotion_receipt'),
+                                         'radio source promotion')
+        promotion = _read_json(promotion_path)
+        promotion_required = {
+            'schema_version', 'producer', 'source_policy', 'source_progress',
+            'track_snapshot', 'identity_map', 'baseline_state',
+            'baseline_graph_export', 'rebase_report', 'parent_growth',
+            'promoted_growth', 'http_requests_before', 'http_requests_after',
+            'attempted_pids_before', 'attempted_pids_after',
+            'http_request_delta', 'attempt_delta', 'promoted_outgoing_roots',
+            'promotion_batches',
+        }
+        if (set(promotion) != promotion_required
+                or promotion.get('schema_version') != 1
+                or promotion.get('producer') != 'opengenius-authenticated-radio-growth-promotion-v1'
+                or promotion.get('source_policy') != 'authenticated-watch-radio-only-v1'
+                or promotion.get('source_progress') != ledger.get('prior_progress')
+                or promotion.get('http_requests_before') != prior_requests
+                or promotion.get('http_requests_after') != prior_requests
+                or promotion.get('http_request_delta') != 0
+                or promotion.get('attempted_pids_before') != sorted(expected_excluded)
+                or promotion.get('attempted_pids_after') != sorted(expected_excluded)
+                or promotion.get('attempt_delta') != 0
+                or not isinstance(promotion.get('promotion_batches'), list)
+                or not promotion['promotion_batches']):
+            raise RecoveryUnsafe('Radio source promotion does not preserve frozen request/PID accounting')
+        for key in ('track_snapshot', 'identity_map', 'baseline_state',
+                    'baseline_graph_export', 'rebase_report'):
+            receipt = promotion.get(key)
+            if (not isinstance(receipt, dict) or set(receipt) != {'path', 'sha256'}
+                    or not isinstance(receipt.get('path'), str)
+                    or not isinstance(receipt.get('sha256'), str)
+                    or checked_receipt(receipt, 'promotion ' + key).resolve()
+                    != Path(prior_config[key]['path']).resolve()
+                    or receipt['sha256'] != prior_config[key]['sha256']):
+                raise RecoveryUnsafe('Radio source promotion changed a frozen campaign input')
+        parent_growth = (prior.get('batches', [])[-1].get('growth_receipt')
+                         if prior.get('batches') else None)
+        if promotion.get('parent_growth') != parent_growth:
+            raise RecoveryUnsafe('Radio source promotion does not bind the frozen parent graph')
+        promoted = promotion.get('promoted_growth')
+        if (not isinstance(promoted, dict)
+                or set(promoted) != {'path', 'accepted_graphs_sha256'}
+                or not isinstance(promoted.get('path'), str)
+                or not isinstance(promoted.get('accepted_graphs_sha256'), str)):
+            raise RecoveryUnsafe('Radio source promotion lacks its final typed growth receipt')
+        promoted_dir = Path(promoted['path']).resolve()
+        promoted_graph_path = promoted_dir / 'accepted-graphs.json'
+        if _sha(promoted_graph_path.read_bytes()) != promoted['accepted_graphs_sha256']:
+            raise RecoveryUnsafe('Promoted accepted graph changed after its receipt')
+        promoted_doc = _read_json(promoted_graph_path)
+        source_batches = [row for row in prior.get('batches', [])
+                          if row.get('outcome') != 'preflight_failed'
+                          and row.get('status') != 'preflight_failed']
+        promotion_batches = promotion.get('promotion_batches')
+        if (len(promotion_batches) != len(source_batches)
+                or [row.get('batch') for row in promotion_batches]
+                != [row.get('batch') for row in source_batches]):
+            raise RecoveryUnsafe('Radio promotion batch list differs from frozen collector progress')
+        try:
+            from radio_source_integration import prepare_radio_only_snapshots
+            parent_doc = _read_json(parent_growth['path'])
+            old_run_count = len(parent_doc.get('growth_runs', []))
+            promoted_runs = promoted_doc.get('growth_runs')
+            if (not isinstance(promoted_runs, list)
+                    or len(promoted_runs) != old_run_count + len(promotion_batches)):
+                raise ValueError('Radio promotion graph run count differs from its report')
+            for index, (source_row, batch_row) in enumerate(
+                    zip(source_batches, promotion_batches)):
+                batch_dir = Path(source_row['seed_plan']['path']).resolve().parent
+                intent_path = batch_dir / 'intent.json'
+                summary_path = Path(source_row['collector_summary']['path']).resolve()
+                manifest_path = Path(source_row['seed_manifest']['path']).resolve()
+                evidence_path = Path(source_row['seed_video_evidence']['path']).resolve()
+                original_snapshots = source_row.get('snapshot_inputs')
+                expected_batch = {
+                    'batch': source_row['batch'],
+                    'collector_summary': {'path': str(summary_path),
+                                          'sha256': source_row['collector_summary']['sha256']},
+                    'seed_manifest': {'path': str(manifest_path),
+                                      'sha256': source_row['seed_manifest']['sha256']},
+                    'batch_intent': {'path': str(intent_path),
+                                     'sha256': _sha(intent_path.read_bytes())},
+                    'seed_video_evidence': {'path': str(evidence_path),
+                                            'sha256': source_row['seed_video_evidence']['sha256']},
+                    'collector_snapshots': original_snapshots,
+                }
+                if any(batch_row.get(key) != value for key, value in expected_batch.items()):
+                    raise ValueError('Radio promotion source receipts differ from frozen batch progress')
+                output_dir = batch_row.get('radio_source_output_dir')
+                if not isinstance(output_dir, str):
+                    raise ValueError('Radio promotion lacks its proof sidecar directory')
+                reproduced = prepare_radio_only_snapshots(
+                    track_snapshot_path=prior_config['track_snapshot']['path'],
+                    identity_map_path=prior_config['identity_map']['path'],
+                    batch_dir=batch_dir,
+                    collector_summary_path=summary_path,
+                    collector_seed_manifest_path=manifest_path,
+                    snapshot_paths=[Path(row['path']) for row in original_snapshots],
+                    output_dir=output_dir, create_missing=False)
+                if (batch_row.get('radio_source_output_dir') != reproduced.get('output_dir')
+                        or any(batch_row.get(key) != reproduced.get(key) for key in (
+                            'proofs', 'snapshot_inputs', 'ineligible'))):
+                    raise ValueError('Radio promotion proof or eligibility disposition did not replay')
+                run = promoted_runs[old_run_count + index]
+                expected_run_inputs = []
+                proof_by_snapshot = {}
+                for proof_receipt in reproduced['proofs']:
+                    proof = _read_json(proof_receipt['path'])
+                    proof_by_snapshot[proof['collector_snapshot']['path']] = {
+                        'path': proof_receipt['path'], 'sha256': proof_receipt['sha256']}
+                for snapshot_receipt in reproduced['snapshot_inputs']:
+                    saved = _read_json(snapshot_receipt['path'])
+                    source_receipt = saved.get('radio_only_source_proof')
+                    if (not isinstance(source_receipt, dict)
+                            or proof_by_snapshot.get(
+                                _read_json(source_receipt['path'])['collector_snapshot']['path'])
+                                != source_receipt):
+                        raise ValueError('Radio-only snapshot has a foreign proof pointer')
+                    expected_run_inputs.append({**snapshot_receipt,
+                                                'radio_only_source_proof': source_receipt})
+                summary = _read_json(summary_path)
+                manifest = _read_json(manifest_path)
+                if (run.get('source_policy') != 'authenticated-watch-radio-only-v1'
+                        or run.get('snapshot_inputs') != expected_run_inputs
+                        or run.get('collector_summary') != {
+                            'path': str(summary_path),
+                            'sha256': _sha(summary_path.read_bytes()),
+                            'http_requests': summary['http_requests'],
+                            'request_budget': summary['request_budget']}
+                        or run.get('seed_manifest') != {
+                            'path': str(manifest_path),
+                            'sha256': _sha(manifest_path.read_bytes()),
+                            'seed_count': len(manifest['seeds']),
+                            'seed_video_evidence': {
+                                'path': str(evidence_path),
+                                'sha256': source_row['seed_video_evidence']['sha256']}}):
+                    raise ValueError('Promoted growth run differs from its radio proof report')
+                if index == 0:
+                    transition = run.get('source_policy_transition')
+                    if (not isinstance(transition, dict)
+                            or transition.get('legacy_run_count') != old_run_count
+                            or transition.get('promotion_http_requests') != 0
+                            or transition.get('promotion_attempt_delta') != 0):
+                        raise ValueError('First radio run lacks the zero-call historical transition')
+                elif 'source_policy_transition' in run:
+                    raise ValueError('A later radio run repeats the historical policy transition')
+        except Exception as error:
+            raise RecoveryUnsafe('Radio promotion proofs and per-batch receipts do not fully replay') from error
+        try:
+            replay = replay_growth_checkpoint(
+                previous_growth=promoted_dir,
+                track_snapshot=prior_config['track_snapshot']['path'],
+                identity_map_path=prior_config['identity_map']['path'],
+                baseline_state_path=prior_config['baseline_state']['path'],
+                baseline_graph_export_path=prior_config['baseline_graph_export']['path'],
+                rebase_report_path=prior_config['rebase_report']['path'])
+        except Exception as error:
+            raise RecoveryUnsafe('Promoted radio-only growth fails full typed replay') from error
+        if (replay['accepted_graphs_sha256'] != promoted['accepted_graphs_sha256']
+                or replay['outgoing_root_count'] != promotion.get('promoted_outgoing_roots')):
+            raise RecoveryUnsafe('Promoted radio-only graph root count or replay receipt differs')
+        promoted_roots = replay['outgoing_root_count']
     if (ledger['http_requests_total'] != prior_requests + incident_requests
-            or ledger['base_outgoing_roots'] != prior_roots):
+            or ledger['base_outgoing_roots'] !=
+               (promoted_roots if promoted_roots is not None else prior_roots)):
         raise RecoveryUnsafe('Prior-attempt request or root total differs from verified receipts')
     return {'attempted_pids': set(expected_excluded),
             'same_map_attempted_pids': same_map_attempts,
             'http_requests': ledger['http_requests_total'],
-            'outgoing_roots': prior_roots}
+            'outgoing_roots': promoted_roots if promoted_roots is not None else prior_roots}
 
 
 def _accepted_roots(graph_path):
@@ -926,6 +1135,8 @@ def run(args):
         'interval': args.interval,
         'deadline': args.deadline,
     }
+    if getattr(args, 'source_policy', None) is not None:
+        config['source_policy'] = args.source_policy
     if progress_path.exists():
         progress = _read_json(progress_path)
         if (progress.get('config') != config
@@ -1098,6 +1309,7 @@ def run(args):
             'schema_version': 1,
             'runner_config': config,
             'runner_config_sha256': runner_config_sha256(config),
+            'source_policy': config.get('source_policy'),
             'library_sha256': library_hash,
             'identity_map_sha256': identity_hash,
             'batch': batch_number,
@@ -1166,6 +1378,8 @@ def main():
                         help='Optional strict current-map saved radio/catalog seed-video evidence')
     parser.add_argument('--dynamic-current-radio-hints', action='store_true',
                         help='Build a per-batch typed composite from the rebound sidecar and current accepted radio snapshots')
+    parser.add_argument('--source-policy', choices=('authenticated-watch-radio-only-v1',),
+                        help='Versioned source qualification policy for new collector snapshots')
     parser.add_argument('--prior-attempt-ledger', type=Path,
                         help='Hash-verified prior-stage request and attempted-PID ledger')
     parser.add_argument('--output', type=Path, required=True)

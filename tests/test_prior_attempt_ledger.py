@@ -142,6 +142,179 @@ class PriorAttemptLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.RecoveryUnsafe, 'PID exclusions'):
             self.validate()
 
+    def _make_promotion_ledger(self):
+        sources = {}
+        for key in ('track_snapshot', 'identity_map', 'baseline_state',
+                    'baseline_graph_export', 'rebase_report'):
+            path = self.root / 'promotion-inputs' / (key + '.json')
+            receipt = write_json(path, {'input': key})
+            sources[key] = receipt
+            self.prior_progress['config'][key] = receipt
+        batch_dir = self.root / 'prior' / 'batch-0001'
+        collector_dir = batch_dir / 'collector'
+        summary_receipt = write_json(collector_dir / 'summary.json', {
+            'schema_version': 1, 'status': 'completed',
+            'account_authentication_verified': True, 'library_sha256': LIBRARY,
+            'http_requests': 4, 'request_budget': 10,
+            'results': [{'persistent_id': PID_PRIOR, 'status': 'collected'}],
+        })
+        evidence_receipt = write_json(batch_dir / 'seed-video-evidence.json', {
+            'schema_version': 1, 'rows': [],
+        })
+        plan_receipt = write_json(batch_dir / 'seed-plan.json', {
+            'seeds': [{'persistent_id': PID_PRIOR}],
+        })
+        manifest_receipt = write_json(collector_dir / 'seeds.json', {
+            'seeds': [{'persistent_id': PID_PRIOR}],
+        })
+        original_snapshot = write_json(collector_dir / (PID_PRIOR + '.json'), {
+            'local_seed': {'persistent_id': PID_PRIOR},
+        })
+        intent_path = batch_dir / 'intent.json'
+        intent_receipt = write_json(intent_path, {'fixture_intent': True})
+        snapshot_inputs = [original_snapshot]
+        self.prior_progress['batches'][0].update({
+            'batch': 1, 'status': 'completed', 'outcome': 'merged',
+            'seed_pids': [PID_PRIOR], 'seed_plan': plan_receipt,
+            'seed_manifest': manifest_receipt,
+            'seed_video_evidence': evidence_receipt,
+            'collector_summary': {**summary_receipt,
+                                  'http_requests': 4, 'request_budget': 10},
+            'collector_summary_sha256': summary_receipt['sha256'],
+            'request_budget': 10, 'http_requests': 4,
+            'snapshot_inputs': snapshot_inputs,
+            'attempted_pids': [PID_PRIOR],
+        })
+        self.progress_receipt = write_json(self.prior_progress_path, self.prior_progress)
+        promoted_dir = self.root / 'radio-promotion' / 'growth'
+        source_output = self.root / 'radio-promotion' / 'radio-inputs'
+        proof_path = source_output / (PID_PRIOR + '.proof.json')
+        proof_receipt = write_json(proof_path, {
+            'collector_snapshot': {'path': original_snapshot['path']},
+        })
+        sanitized = source_output / (PID_PRIOR + '.snapshot.json')
+        sanitized_receipt = write_json(sanitized, {
+            'radio_only_source_proof': proof_receipt,
+        })
+        summary = json.loads(Path(summary_receipt['path']).read_text())
+        manifest = json.loads(Path(manifest_receipt['path']).read_text())
+        transition = {
+            'schema_version': 1, 'producer': 'opengenius-radio-source-policy-transition-v1',
+            'from_policy': 'legacy-related-required-v1',
+            'to_policy': 'authenticated-watch-radio-only-v1',
+            'legacy_parent_growth': {'path': str(self.graph.resolve()),
+                                     'sha256': self.graph_receipt['sha256']},
+            'legacy_run_count': 0, 'promotion_http_requests': 0,
+            'promotion_attempt_delta': 0,
+        }
+        promoted_run = {
+            'source_policy': 'authenticated-watch-radio-only-v1',
+            'source_policy_transition': transition,
+            'snapshot_inputs': [{**sanitized_receipt,
+                                 'radio_only_source_proof': proof_receipt}],
+            'collector_summary': {
+                'path': summary_receipt['path'], 'sha256': summary_receipt['sha256'],
+                'http_requests': summary['http_requests'],
+                'request_budget': summary['request_budget'],
+            },
+            'seed_manifest': {
+                'path': manifest_receipt['path'], 'sha256': manifest_receipt['sha256'],
+                'seed_count': len(manifest['seeds']),
+                'seed_video_evidence': evidence_receipt,
+            },
+        }
+        promoted_graph = write_json(promoted_dir / 'accepted-graphs.json', {
+            'growth_runs': [promoted_run],
+            'accepted_roots': [
+                {'root_pid': PID_PRIOR, 'ordered_target_pids': ['target']},
+                {'root_pid': PID_TAIL, 'ordered_target_pids': ['target']},
+            ],
+        })
+        source_report = {
+            'batch': 1,
+            'collector_summary': {'path': summary_receipt['path'],
+                                  'sha256': summary_receipt['sha256']},
+            'seed_manifest': {'path': manifest_receipt['path'],
+                              'sha256': manifest_receipt['sha256']},
+            'batch_intent': intent_receipt,
+            'seed_video_evidence': evidence_receipt,
+            'collector_snapshots': snapshot_inputs,
+            'radio_source_output_dir': str(source_output.resolve()),
+            'proofs': [proof_receipt],
+            'snapshot_inputs': [sanitized_receipt],
+            'ineligible': [],
+        }
+        promotion_path = self.root / 'radio-promotion' / 'promotion.json'
+        promotion = {
+            'schema_version': 1,
+            'producer': 'opengenius-authenticated-radio-growth-promotion-v1',
+            'source_policy': 'authenticated-watch-radio-only-v1',
+            'source_progress': self.progress_receipt,
+            **sources,
+            'parent_growth': self.graph_receipt,
+            'promoted_growth': {
+                'path': str(promoted_dir.resolve()),
+                'accepted_graphs_sha256': promoted_graph['sha256'],
+            },
+            'http_requests_before': 4,
+            'http_requests_after': 4,
+            'attempted_pids_before': [PID_PRIOR],
+            'attempted_pids_after': [PID_PRIOR],
+            'http_request_delta': 0,
+            'attempt_delta': 0,
+            'promoted_outgoing_roots': 2,
+            'promotion_batches': [source_report],
+        }
+        promotion_receipt = write_json(promotion_path, promotion)
+        self.ledger = {
+            **self.ledger,
+            'schema_version': 2,
+            'producer': 'opengenius-genuine-root-attempt-ledger-v2',
+            'prior_progress': self.progress_receipt,
+            'interruption_incidents': [],
+            'http_requests_total': 4,
+            'excluded_persistent_ids': [PID_PRIOR],
+            'promotion_receipt': promotion_receipt,
+            'base_outgoing_roots': 2,
+        }
+        write_json(self.ledger_path, self.ledger)
+        self.promotion = promotion
+        self.promotion_path = promotion_path
+        self.promoted_graph = promoted_dir / 'accepted-graphs.json'
+        self.track_sha = sources['track_snapshot']['sha256']
+        self.radio_source_result = {
+            'source_policy': 'authenticated-watch-radio-only-v1',
+            'proofs': [proof_receipt], 'snapshot_inputs': [sanitized_receipt],
+            'ineligible': [], 'output_dir': str(source_output.resolve()),
+        }
+
+    def test_v2_promotion_replays_graph_without_charging_requests_or_attempts(self):
+        self._make_promotion_ledger()
+        with patch.object(runner, '_verify_progress_receipts'), \
+                patch('radio_source_integration.prepare_radio_only_snapshots',
+                      return_value=self.radio_source_result), \
+                patch.object(runner, 'replay_growth_checkpoint', return_value={
+                    'accepted_graphs_sha256': hashlib.sha256(
+                        self.promoted_graph.read_bytes()).hexdigest(),
+                    'outgoing_root_count': 2,
+                }):
+            result = runner._validate_prior_attempt_ledger(
+                self.ledger_path, LIBRARY, self.track_sha)
+        self.assertEqual(result['http_requests'], 4)
+        self.assertEqual(result['attempted_pids'], {PID_PRIOR})
+        self.assertEqual(result['outgoing_roots'], 2)
+
+    def test_v2_promotion_rejects_request_or_attempt_delta(self):
+        self._make_promotion_ledger()
+        self.promotion['http_requests_after'] = 5
+        receipt = write_json(self.promotion_path, self.promotion)
+        self.ledger['promotion_receipt'] = receipt
+        write_json(self.ledger_path, self.ledger)
+        with patch.object(runner, '_verify_progress_receipts'):
+            with self.assertRaisesRegex(runner.RecoveryUnsafe, 'preserve frozen request/PID'):
+                runner._validate_prior_attempt_ledger(
+                    self.ledger_path, LIBRARY, self.track_sha)
+
     def test_repeated_interruption_cannot_inflate_budget(self):
         duplicate = self.root / 'incident-copy.json'
         copy_receipt = write_json(duplicate, json.loads(self.incident_path.read_text()))

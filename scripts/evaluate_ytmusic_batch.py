@@ -85,8 +85,12 @@ def validate_observations(snapshot, library_hash):
     return snapshot
 
 
-def collect_graphs(paths, matcher, library_hash):
+def collect_graphs(paths, matcher, library_hash, source_policy=None,
+                   identity_map_sha256=None):
     """Rematch each file and retain each snapshot's provenance and observations."""
+    supported_policy = 'authenticated-watch-radio-only-v1'
+    if source_policy not in (None, supported_policy):
+        raise ValueError('Unsupported authenticated recommendation source policy')
     graphs, skipped, inputs = [], [], []
     for path in paths:
         entry = {'path': str(path)}
@@ -95,6 +99,32 @@ def collect_graphs(paths, matcher, library_hash):
             entry['sha256'] = hashlib.sha256(data).hexdigest()
             inputs.append(entry)
             snapshot = json.loads(data)
+            radio_receipt = snapshot.get('radio_only_source_proof')
+            if source_policy == supported_policy and not isinstance(radio_receipt, dict):
+                raise InvalidObservation('missing_authenticated_radio_source_proof')
+            if radio_receipt is not None:
+                if (not isinstance(radio_receipt, dict)
+                        or set(radio_receipt) != {'path', 'sha256'}
+                        or not isinstance(radio_receipt.get('path'), str)
+                        or not isinstance(radio_receipt.get('sha256'), str)):
+                    raise InvalidObservation('malformed_authenticated_radio_source_proof')
+                from radio_snapshot_proof import (radio_only_snapshot_from_proof,
+                                                  verify_radio_snapshot_proof)
+                proof_path = Path(radio_receipt['path']).resolve()
+                proof_bytes = proof_path.read_bytes()
+                if hashlib.sha256(proof_bytes).hexdigest() != radio_receipt['sha256']:
+                    raise InvalidObservation('authenticated_radio_source_proof_changed')
+                proof_result = verify_radio_snapshot_proof(proof_path)
+                expected_snapshot = radio_only_snapshot_from_proof(proof_path)
+                if snapshot != expected_snapshot:
+                    raise InvalidObservation('sanitized_radio_snapshot_differs_from_its_proof')
+                if (proof_result.get('verified') is not True
+                        or proof_result.get('outgoing_target_count') < 1
+                        or snapshot.get('library_sha256') != library_hash
+                        or (identity_map_sha256 is not None
+                            and snapshot.get('identity_map_sha256') != identity_map_sha256)):
+                    raise InvalidObservation('authenticated_radio_proof_has_foreign_identity_or_empty_graph')
+                entry['radio_only_source_proof'] = dict(radio_receipt)
             validate_observations(snapshot, library_hash)
             graph = candidate_graph(snapshot, matcher, library_hash)
             graph['input'] = entry.copy()

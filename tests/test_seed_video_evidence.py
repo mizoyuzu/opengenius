@@ -17,6 +17,7 @@ from seed_video_evidence import (PRODUCER, build_seed_video_evidence,
                                  build_rebound_catalog_hints,
                                  build_combined_rebound_seed_video_evidence,
                                  combine_seed_video_evidence,
+                                 strict_cached_search_match,
                                  select_seed_video_evidence,
                                  validate_album_catalog_evidence,
                                  main as evidence_main)
@@ -98,6 +99,47 @@ class SeedVideoEvidenceTests(unittest.TestCase):
             self.tracks if tracks is None else tracks,
             self.matcher if matcher is None else matcher,
             LIBRARY_HASH, MAP_HASH)
+
+    def _cached_result(self, *, title='Song', artists=None, album='Album'):
+        return [{'videoId': VIDEO, 'title': title,
+                 'artists': artists if artists is not None else [{'name': 'Artist'}],
+                 'album': album, 'duration_seconds': 100,
+                 'length': '1:40'}]
+
+    def test_cached_search_accepts_only_exact_validated_album_alias(self):
+        identity = build_map(self.tracks, LIBRARY_HASH)
+        identity['album_title_aliases'] = [{
+            'enabled': True, 'canonical_library_album': 'Album',
+            'exact_remote_album_aliases': ['Official English Edition'],
+        }]
+        matcher = IdentityMap(identity, self.tracks, LIBRARY_HASH)
+        accepted = strict_cached_search_match(
+            self._cached_result(album='Official English Edition'),
+            self.tracks[0], matcher)
+        self.assertIsNotNone(accepted)
+        self.assertEqual(accepted['video_id'], VIDEO)
+        self.assertTrue(accepted['matches'][0]['album_match'])
+
+        for album in ('Other Album', 'Deluxe Official English Edition'):
+            with self.subTest(album=album):
+                self.assertIsNone(strict_cached_search_match(
+                    self._cached_result(album=album), self.tracks[0], matcher))
+
+    def test_cached_search_album_alias_keeps_credit_and_version_gates(self):
+        identity = build_map(self.tracks, LIBRARY_HASH)
+        identity['album_title_aliases'] = [{
+            'enabled': True, 'canonical_library_album': 'Album',
+            'exact_remote_album_aliases': ['Official English Edition'],
+        }]
+        matcher = IdentityMap(identity, self.tracks, LIBRARY_HASH)
+        self.assertIsNone(strict_cached_search_match(
+            self._cached_result(album='Official English Edition',
+                                artists=[{'name': 'Artist'}, {'name': 'Guest'}]),
+            self.tracks[0], matcher))
+        self.assertIsNone(strict_cached_search_match(
+            self._cached_result(title='Song (Live Version)',
+                                album='Official English Edition'),
+            self.tracks[0], matcher))
 
     def test_builds_and_revalidates_a_radio_seed_hint_with_source_provenance(self):
         row, = self.document['rows']

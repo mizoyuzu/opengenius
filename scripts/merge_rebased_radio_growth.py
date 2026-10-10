@@ -106,9 +106,18 @@ def _verify_rebase_receipt(graph_path, report_path, state_path,
                 or (str(_resolve_input(pair[0])), pair[1]) not in verified):
             raise ValueError('Accepted input manifest is not contained in verified raw receipts')
     if typed_rebind:
-        proof_inputs = _verify_identity_map_rebinding(
-            graph_doc, report, state, library_hash, identity_hash,
-            Path(state_path).resolve())
+        if report.get('producer') == 'opengenius-typed-identity-map-rebinding-v2':
+            proof_inputs = _verify_identity_map_rebinding(
+                graph_doc, report, state, library_hash, identity_hash,
+                Path(state_path).resolve())
+        elif report.get('producer') == 'opengenius-typed-album-alias-growth-rebinding-v1':
+            from rebind_radio_growth_identity import verify_album_alias_growth_rebinding_report
+            proof_inputs = verify_album_alias_growth_rebinding_report(
+                graph_doc=graph_doc, report=report, state=state,
+                library_hash=library_hash, identity_hash=identity_hash,
+                state_path=Path(state_path).resolve())
+        else:
+            raise ValueError('Unsupported typed identity-map rebind report producer')
     else:
         proof_inputs = []
     return graph_doc, report, state, {
@@ -141,6 +150,51 @@ def verify_typed_identity_map_rebinding(*, graph_export_path, rebase_report_path
     old_hash, new_hash = sha(old_path.read_bytes()), sha(new_path.read_bytes())
     graph, report, state, provenance = _verify_rebase_receipt(
         graph_export_path, rebase_report_path, state_path, library_sha256, new_hash)
+    if report.get('producer') == 'opengenius-typed-album-alias-growth-rebinding-v1':
+        binding = report.get('album_alias_growth_rebinding') or {}
+        parent = binding.get('parent_typed_growth') or {}
+        old_ref = parent.get('old_identity_map') or {}
+        new_ref = binding.get('output_identity_map') or {}
+        snapshot_ref = binding.get('track_snapshot') or {}
+        snapshot_path = _resolve_input(snapshot_ref.get('path'))
+        if (not snapshot_path.is_file() or sha(snapshot_path.read_bytes()) != snapshot_ref.get('sha256')
+                or old_ref.get('sha256') != old_hash
+                or _resolve_input(old_ref.get('path')) != old_path
+                or new_ref.get('sha256') != new_hash
+                or _resolve_input(new_ref.get('path')) != new_path):
+            raise ValueError('Typed album-alias growth transition does not bind expected maps')
+        proof_inputs = {
+            (Path(row['path']).resolve().as_posix(), row['sha256'])
+            for row in provenance.get('proof_input_receipts', [])
+        }
+        proof_inputs.update({
+            (str(Path(graph_export_path).resolve()), sha(Path(graph_export_path).read_bytes())),
+            (str(Path(rebase_report_path).resolve()), sha(Path(rebase_report_path).read_bytes())),
+            (str(Path(state_path).resolve()), sha(Path(state_path).read_bytes())),
+            (str(snapshot_path), snapshot_ref['sha256']),
+            (str(old_path), old_hash), (str(new_path), new_hash),
+        })
+        return {
+            'verified': True, 'library_sha256': library_sha256,
+            'old_identity_map_path': str(old_path), 'old_identity_map_sha256': old_hash,
+            'new_identity_map_path': str(new_path), 'new_identity_map_sha256': new_hash,
+            'report_path': str(Path(rebase_report_path).resolve()),
+            'report_sha256': sha(Path(rebase_report_path).read_bytes()),
+            'graph_export_path': str(Path(graph_export_path).resolve()),
+            'graph_export_sha256': sha(Path(graph_export_path).read_bytes()),
+            'state_path': str(Path(state_path).resolve()),
+            'state_file_sha256': sha(Path(state_path).read_bytes()),
+            'state_sha256': state.get('state_sha256'),
+            'track_snapshot_receipt': snapshot_ref,
+            'accepted_input_manifest_sha256': binding.get('accepted_input_manifest_sha256'),
+            'authenticated_observation_inputs': binding.get('authenticated_observation_inputs'),
+            'proof_input_receipts': [
+                {'path': path, 'sha256': digest}
+                for path, digest in sorted(proof_inputs)
+            ],
+            'recording_identity_verified': False,
+            'recording_edges_added_by_rebinding': 0,
+        }
     binding = report.get('identity_map_rebinding') or {}
     recorded_old = binding.get('old_identity_map') or {}
     recorded_new = binding.get('new_identity_map') or {}
@@ -569,7 +623,21 @@ def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
         if sha(path.read_bytes()) != source['sha256']:
             raise ValueError('A previous collector snapshot changed')
         paths.append(path)
-    graphs, skipped, inputs = collect_graphs(paths, matcher, library_hash)
+    source_policy = run.get('source_policy')
+    if source_policy not in (None, 'authenticated-watch-radio-only-v1'):
+        raise ValueError('A previous run uses an unsupported recommendation source policy')
+    if source_policy is None:
+        for path in paths:
+            snapshot = json.loads(path.read_bytes())
+            endpoints = {row.get('endpoint') for row in snapshot.get('requests', [])
+                         if isinstance(row, dict)}
+            if (snapshot.get('account_authentication_verified') is not True
+                    or snapshot.get('related_status') != 'collected'
+                    or not {'watch_radio', 'watch_seed', 'song_related'} <= endpoints):
+                raise ValueError('A legacy run snapshot fails its original related-required policy')
+    graphs, skipped, inputs = collect_graphs(
+        paths, matcher, library_hash, source_policy=source_policy,
+        identity_map_sha256=identity_hash)
     if (not graphs or skipped != run.get('skipped_snapshots', [])
             or any(graph['root_pid'] not in collected for graph in graphs)):
         raise ValueError('A previous snapshot fails authenticated collector or graph validation')
@@ -589,12 +657,78 @@ def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
                         'ordered_target_pids': row['ordered_target_pids']}
                        for row in incoming_roots],
     }
+    if source_policy is not None:
+        normalized_run['source_policy'] = source_policy
     if evidence_info is not None:
         normalized_run['seed_manifest']['seed_video_evidence'] = {
             'path': str(evidence_path), 'sha256': evidence_info['sha256']}
     if run.get('resulting_state_sha256'):
         normalized_run['resulting_state_sha256'] = run['resulting_state_sha256']
     return incoming_roots, normalized_run
+
+
+def _validate_source_policy_history(accepted_policy, policy_transition, runs):
+    """Validate the one-way boundary from legacy to proof-backed radio runs."""
+    radio_policy = 'authenticated-watch-radio-only-v1'
+    if accepted_policy not in (None, radio_policy):
+        raise ValueError('Previous growth output has an unsupported source policy')
+    if accepted_policy is None:
+        if policy_transition is not None or any(run.get('source_policy') is not None for run in runs):
+            raise ValueError('Legacy growth output contains an unreviewed policy transition')
+        return None
+    required = {
+        'schema_version', 'producer', 'from_policy', 'to_policy',
+        'legacy_parent_growth', 'legacy_run_count',
+        'promotion_http_requests', 'promotion_attempt_delta',
+    }
+    if (not isinstance(policy_transition, dict)
+            or set(policy_transition) != required
+            or type(policy_transition.get('schema_version')) is not int
+            or policy_transition.get('schema_version') != 1
+            or policy_transition.get('producer') != 'opengenius-radio-source-policy-transition-v1'
+            or policy_transition.get('from_policy') != 'legacy-related-required-v1'
+            or policy_transition.get('to_policy') != radio_policy
+            or type(policy_transition.get('legacy_run_count')) is not int
+            or type(policy_transition.get('promotion_http_requests')) is not int
+            or type(policy_transition.get('promotion_attempt_delta')) is not int
+            or policy_transition.get('promotion_http_requests') != 0
+            or policy_transition.get('promotion_attempt_delta') != 0):
+        raise ValueError('Radio-only growth lacks its exact zero-call historical-policy transition receipt')
+    run_policies = [run.get('source_policy') for run in runs]
+    first_radio_run = next((index for index, value in enumerate(run_policies)
+                            if value == radio_policy), None)
+    if (first_radio_run is None
+            or policy_transition['legacy_run_count'] != first_radio_run
+            or any(value is not None for value in run_policies[:first_radio_run])
+            or any(value != radio_policy for value in run_policies[first_radio_run:])
+            or runs[first_radio_run].get('source_policy_transition') != policy_transition
+            or any('source_policy_transition' in run
+                   for run in runs[first_radio_run + 1:])):
+        raise ValueError('Historical and radio-only runs are not separated by one typed policy boundary')
+    parent = policy_transition.get('legacy_parent_growth')
+    if (not isinstance(parent, dict) or set(parent) != {'path', 'sha256'}
+            or not isinstance(parent.get('path'), str)
+            or not isinstance(parent.get('sha256'), str)):
+        raise ValueError('Radio-only policy transition lacks its exact legacy parent graph receipt')
+    return first_radio_run
+
+
+def _require_legacy_source_policy(paths):
+    """Keep direct/default growth merges under the original related-required gate.
+
+    ``collect_graphs`` is also used for exploratory review, so its permissive
+    default remains useful there. A growth merge, however, creates durable
+    accepted roots and must not admit a sanitized radio-only snapshot whose
+    typed proof receipt was stripped.
+    """
+    for path in paths:
+        snapshot = json.loads(Path(path).read_bytes())
+        endpoints = {row.get('endpoint') for row in snapshot.get('requests', [])
+                     if isinstance(row, dict)}
+        if (snapshot.get('account_authentication_verified') is not True
+                or snapshot.get('related_status') != 'collected'
+                or not {'watch_radio', 'watch_seed', 'song_related'} <= endpoints):
+            raise ValueError('A legacy growth merge snapshot fails its related-required source policy')
 
 
 def _replay_previous_growth(previous_dir, baseline_state, baseline_roots,
@@ -646,10 +780,35 @@ def _replay_previous_growth(previous_dir, baseline_state, baseline_roots,
         }]
     if not runs:
         raise ValueError('Previous growth output has no collector runs')
+    accepted_policy = accepted.get('source_policy')
+    policy_transition = accepted.get('source_policy_transition')
+    first_radio_run = _validate_source_policy_history(
+        accepted_policy, policy_transition, runs)
+    if accepted_policy is not None:
+        transition_parent = policy_transition.get('legacy_parent_growth')
+        transition_path = Path(transition_parent['path']).resolve()
+        transition_bytes = transition_path.read_bytes()
+        transition_graph = json.loads(transition_bytes)
+        if (sha(transition_bytes) != transition_parent['sha256']
+                or transition_graph.get('source_policy') is not None
+                or transition_graph.get('producer') != 'opengenius-ytmusic-recommendation-growth-rebased-merge-v1'):
+            raise ValueError('Radio-only policy transition parent is not the exact legacy growth graph')
     state = baseline_state
     roots = baseline_roots
     normalized_runs = []
-    for run in runs:
+    for run_index, run in enumerate(runs):
+        if accepted_policy is not None and run_index == first_radio_run:
+            transition_parent = policy_transition['legacy_parent_growth']
+            transition_path = Path(transition_parent['path']).resolve()
+            transition_graph = json.loads(transition_path.read_bytes())
+            transition_state_path = transition_path.parent / 'state.json'
+            transition_state = json.loads(transition_state_path.read_bytes())
+            if (state.get('state_sha256') != transition_state.get('state_sha256')
+                    or _relation_map(roots, 'Replayed legacy transition roots')
+                       != _relation_map(transition_graph.get('accepted_roots'),
+                                        'Legacy transition parent roots')
+                    or run.get('source_policy_transition') != policy_transition):
+                raise ValueError('Radio-only policy boundary does not extend the exact replayed legacy graph/state')
         new_roots, normalized = _validate_run_receipt(
             run, matcher.tracks, matcher, library_hash, identity_hash)
         roots, _ = _append_graphs(roots, new_roots)
@@ -679,10 +838,12 @@ def merge_radio_growth(*, track_snapshot, identity_map_path, baseline_state_path
                        baseline_graph_export_path, rebase_report_path,
                        collector_summary_path, seed_manifest_path,
                        snapshot_paths, output_dir, seed_video_evidence_path=None,
-                       previous_growth_dir=None):
+                       previous_growth_dir=None, source_policy=None):
     output_dir = Path(output_dir).resolve()
     if output_dir.exists():
         raise FileExistsError('Output directory exists; choose a new directory')
+    if source_policy not in (None, 'authenticated-watch-radio-only-v1'):
+        raise ValueError('Unsupported authenticated recommendation source policy')
     tracks, library_hash, library_input = load_library(track_snapshot=Path(track_snapshot))
     map_bytes = Path(identity_map_path).read_bytes()
     identity_hash = sha(map_bytes)
@@ -744,6 +905,13 @@ def merge_radio_growth(*, track_snapshot, identity_map_path, baseline_state_path
         state, graph_roots, growth_runs, prior_growth_receipt = _replay_previous_growth(
             previous_growth_dir, state, graph_roots, rebase_provenance,
             matcher, library_hash, identity_hash)
+        prior_graph_doc = json.loads((Path(previous_growth_dir).resolve() / 'accepted-graphs.json').read_bytes())
+        prior_policy = prior_graph_doc.get('source_policy')
+        latest_run_policy = growth_runs[-1].get('source_policy') if growth_runs else prior_policy
+        if source_policy != latest_run_policy:
+            if not (source_policy == 'authenticated-watch-radio-only-v1'
+                    and prior_policy is None and latest_run_policy is None):
+                raise ValueError('Current merge source policy differs from its prior growth chain')
     direct_parent_state_sha256 = state['state_sha256']
 
     collector_path = Path(collector_summary_path).resolve()
@@ -774,12 +942,39 @@ def merge_radio_growth(*, track_snapshot, identity_map_path, baseline_state_path
     paths = [Path(path).resolve() for path in snapshot_paths]
     if not paths:
         raise ValueError('At least one collector snapshot is required')
-    graphs, skipped, inputs = collect_graphs(paths, matcher, library_hash)
+    if source_policy is None:
+        _require_legacy_source_policy(paths)
+    graphs, skipped, inputs = collect_graphs(
+        paths, matcher, library_hash, source_policy=source_policy,
+        identity_map_sha256=identity_hash)
     if not graphs:
         raise ValueError('No collector snapshots rematched as valid YT Music graphs')
     if any(graph['root_pid'] not in collected for graph in graphs):
         raise ValueError('A graph root is absent from authenticated collected seed results')
     new_roots = merge_graphs(graphs)
+    source_policy_transition = None
+    if source_policy == 'authenticated-watch-radio-only-v1':
+        if previous_growth_dir is None:
+            raise ValueError('Radio-only growth must extend a fully replayed parent graph')
+        prior_graph_doc = json.loads((Path(previous_growth_dir).resolve() / 'accepted-graphs.json').read_bytes())
+        if prior_graph_doc.get('source_policy') is None:
+            source_policy_transition = {
+                'schema_version': 1,
+                'producer': 'opengenius-radio-source-policy-transition-v1',
+                'from_policy': 'legacy-related-required-v1',
+                'to_policy': source_policy,
+                'legacy_parent_growth': {
+                    'path': str((Path(previous_growth_dir).resolve() / 'accepted-graphs.json')),
+                    'sha256': sha((Path(previous_growth_dir).resolve() / 'accepted-graphs.json').read_bytes()),
+                },
+                'legacy_run_count': len(growth_runs),
+                'promotion_http_requests': 0,
+                'promotion_attempt_delta': 0,
+            }
+        else:
+            source_policy_transition = prior_graph_doc.get('source_policy_transition')
+            if not isinstance(source_policy_transition, dict):
+                raise ValueError('Prior radio-only graph has no typed policy transition receipt')
     roots, original_edges = _append_graphs(graph_roots, new_roots)
     update = plan_genius_update(state, roots, matcher, library_hash, identity_hash)
     next_state = update['next_state']
@@ -859,6 +1054,9 @@ def merge_radio_growth(*, track_snapshot, identity_map_path, baseline_state_path
                               'seed_video_evidence_sha256': sha(evidence_bytes)}
                              if evidence_path is not None else {}),
                           'seed_count': len(seed_manifest['seeds'])},
+        **({'source_policy': source_policy} if source_policy is not None else {}),
+        **({'source_policy_transition': source_policy_transition}
+           if source_policy_transition is not None else {}),
         'baseline_accepted_roots': original_baseline_roots,
         'growth_runs': [*growth_runs, {
             'collector_summary': {'path': str(collector_path),
@@ -873,6 +1071,10 @@ def merge_radio_growth(*, track_snapshot, identity_map_path, baseline_state_path
                                  if evidence_path is not None else {}),
                               'seed_count': len(seed_manifest['seeds'])},
             'snapshot_inputs': inputs,
+            **({'source_policy': source_policy} if source_policy is not None else {}),
+            **({'source_policy_transition': source_policy_transition}
+               if source_policy_transition is not None
+               and source_policy_transition.get('legacy_run_count') == len(growth_runs) else {}),
             'skipped_snapshots': skipped,
             'new_graphs': [{'root_pid': row['root_pid'],
                             'ordered_target_pids': row['ordered_target_pids']}
@@ -899,6 +1101,7 @@ def merge_radio_growth(*, track_snapshot, identity_map_path, baseline_state_path
         'schema_version': 1, 'producer': 'opengenius-ytmusic-recommendation-growth-rebased-merge-v1',
         'created_at': datetime.now(timezone.utc).isoformat(),
         'library_sha256': library_hash, 'identity_map_sha256': identity_hash,
+        **({'source_policy': source_policy} if source_policy is not None else {}),
         'track_snapshot_sha256': sha(Path(track_snapshot).read_bytes()),
         'library_input': library_input,
         'origin_rebased_state_sha256': original_state_sha256,
@@ -951,6 +1154,8 @@ def main():
     parser.add_argument('--snapshot-directory', type=Path, action='append', default=[])
     parser.add_argument('--previous-growth', type=Path,
                         help='Prior merged growth directory to receipt-check and extend')
+    parser.add_argument('--source-policy', choices=('authenticated-watch-radio-only-v1',),
+                        help='Require independently replayable authenticated radio-only proof sidecars')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     paths = list(args.snapshot)
@@ -968,7 +1173,8 @@ def main():
             seed_manifest_path=args.seed_manifest,
             seed_video_evidence_path=args.seed_video_evidence,
             snapshot_paths=paths, output_dir=args.output,
-            previous_growth_dir=args.previous_growth)
+            previous_growth_dir=args.previous_growth,
+            source_policy=args.source_policy)
     except Exception as error:
         parser.exit(1, 'Stopped (' + type(error).__name__ + '). No database was changed.\n')
     print(json.dumps({key: audit[key] for key in (
