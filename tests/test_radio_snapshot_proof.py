@@ -510,6 +510,94 @@ class RadioSnapshotProofTests(unittest.TestCase):
                     snapshot_paths=[snapshot_path], output_dir=output_dir,
                     create_missing=False)
 
+    def test_missing_proof_replays_typed_ineligible_without_writing_sidecars(self):
+        batch = self.root / 'ineligible-replay-batch'
+        collector = batch / 'collector'
+        (collector / 'requests').mkdir(parents=True)
+        snapshot_path = collector / (ROOT + '.json')
+        summary_path = collector / 'summary-1.json'
+        manifest_path = collector / 'seeds.json'
+        for source, target in (
+                (self.summary_path, summary_path),
+                (self.manifest_path, manifest_path),
+                (self.intent_path, batch / 'intent.json')):
+            shutil.copyfile(source, target)
+        # Preserve all receipts, but make the seed fail its strict album gate.
+        raw_tracks = copy.deepcopy(self.raw_tracks)
+        raw_tracks[0]['album']['name'] = 'Wrong Seed Album'
+        self.raw_tracks = raw_tracks
+        cache_key = hashlib.sha256(json.dumps(
+            ['get_watch_playlist', self.arguments], sort_keys=True,
+            ensure_ascii=False).encode('utf-8')).hexdigest()
+        cache_path = collector / 'requests' / (cache_key + '.json')
+        cache_path.write_text(json.dumps({
+            'endpoint': 'get_watch_playlist', 'arguments': self.arguments,
+            'observed_at': self.observed_at,
+            'response': {'tracks': raw_tracks},
+        }), encoding='utf-8')
+        saved_snapshot = self.snapshot()
+        snapshot_path.write_text(json.dumps(saved_snapshot), encoding='utf-8')
+        summary = json.loads(summary_path.read_text())
+        summary['results'][0] = {
+            **collector_result_summary(saved_snapshot), 'status': 'collected'}
+        summary_path.write_text(json.dumps(summary), encoding='utf-8')
+        output_dir = batch / 'radio-only'
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence',
+                      return_value={ROOT: {'video_id': self.arguments['videoId']}}):
+            result = prepare_radio_only_snapshots(
+                track_snapshot_path=self.track_path,
+                identity_map_path=self.identity_path,
+                batch_dir=batch,
+                collector_summary_path=summary_path,
+                collector_seed_manifest_path=manifest_path,
+                snapshot_paths=[snapshot_path], output_dir=output_dir,
+                create_missing=False)
+        self.assertEqual(result['proofs'], [])
+        self.assertEqual(result['snapshot_inputs'], [])
+        self.assertEqual(result['ineligible'][0]['persistent_id'], ROOT)
+        self.assertEqual(result['ineligible'][0]['reason'], 'seed_not_strictly_matched')
+        self.assertEqual(result['ineligible'][0]['raw_radio_cache']['sha256'],
+                         hashlib.sha256(cache_path.read_bytes()).hexdigest())
+        self.assertFalse((output_dir / (ROOT + '.proof.json')).exists())
+        self.assertFalse((output_dir / (ROOT + '.snapshot.json')).exists())
+
+    def test_missing_proof_for_eligible_snapshot_remains_fatal(self):
+        batch = self.root / 'eligible-missing-proof-batch'
+        collector = batch / 'collector'
+        (collector / 'requests').mkdir(parents=True)
+        snapshot_path = collector / (ROOT + '.json')
+        summary_path = collector / 'summary-1.json'
+        manifest_path = collector / 'seeds.json'
+        for source, target in (
+                (self.snapshot_path, snapshot_path),
+                (self.summary_path, summary_path),
+                (self.manifest_path, manifest_path),
+                (self.intent_path, batch / 'intent.json')):
+            shutil.copyfile(source, target)
+        cache_key = hashlib.sha256(json.dumps(
+            ['get_watch_playlist', self.arguments], sort_keys=True,
+            ensure_ascii=False).encode('utf-8')).hexdigest()
+        cache_path = collector / 'requests' / (cache_key + '.json')
+        shutil.copyfile(self.cache_path, cache_path)
+        output_dir = batch / 'radio-only'
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence',
+                      return_value={ROOT: {'video_id': self.arguments['videoId']}}):
+            with self.assertRaisesRegex(ValueError, 'recorded radio proof sidecar is missing'):
+                prepare_radio_only_snapshots(
+                    track_snapshot_path=self.track_path,
+                    identity_map_path=self.identity_path,
+                    batch_dir=batch,
+                    collector_summary_path=summary_path,
+                    collector_seed_manifest_path=manifest_path,
+                    snapshot_paths=[snapshot_path], output_dir=output_dir,
+                    create_missing=False)
+        self.assertFalse((output_dir / (ROOT + '.proof.json')).exists())
+        self.assertFalse((output_dir / (ROOT + '.snapshot.json')).exists())
+
     def test_materializer_loads_real_track_snapshot_from_path(self):
         track_snapshot = self.write('real-track-snapshot.json', {
             'source_sha256': LIBRARY, 'tracks': self.tracks,

@@ -190,7 +190,7 @@ class PriorAttemptLedgerTests(unittest.TestCase):
         source_output = self.root / 'radio-promotion' / 'radio-inputs'
         proof_path = source_output / (PID_PRIOR + '.proof.json')
         proof_receipt = write_json(proof_path, {
-            'collector_snapshot': {'path': original_snapshot['path']},
+            'collector_snapshot': original_snapshot,
         })
         sanitized = source_output / (PID_PRIOR + '.snapshot.json')
         sanitized_receipt = write_json(sanitized, {
@@ -241,7 +241,8 @@ class PriorAttemptLedgerTests(unittest.TestCase):
             'collector_snapshots': snapshot_inputs,
             'radio_source_output_dir': str(source_output.resolve()),
             'proofs': [proof_receipt],
-            'snapshot_inputs': [sanitized_receipt],
+            'snapshot_inputs': [{**sanitized_receipt,
+                                 'radio_only_source_proof': proof_receipt}],
             'ineligible': [],
         }
         promotion_path = self.root / 'radio-promotion' / 'promotion.json'
@@ -312,6 +313,23 @@ class PriorAttemptLedgerTests(unittest.TestCase):
         write_json(self.ledger_path, self.ledger)
         with patch.object(runner, '_verify_progress_receipts'):
             with self.assertRaisesRegex(runner.RecoveryUnsafe, 'preserve frozen request/PID'):
+                runner._validate_prior_attempt_ledger(
+                    self.ledger_path, LIBRARY, self.track_sha)
+
+    def test_v2_promotion_rejects_changed_snapshot_proof_pointer(self):
+        self._make_promotion_ledger()
+        pointer = self.promotion['promotion_batches'][0]['snapshot_inputs'][0][
+            'radio_only_source_proof']
+        pointer['sha256'] = 'f' * 64
+        receipt = write_json(self.promotion_path, self.promotion)
+        self.ledger['promotion_receipt'] = receipt
+        write_json(self.ledger_path, self.ledger)
+        with patch.object(runner, '_verify_progress_receipts'), \
+                patch('radio_source_integration.prepare_radio_only_snapshots',
+                      return_value=self.radio_source_result):
+            with self.assertRaisesRegex(
+                    runner.RecoveryUnsafe,
+                    'Radio promotion proofs and per-batch receipts do not fully replay'):
                 runner._validate_prior_attempt_ledger(
                     self.ledger_path, LIBRARY, self.track_sha)
 

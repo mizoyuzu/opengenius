@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from radio_snapshot_proof import (
-    POLICY, RadioSnapshotIneligible, create_radio_snapshot_proof,
+    POLICY, RadioSnapshotIneligible, _proof_from_inputs,
+    create_radio_snapshot_proof,
     radio_only_snapshot_from_proof,
     verify_radio_snapshot_proof,
 )
@@ -79,6 +80,22 @@ def prepare_radio_only_snapshots(*, track_snapshot_path, identity_map_path,
                 proof = _read(proof_path)
             else:
                 if not create_missing:
+                    if sanitized_path.exists():
+                        raise ValueError(
+                            'A sanitized radio snapshot exists without its proof sidecar')
+                    # Re-run the complete source replay without creating durable
+                    # output. A typed ineligible result is itself reproducible
+                    # provenance; a proof-eligible input with no recorded proof
+                    # remains an integrity failure.
+                    _proof_from_inputs(
+                        track_snapshot_path=track_snapshot_path,
+                        identity_map_path=identity_map_path,
+                        snapshot_path=original_path,
+                        collector_summary_path=summary_path,
+                        collector_seed_manifest_path=manifest_path,
+                        batch_intent_path=intent_path,
+                        raw_radio_cache_path=cache_path,
+                        sealed_at_utc=sealed_at_utc)
                     raise ValueError('A recorded radio proof sidecar is missing')
                 proof = create_radio_snapshot_proof(
                     track_snapshot_path=track_snapshot_path,

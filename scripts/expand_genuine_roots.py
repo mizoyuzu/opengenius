@@ -772,24 +772,45 @@ def _validate_prior_attempt_ledger(path, library_hash, track_snapshot_sha256,
                     collector_seed_manifest_path=manifest_path,
                     snapshot_paths=[Path(row['path']) for row in original_snapshots],
                     output_dir=output_dir, create_missing=False)
-                if (batch_row.get('radio_source_output_dir') != reproduced.get('output_dir')
-                        or any(batch_row.get(key) != reproduced.get(key) for key in (
-                            'proofs', 'snapshot_inputs', 'ineligible'))):
-                    raise ValueError('Radio promotion proof or eligibility disposition did not replay')
-                run = promoted_runs[old_run_count + index]
-                expected_run_inputs = []
+                original_by_path = {row['path']: row for row in original_snapshots}
                 proof_by_snapshot = {}
                 for proof_receipt in reproduced['proofs']:
                     proof = _read_json(proof_receipt['path'])
-                    proof_by_snapshot[proof['collector_snapshot']['path']] = {
-                        'path': proof_receipt['path'], 'sha256': proof_receipt['sha256']}
+                    source = proof.get('collector_snapshot')
+                    if (not isinstance(source, dict)
+                            or source.get('path') not in original_by_path
+                            or source.get('sha256')
+                            != original_by_path[source['path']].get('sha256')
+                            or source['path'] in proof_by_snapshot):
+                        raise ValueError(
+                            'Radio proof does not bind one exact frozen collector snapshot')
+                    proof_by_snapshot[source['path']] = proof_receipt
+                expected_snapshot_inputs = []
                 for snapshot_receipt in reproduced['snapshot_inputs']:
                     saved = _read_json(snapshot_receipt['path'])
                     source_receipt = saved.get('radio_only_source_proof')
-                    if (not isinstance(source_receipt, dict)
-                            or proof_by_snapshot.get(
-                                _read_json(source_receipt['path'])['collector_snapshot']['path'])
-                                != source_receipt):
+                    source_path = next((path for path, receipt in proof_by_snapshot.items()
+                                        if receipt == source_receipt), None)
+                    if (source_path is None
+                            or source_receipt != proof_by_snapshot[source_path]):
+                        raise ValueError(
+                            'Radio-only snapshot does not bind its exact reproduced proof')
+                    expected_snapshot_inputs.append({
+                        **snapshot_receipt,
+                        'radio_only_source_proof': source_receipt})
+                if (batch_row.get('radio_source_output_dir') != reproduced.get('output_dir')
+                        or batch_row.get('proofs') != reproduced.get('proofs')
+                        or batch_row.get('snapshot_inputs') != expected_snapshot_inputs
+                        or batch_row.get('ineligible') != reproduced.get('ineligible')):
+                    raise ValueError('Radio promotion proof or eligibility disposition did not replay')
+                run = promoted_runs[old_run_count + index]
+                expected_run_inputs = []
+                for snapshot_receipt in reproduced['snapshot_inputs']:
+                    saved = _read_json(snapshot_receipt['path'])
+                    source_receipt = saved.get('radio_only_source_proof')
+                    original_path = next((path for path, receipt in proof_by_snapshot.items()
+                                          if receipt == source_receipt), None)
+                    if original_path is None:
                         raise ValueError('Radio-only snapshot has a foreign proof pointer')
                     expected_run_inputs.append({**snapshot_receipt,
                                                 'radio_only_source_proof': source_receipt})
