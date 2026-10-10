@@ -475,10 +475,13 @@ def _validate_prior_attempt_ledger(path, library_hash, track_snapshot_sha256,
     if ledger_version == 2:
         required = required | {'promotion_receipt'}
         expected_producer = 'opengenius-genuine-root-attempt-ledger-v2'
+    elif ledger_version == 3:
+        required = required | {'request_only_failure_incidents'}
+        expected_producer = 'opengenius-genuine-root-attempt-ledger-v3'
     else:
         expected_producer = 'opengenius-genuine-root-attempt-ledger-v1'
     if (not isinstance(ledger, dict) or set(ledger) != required
-            or ledger_version not in (1, 2)
+            or ledger_version not in (1, 2, 3)
             or ledger.get('producer') != expected_producer
             or type(ledger.get('http_requests_total')) is not int
             or ledger['http_requests_total'] < 0
@@ -667,6 +670,182 @@ def _validate_prior_attempt_ledger(path, library_hash, track_snapshot_sha256,
         if (current_identity_map_sha256 is not None
                 and intent.get('identity_map_sha256') == current_identity_map_sha256):
             same_map_attempts.add(pid)
+
+    request_only_incident_paths = set()
+    request_only_incident_requests = 0
+    request_only_incidents = ledger.get('request_only_failure_incidents', [])
+    if not isinstance(request_only_incidents, list):
+        raise RecoveryUnsafe('Request-only failure incidents must be a list')
+    for receipt in request_only_incidents:
+        incident_path = checked_receipt(receipt, 'request-only failure incident')
+        if incident_path in request_only_incident_paths or incident_path in incident_paths:
+            raise RecoveryUnsafe('Prior-attempt ledger repeats a failure incident')
+        request_only_incident_paths.add(incident_path)
+        incident = _read_json(incident_path)
+        incident_required = {
+            'schema_version', 'type', 'status', 'request_starts_counted_by_collector',
+            'runner_progress_receipt', 'intent_receipt', 'seed_plan_receipt',
+            'seed_manifest_receipt', 'summary_receipt', 'parent_growth_receipt',
+        }
+        if (set(incident) != incident_required
+                or incident.get('schema_version') != 1
+                or incident.get('type') != 'preauth_transport_failure'
+                or incident.get('status') != 'account_preflight_request_failed'
+                or incident.get('request_starts_counted_by_collector') != 1):
+            raise RecoveryUnsafe('Request-only pre-auth failure incident is malformed')
+        # The incident must describe the exact frozen progress whose first
+        # batch stopped, not a separately assembled copy of its config.
+        if incident.get('runner_progress_receipt') != ledger.get('prior_progress'):
+            raise RecoveryUnsafe('Request-only incident is not bound to ledger prior progress')
+        failed_progress = _read_json(prior_progress_path)
+        failed_config = failed_progress.get('config')
+        if (not isinstance(failed_config, dict)
+                or failed_config.get('source_policy') != 'authenticated-watch-radio-only-v1'
+                or failed_progress.get('batches') != []
+                or failed_progress.get('http_requests') != prior_requests
+                or failed_progress.get('successful_outgoing_roots') != prior_roots
+                or set(failed_progress.get('attempted_pids', [])) != prior_attempted):
+            raise RecoveryUnsafe('Request-only incident progress is not an empty failed startup')
+        intent_path = checked_receipt(incident.get('intent_receipt'),
+                                      'pre-auth batch intent')
+        plan_path = checked_receipt(incident.get('seed_plan_receipt'),
+                                    'pre-auth seed plan')
+        manifest_path = checked_receipt(incident.get('seed_manifest_receipt'),
+                                        'pre-auth seed manifest')
+        summary_path = checked_receipt(incident.get('summary_receipt'),
+                                       'pre-auth collector summary')
+        intent = _read_json(intent_path)
+        plan = _read_json(plan_path)
+        manifest = _read_json(manifest_path)
+        summary = _read_json(summary_path)
+        batch_dir = intent_path.parent
+        collector_dir = manifest_path.parent
+        planned_pids = [row.get('persistent_id') for row in plan.get('seeds', [])
+                        if isinstance(row, dict)]
+        manifest_pids = [row.get('persistent_id') for row in manifest.get('seeds', [])
+                         if isinstance(row, dict)]
+        intent_plan = intent.get('seed_plan')
+        intent_video = intent.get('seed_video_evidence')
+        intent_radio = intent.get('current_radio_evidence')
+        for evidence, label in ((intent_plan, 'pre-auth intent seed plan'),
+                                (intent_video, 'pre-auth intent seed-video evidence'),
+                                (intent_radio, 'pre-auth intent current-radio evidence')):
+            checked_receipt(evidence, label)
+        source_receipts = intent.get('source_inputs')
+        configured_source_receipts = []
+        for key in ('track_snapshot', 'identity_map', 'baseline_state',
+                    'baseline_graph_export', 'rebase_report'):
+            source = failed_config.get(key)
+            if not isinstance(source, dict):
+                raise RecoveryUnsafe('Pre-auth runner config lacks a bound ' + key)
+            configured_source_receipts.append({'path': source.get('path'),
+                                               'sha256': source.get('sha256')})
+        for key in ('external_seed_video_evidence', 'prior_attempt_ledger'):
+            source = failed_config.get(key)
+            if source is not None:
+                if not isinstance(source, dict):
+                    raise RecoveryUnsafe('Pre-auth runner config has malformed ' + key)
+                configured_source_receipts.append({'path': source.get('path'),
+                                                   'sha256': source.get('sha256')})
+        normalized_source_receipts = []
+        if not isinstance(source_receipts, list):
+            raise RecoveryUnsafe('Pre-auth intent lacks source input receipts')
+        for source in source_receipts:
+            path = checked_receipt(source, 'pre-auth batch source input')
+            normalized_source_receipts.append({'path': str(path),
+                                               'sha256': source['sha256']})
+        expected_source_receipts = []
+        for source in configured_source_receipts:
+            if (not isinstance(source.get('path'), str)
+                    or not isinstance(source.get('sha256'), str)):
+                raise RecoveryUnsafe('Pre-auth config has a malformed source receipt')
+            source_path = Path(source['path']).resolve()
+            if _sha(source_path.read_bytes()) != source['sha256']:
+                raise RecoveryUnsafe('Pre-auth configured source hash changed')
+            expected_source_receipts.append({'path': str(source_path),
+                                             'sha256': source['sha256']})
+        global_budget = failed_config.get('global_request_budget')
+        batch_budget = failed_config.get('batch_request_budget')
+        if (type(global_budget) is not int or global_budget < prior_requests
+                or type(batch_budget) is not int or batch_budget <= 0):
+            raise RecoveryUnsafe('Pre-auth runner request budget is malformed')
+        expected_request_budget = min(batch_budget, global_budget - prior_requests)
+        if (plan_path.parent != batch_dir
+                or intent_path.name != 'intent.json'
+                or manifest_path.name != 'seeds.json'
+                or summary_path.parent != collector_dir
+                or collector_dir.name != 'collector'
+                or collector_dir.parent != batch_dir
+                or intent_plan != {'path': str(plan_path),
+                                   'sha256': _sha(plan_path.read_bytes())}
+                or Path(intent_video['path']).resolve() != batch_dir / 'seed-video-evidence.json'
+                or Path(intent_radio['path']).resolve() != batch_dir / 'current-radio-evidence.json'
+                or intent.get('batch') != 1
+                or intent.get('source_policy') != failed_config['source_policy']
+                or intent.get('runner_config') != failed_config
+                or intent.get('runner_config_sha256') != runner_config_sha256(failed_config)
+                or normalized_source_receipts != expected_source_receipts
+                or intent.get('request_budget') != expected_request_budget
+                or intent.get('seed_pids') != planned_pids
+                or intent.get('library_sha256') != library_hash
+                or intent.get('identity_map_sha256')
+                != failed_config.get('identity_map', {}).get('sha256')
+                or manifest.get('library_sha256') != library_hash
+                or manifest.get('identity_map_sha256')
+                != failed_config.get('identity_map', {}).get('sha256')
+                or manifest.get('seed_plan_sha256') != _sha(plan_path.read_bytes())
+                or manifest.get('seed_video_evidence_sha256')
+                != intent_video.get('sha256')
+                or manifest_pids != planned_pids
+                or not planned_pids
+                or len(planned_pids) > failed_config.get('batch_size', 0)
+                or len(planned_pids) != len(set(planned_pids))):
+            raise RecoveryUnsafe('Pre-auth failure intent, plan, or manifest receipts disagree')
+        parent_growth_receipt = incident.get('parent_growth_receipt')
+        configured_growth = failed_config.get('previous_growth')
+        if (not isinstance(configured_growth, dict)
+                or not isinstance(parent_growth_receipt, dict)
+                or set(parent_growth_receipt) != {'path', 'sha256'}
+                or parent_growth_receipt.get('path') != configured_growth.get('path')
+                or parent_growth_receipt.get('sha256') != configured_growth.get('sha256')):
+            raise RecoveryUnsafe('Pre-auth failure does not bind the frozen growth parent')
+        growth_path = Path(configured_growth['path']).resolve()
+        if growth_path.is_dir():
+            growth_path = growth_path / 'accepted-graphs.json'
+        if (_sha(growth_path.read_bytes()) != configured_growth['sha256']
+                or prior_roots != sum(bool(row.get('ordered_target_pids'))
+                                      for row in _read_json(growth_path).get('accepted_roots', [])
+                                      if isinstance(row, dict))):
+            raise RecoveryUnsafe('Pre-auth failure growth parent differs from frozen roots')
+        expected_previous_growth = {
+            'path': str(growth_path.resolve()),
+            'accepted_graphs_sha256': configured_growth['sha256'],
+        }
+        if intent.get('previous_growth') != expected_previous_growth:
+            raise RecoveryUnsafe('Pre-auth intent names a different typed growth parent')
+        starts = incident['request_starts_counted_by_collector']
+        if (summary.get('schema_version') != 1
+                or summary.get('status') != 'stopped'
+                or summary.get('account_authentication_verified') is not False
+                or summary.get('identity_status') != 'unverified'
+                or summary.get('http_requests') != starts
+                or type(summary.get('http_requests')) is not int
+                or summary.get('results') != []
+                or summary.get('partial_seed_persistent_id') is not None
+                or summary.get('library_sha256') != library_hash
+                or summary.get('error_type') != 'ConnectionError'
+                or summary.get('error_location') != {
+                    'file': 'adapters.py', 'function': 'send', 'line': 700}
+                or type(summary.get('request_budget')) is not int
+                or summary.get('request_budget') != intent.get('request_budget')
+                or summary.get('request_budget') != expected_request_budget
+                or summary.get('request_budget') < starts
+                or 'http_error_status' in summary):
+            raise RecoveryUnsafe('Pre-auth summary does not prove the one request-only failure')
+        if (list(collector_dir.glob('[0-9A-F]' * 16 + '.json'))
+                or any(path.is_file() for path in (collector_dir / 'requests').rglob('*'))):
+            raise RecoveryUnsafe('Pre-auth failure unexpectedly has seed snapshots or request caches')
+        request_only_incident_requests += starts
 
     if prior_attempted & incident_pids:
         raise RecoveryUnsafe('Prior interruption incident duplicates an attempted PID')
@@ -860,6 +1039,7 @@ def _validate_prior_attempt_ledger(path, library_hash, track_snapshot_sha256,
             raise RecoveryUnsafe('Promoted radio-only graph root count or replay receipt differs')
         promoted_roots = replay['outgoing_root_count']
     if (ledger['http_requests_total'] != prior_requests + incident_requests
+            + request_only_incident_requests
             or ledger['base_outgoing_roots'] !=
                (promoted_roots if promoted_roots is not None else prior_roots)):
         raise RecoveryUnsafe('Prior-attempt request or root total differs from verified receipts')

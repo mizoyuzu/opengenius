@@ -397,5 +397,171 @@ class PriorAttemptLedgerTests(unittest.TestCase):
         self.assertEqual(progress['config']['global_request_budget'], 6500)
 
 
+class PreauthTransportLedgerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name).resolve()
+        self.library_hash = '1' * 64
+        sources = self.root / 'sources'
+        self.source_receipts = [
+            write_json(sources / 'tracks.json', {'kind': 'tracks'}),
+            write_json(sources / 'map.json', {'kind': 'map'}),
+            write_json(sources / 'state.json', {'kind': 'state'}),
+            write_json(sources / 'baseline-graphs.json', {'kind': 'baseline'}),
+            write_json(sources / 'rebase.json', {'kind': 'rebase'}),
+            write_json(sources / 'external-evidence.json', {'kind': 'external'}),
+        ]
+        self.track_hash = self.source_receipts[0]['sha256']
+        self.map_hash = self.source_receipts[1]['sha256']
+        self.pid = 'ABCDEF0123456789'
+        self.graph_path = self.root / 'parent' / 'accepted-graphs.json'
+        self.graph_receipt = write_json(self.graph_path, {'accepted_roots': [
+            {'root_pid': PID_PRIOR, 'ordered_target_pids': ['target']},
+        ]})
+        self.progress_path = self.root / 'run' / 'progress.json'
+        config = {
+            'track_snapshot': self.source_receipts[0],
+            'identity_map': self.source_receipts[1],
+            'baseline_state': self.source_receipts[2],
+            'baseline_graph_export': self.source_receipts[3],
+            'rebase_report': self.source_receipts[4],
+            'external_seed_video_evidence': self.source_receipts[5],
+            'previous_growth': {'path': str(self.graph_path),
+                                'sha256': self.graph_receipt['sha256']},
+            'source_policy': 'authenticated-watch-radio-only-v1',
+            'batch_size': 20, 'batch_request_budget': 90,
+            'global_request_budget': 6500, 'deadline': None,
+        }
+        self.progress_receipt = write_json(self.progress_path, {
+            'config': config, 'batches': [], 'attempted_pids': [],
+            'http_requests': 0, 'successful_outgoing_roots': 1,
+        })
+        batch = self.root / 'run' / 'batch-0001'
+        self.plan_receipt = write_json(batch / 'seed-plan.json', {
+            'source_library_sha256': self.library_hash,
+            'seeds': [{'persistent_id': self.pid}],
+        })
+        video_receipt = write_json(batch / 'seed-video-evidence.json', {'rows': []})
+        radio_receipt = write_json(batch / 'current-radio-evidence.json', {'rows': []})
+        self.manifest_receipt = write_json(batch / 'collector' / 'seeds.json', {
+            'library_sha256': self.library_hash, 'identity_map_sha256': self.map_hash,
+            'seed_plan_sha256': self.plan_receipt['sha256'],
+            'seed_video_evidence_sha256': video_receipt['sha256'],
+            'seeds': [{'persistent_id': self.pid, 'seed_video_id': 'video'}],
+        })
+        (batch / 'collector' / 'requests').mkdir()
+        self.summary_receipt = write_json(batch / 'collector' / 'summary.json', {
+            'schema_version': 1, 'status': 'stopped',
+            'account_authentication_verified': False, 'identity_status': 'unverified',
+            'results': [], 'http_requests': 1, 'request_budget': 90,
+            'partial_seed_persistent_id': None, 'library_sha256': self.library_hash,
+            'error_type': 'ConnectionError',
+            'error_location': {'file': 'adapters.py', 'function': 'send', 'line': 700},
+        })
+        # The runner config itself is exactly the progress config; batch-only
+        # seed receipts are separate intent fields.
+        intent = {
+            'batch': 1, 'source_policy': config['source_policy'],
+            'runner_config': config,
+            'runner_config_sha256': runner.runner_config_sha256(config),
+            'request_budget': 90,
+            'seed_pids': [self.pid], 'library_sha256': self.library_hash,
+            'identity_map_sha256': self.map_hash,
+            'source_inputs': self.source_receipts,
+            'seed_plan': self.plan_receipt, 'seed_video_evidence': video_receipt,
+            'current_radio_evidence': radio_receipt,
+            'previous_growth': {'path': str(self.graph_path),
+                                'accepted_graphs_sha256': self.graph_receipt['sha256']},
+        }
+        self.intent_receipt = write_json(batch / 'intent.json', intent)
+        self.incident_path = self.root / 'preauth-incident.json'
+        self.incident_receipt = write_json(self.incident_path, {
+            'schema_version': 1, 'type': 'preauth_transport_failure',
+            'status': 'account_preflight_request_failed',
+            'request_starts_counted_by_collector': 1,
+            'runner_progress_receipt': self.progress_receipt,
+            'intent_receipt': self.intent_receipt,
+            'seed_plan_receipt': self.plan_receipt,
+            'seed_manifest_receipt': self.manifest_receipt,
+            'summary_receipt': self.summary_receipt,
+            'parent_growth_receipt': {'path': config['previous_growth']['path'],
+                                      'sha256': config['previous_growth']['sha256']},
+        })
+        self.ledger_path = self.root / 'ledger-v3.json'
+        self.ledger = {
+            'schema_version': 3,
+            'producer': 'opengenius-genuine-root-attempt-ledger-v3',
+            'prior_progress': self.progress_receipt,
+            'attempt_only_progress': [], 'interruption_incidents': [],
+            'request_only_failure_incidents': [self.incident_receipt],
+            'http_requests_total': 1, 'excluded_persistent_ids': [],
+            'base_outgoing_roots': 1,
+        }
+        write_json(self.ledger_path, self.ledger)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def validate(self):
+        return runner._validate_prior_attempt_ledger(
+            self.ledger_path, self.library_hash, self.track_hash,
+            current_identity_map_sha256=self.map_hash)
+
+    def reseal_intent(self, mutate):
+        intent_path = Path(self.intent_receipt['path'])
+        intent = json.loads(intent_path.read_text())
+        mutate(intent)
+        self.intent_receipt = write_json(intent_path, intent)
+        incident = json.loads(self.incident_path.read_text())
+        incident['intent_receipt'] = self.intent_receipt
+        self.incident_receipt = write_json(self.incident_path, incident)
+        self.ledger['request_only_failure_incidents'] = [self.incident_receipt]
+        write_json(self.ledger_path, self.ledger)
+
+    def test_preauth_transport_failure_charges_request_without_consuming_pid(self):
+        result = self.validate()
+        self.assertEqual(result['http_requests'], 1)
+        self.assertEqual(result['attempted_pids'], set())
+        self.assertEqual(result['outgoing_roots'], 1)
+
+    def test_preauth_receipt_rejects_auth_success_result_or_snapshot(self):
+        summary = json.loads(Path(self.summary_receipt['path']).read_text())
+        summary['account_authentication_verified'] = True
+        self.summary_receipt = write_json(Path(self.summary_receipt['path']), summary)
+        # Rebind the mutated summary through the incident and ledger so this
+        # checks semantic validation rather than only a stale hash failure.
+        incident = json.loads(self.incident_path.read_text())
+        incident['summary_receipt'] = self.summary_receipt
+        self.incident_receipt = write_json(self.incident_path, incident)
+        self.ledger['request_only_failure_incidents'] = [self.incident_receipt]
+        write_json(self.ledger_path, self.ledger)
+        with self.assertRaisesRegex(runner.RecoveryUnsafe,
+                                    'one request-only failure'):
+            self.validate()
+
+    def test_preauth_incident_rejects_omitted_resealed_config_source(self):
+        self.reseal_intent(lambda intent: intent['source_inputs'].pop())
+        with self.assertRaisesRegex(runner.RecoveryUnsafe,
+                                    'intent, plan, or manifest receipts disagree'):
+            self.validate()
+
+    def test_preauth_incident_rejects_wrong_resealed_large_request_budget(self):
+        def wrong_budget(intent):
+            intent['request_budget'] = 89
+            summary_path = Path(self.summary_receipt['path'])
+            summary = json.loads(summary_path.read_text())
+            summary['request_budget'] = 89
+            self.summary_receipt = write_json(summary_path, summary)
+        self.reseal_intent(wrong_budget)
+        incident = json.loads(self.incident_path.read_text())
+        incident['summary_receipt'] = self.summary_receipt
+        self.incident_receipt = write_json(self.incident_path, incident)
+        self.ledger['request_only_failure_incidents'] = [self.incident_receipt]
+        write_json(self.ledger_path, self.ledger)
+        with self.assertRaisesRegex(runner.RecoveryUnsafe,
+                                    'intent, plan, or manifest receipts disagree'):
+            self.validate()
+
+
 if __name__ == '__main__':
     unittest.main()
