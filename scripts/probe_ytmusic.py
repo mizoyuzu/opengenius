@@ -72,7 +72,10 @@ def observe(rows, relation, timestamp, local_tracks, seed_video_id, section=None
     return observations
 
 
-def collect(client, local_seed, local_tracks, video_id, limit, candidate_matcher=None):
+def collect(client, local_seed, local_tracks, video_id, limit, candidate_matcher=None,
+            collection_mode='related-v1'):
+    if collection_mode not in ('related-v1', 'radio-only-v1'):
+        raise ValueError('Unsupported collection mode')
     snapshot = {
         "schema_version": 1, "source_version": version("ytmusicapi"),
         "session_id": str(uuid4()),
@@ -88,6 +91,10 @@ def collect(client, local_seed, local_tracks, video_id, limit, candidate_matcher
     snapshot["observations"].extend(observe(
         radio.get("tracks") or [], "radio", radio_time, local_tracks, video_id,
         candidate_matcher=candidate_matcher))
+    if collection_mode == 'radio-only-v1':
+        snapshot['collector_collection_mode'] = collection_mode
+        snapshot['related_status'] = 'not_requested'
+        return snapshot
     # Related is obtained from a separate seed watch response; it need not exist.
     watch_time = datetime.now(timezone.utc).isoformat()
     watch = client.get_watch_playlist(videoId=video_id, radio=False, limit=limit)

@@ -17,7 +17,9 @@ from evaluate_ytmusic_batch import collect_graphs
 from radio_snapshot_proof import (create_radio_snapshot_proof,
                                   RadioSnapshotIneligible,
                                   radio_only_snapshot_from_proof,
+                                  radio_snapshot_proof_cache_scope,
                                   verify_radio_snapshot_proof)
+import radio_snapshot_proof as radio_proof
 from radio_source_integration import prepare_radio_only_snapshots
 
 
@@ -135,6 +137,200 @@ class RadioSnapshotProofTests(unittest.TestCase):
                 batch_intent_path=self.intent_path,
                 raw_radio_cache_path=self.cache_path, output_path=output,
                 sealed_at_utc='2026-10-10T12:10:00+00:00')
+
+    def verify_with_fixture_patches(self, proof_path):
+        return patch('radio_snapshot_proof.load_library',
+                     return_value=(self.tracks, LIBRARY, None)), \
+               patch('radio_snapshot_proof.select_seed_video_evidence',
+                     return_value={ROOT: {'video_id': self.arguments['videoId']}})
+
+    def _install_dynamic_source_fixture(self, *, include_catalog=False):
+        collector_dir = self.root / 'cached-run'
+        request_dir = collector_dir / 'requests'
+        request_dir.mkdir(parents=True)
+        summary = self.write('cached-run/summary-1.json', {'results': []})
+        manifest = self.write('cached-run/seeds.json', {'seeds': []})
+        request = self.write('cached-run/requests/one.json', {'response': []})
+        cached_doc = self.write('cached-hints.json', {
+            'schema_version': 1,
+            'producer': 'opengenius-cached-seed-hint-revalidation-v1',
+            'source_runs': [{'collector_dir': str(collector_dir.resolve()),
+                             'summary': {'path': str(summary.resolve()),
+                                         'sha256': self.digest(summary)},
+                             'seed_manifest': {'path': str(manifest.resolve()),
+                                               'sha256': self.digest(manifest)}}],
+            'rows': [{'input_path': str(request.resolve()),
+                      'input_sha256': self.digest(request)}],
+        })
+        catalog_ref = None
+        catalog_source = None
+        if include_catalog:
+            catalog_source = self.write('catalog-response.json', {'tracks': []})
+            catalog_doc = self.write('catalog-evidence.json', {
+                'rows': [{'input_path': str(catalog_source.resolve()),
+                          'input_sha256': self.digest(catalog_source)}],
+            })
+            catalog_ref = {'path': str(catalog_doc.resolve()),
+                           'sha256': self.digest(catalog_doc)}
+        map_ref = {'path': str(self.identity_path.resolve()), 'sha256': self.map_hash}
+        transition = {key: dict(map_ref) for key in (
+            'old_identity_map', 'new_identity_map', 'graph_export',
+            'rebase_report', 'state')}
+        rebound = self.write('rebound-hints.json', {
+            'schema_version': 1,
+            'producer': 'opengenius-map-transition-rebound-seed-evidence-v1',
+            'track_snapshot': {'path': str(self.track_path.resolve()),
+                               'sha256': self.digest(self.track_path)},
+            'typed_map_transition': transition,
+            'catalog_evidence': catalog_ref,
+            'cached_hint_evidence': {'path': str(cached_doc.resolve()),
+                                     'sha256': self.digest(cached_doc)},
+        })
+        current = self.write('current-radio.json', {'rows': []})
+        combined = self.write('seed-video-evidence.json', {
+            'schema_version': 1,
+            'producer': 'opengenius-combined-rebound-seed-evidence-v1',
+            'rebound_evidence': {'path': str(rebound.resolve()),
+                                 'sha256': self.digest(rebound)},
+            'current_radio_source': {'path': str(current.resolve()),
+                                     'sha256': self.digest(current)},
+            'current_radio_evidence': {'rows': []}, 'rows': [],
+            'audit': {'rebound_hint_count': 0, 'current_radio_hint_count': 0,
+                      'recommendation_edges_created': 0,
+                      'recommendation_observations_created': 0,
+                      'outgoing_roots_created': 0},
+        })
+        manifest_doc = json.loads(self.manifest_path.read_text(encoding='utf-8'))
+        manifest_doc['seed_video_evidence_sha256'] = self.digest(combined)
+        self.manifest_path.write_text(json.dumps(manifest_doc), encoding='utf-8')
+        intent_doc = json.loads(self.intent_path.read_text(encoding='utf-8'))
+        intent_doc['seed_video_evidence'] = {
+            'path': str(combined.resolve()), 'sha256': self.digest(combined)}
+        self.intent_path.write_text(json.dumps(intent_doc), encoding='utf-8')
+        radio_proof._seed_video_evidence._TYPED_TRANSITION_PROOF_CACHE.clear()
+        radio_proof._seed_video_evidence._TYPED_TRANSITION_PROOF_CACHE[
+            (self.map_hash, self.map_hash, LIBRARY, ())] = {'hash_inputs': []}
+        return collector_dir, summary, manifest, request, catalog_source
+
+    def test_scoped_cache_reuses_verified_result_and_returns_a_copy(self):
+        output = self.root / 'proof-cache.json'
+        self.create(output)
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        with load_patch, selector_patch, patch(
+                'radio_snapshot_proof._proof_from_inputs',
+                wraps=__import__('radio_snapshot_proof')._proof_from_inputs) as replay:
+            with radio_snapshot_proof_cache_scope():
+                first = verify_radio_snapshot_proof(output)
+                first['verified'] = False
+                second = verify_radio_snapshot_proof(output)
+        self.assertEqual(replay.call_count, 1)
+        self.assertTrue(second['verified'])
+        self.assertEqual(second['persistent_id'], ROOT)
+
+    def _assert_cached_source_change_rejects(self, source_name, *, remove=False,
+                                             add_transitive_source=False):
+        if add_transitive_source:
+            nested = self.write('source-extra.json', {'stable': True})
+            intent = json.loads(self.intent_path.read_text(encoding='utf-8'))
+            intent['source_inputs'] = [{'path': str(nested.resolve()),
+                                        'sha256': self.digest(nested)}]
+            self.write('intent.json', intent)
+        output = self.root / ('proof-change-' + source_name + '.json')
+        self.create(output)
+        proof = json.loads(output.read_text(encoding='utf-8'))
+        if source_name == 'map':
+            source_path = Path(proof['identity_map']['path'])
+        elif source_name == 'snapshot':
+            source_path = Path(proof['collector_snapshot']['path'])
+        elif source_name == 'raw':
+            source_path = Path(proof['raw_radio_cache']['path'])
+        elif source_name == 'intent':
+            source_path = Path(proof['batch_intent']['path'])
+        else:
+            source_path = self.root / 'source-extra.json'
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        with load_patch, selector_patch, radio_snapshot_proof_cache_scope():
+            self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+            if remove:
+                source_path.unlink()
+            else:
+                source_path.write_text('{"tampered":true}', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'cached radio-proof source'):
+                verify_radio_snapshot_proof(output)
+
+    def test_cache_hit_rehashes_transitive_intent_source(self):
+        self._assert_cached_source_change_rejects('transitive', add_transitive_source=True)
+
+    def test_cache_hit_rejects_changed_map(self):
+        self._assert_cached_source_change_rejects('map')
+
+    def test_cache_hit_rejects_changed_snapshot(self):
+        self._assert_cached_source_change_rejects('snapshot')
+
+    def test_cache_hit_rejects_changed_raw_cache(self):
+        self._assert_cached_source_change_rejects('raw')
+
+    def test_cache_hit_rejects_changed_intent(self):
+        self._assert_cached_source_change_rejects('intent')
+
+    def test_cache_hit_rejects_missing_transitive_source(self):
+        self._assert_cached_source_change_rejects('transitive-missing',
+                                                  remove=True,
+                                                  add_transitive_source=True)
+
+    def test_cache_hit_rejects_cached_search_tree_edit_delete_and_add(self):
+        collector_dir, summary, manifest, request, _ = self._install_dynamic_source_fixture()
+        output = self.root / 'proof-dynamic-cache.json'
+        self.create(output)
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        for mutation, path in (('edit', summary), ('delete', request),
+                               ('add', collector_dir / 'summary-new.json')):
+            # Reset a new scope and proof for each distinct first-seal state.
+            if mutation == 'delete':
+                request.write_text('{"response":[]}', encoding='utf-8')
+            if mutation == 'add':
+                request.write_text('{"response":[]}', encoding='utf-8')
+            with load_patch, selector_patch, radio_snapshot_proof_cache_scope():
+                self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+                if mutation == 'edit':
+                    path.write_text('{"changed":true}', encoding='utf-8')
+                elif mutation == 'delete':
+                    path.unlink()
+                else:
+                    path.write_text('{"results":[]}', encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'cached radio-proof source'):
+                    verify_radio_snapshot_proof(output)
+            if mutation == 'delete':
+                path.write_text('{"response":[]}', encoding='utf-8')
+            if mutation == 'add':
+                path.unlink()
+
+    def test_cache_hit_rejects_catalog_source_mutation(self):
+        _, _, _, _, catalog_source = self._install_dynamic_source_fixture(
+            include_catalog=True)
+        output = self.root / 'proof-catalog-cache.json'
+        self.create(output)
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        with load_patch, selector_patch, radio_snapshot_proof_cache_scope():
+            self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+            catalog_source.write_text('{"tracks":["tampered"]}', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'cached radio-proof source'):
+                verify_radio_snapshot_proof(output)
+
+    def test_source_run_tree_change_during_replay_does_not_seal_cache(self):
+        collector_dir, _, _, _, _ = self._install_dynamic_source_fixture()
+        output = self.root / 'proof-replay-race.json'
+        self.create(output)
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        original = radio_proof._proof_from_inputs
+        def replay_then_add(*args, **kwargs):
+            result = original(*args, **kwargs)
+            (collector_dir / 'summary-late.json').write_text('{}', encoding='utf-8')
+            return result
+        with load_patch, selector_patch, radio_snapshot_proof_cache_scope(), \
+                patch('radio_snapshot_proof._proof_from_inputs', side_effect=replay_then_add):
+            with self.assertRaisesRegex(ValueError, 'changed during radio proof replay'):
+                verify_radio_snapshot_proof(output)
 
     def test_radio_only_proof_accepts_parser_error_when_raw_radio_replays(self):
         output = self.root / 'proof.json'
@@ -615,6 +811,45 @@ class RadioSnapshotProofTests(unittest.TestCase):
             snapshot = radio_only_snapshot_from_proof(proof_path)
         self.assertEqual(snapshot['identity_map_sha256'], proof['identity_map']['sha256'])
         self.assertEqual(snapshot['local_seed']['persistent_id'], ROOT)
+
+    def test_radio_only_mode_is_declared_and_rejects_auxiliary_endpoints(self):
+        snapshot = self.snapshot()
+        snapshot['collector_collection_mode'] = 'radio-only-v1'
+        snapshot['related_status'] = 'not_requested'
+        snapshot['requests'] = [snapshot['requests'][0]]
+        self.snapshot_path.write_text(json.dumps(snapshot), encoding='utf-8')
+        summary = json.loads(self.summary_path.read_text())
+        summary['collector_collection_mode'] = 'radio-only-v1'
+        summary['results'][0] = {**collector_result_summary(snapshot), 'status': 'collected'}
+        self.summary_path.write_text(json.dumps(summary), encoding='utf-8')
+        manifest = json.loads(self.manifest_path.read_text())
+        manifest['collector_collection_mode'] = 'radio-only-v1'
+        self.manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+        intent = json.loads(self.intent_path.read_text())
+        intent['runner_config']['collector_collection_mode'] = 'radio-only-v1'
+        self.intent_path.write_text(json.dumps(intent), encoding='utf-8')
+        output = self.root / 'radio-only-proof.json'
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence',
+                      return_value={ROOT: {'video_id': self.arguments['videoId']}}):
+            proof = self.create(output)
+        self.assertEqual(proof['outgoing_target_pids'], [TARGET])
+
+        snapshot['request_evidence'].append({
+            'endpoint': 'get_watch_playlist',
+            'arguments': {'videoId': self.arguments['videoId'], 'radio': False, 'limit': 25},
+            'observed_at': self.observed_at, 'cache_hit': False})
+        snapshot['requests'].append({'endpoint': 'watch_seed', 'related_available': True})
+        self.snapshot_path.write_text(json.dumps(snapshot), encoding='utf-8')
+        summary['results'][0] = {**collector_result_summary(snapshot), 'status': 'collected'}
+        self.summary_path.write_text(json.dumps(summary), encoding='utf-8')
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence',
+                      return_value={ROOT: {'video_id': self.arguments['videoId']}}):
+            with self.assertRaisesRegex(ValueError, 'auxiliary watch/related'):
+                self.create(self.root / 'radio-only-aux-proof.json')
 
 
 if __name__ == '__main__':

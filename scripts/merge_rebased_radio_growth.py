@@ -840,7 +840,7 @@ def _replay_previous_growth(previous_dir, baseline_state, baseline_roots,
     return state, roots, normalized_runs, sha(accepted_bytes)
 
 
-def merge_radio_growth(*, track_snapshot, identity_map_path, baseline_state_path,
+def _merge_radio_growth_with_radio_proof_cache(*, track_snapshot, identity_map_path, baseline_state_path,
                        baseline_graph_export_path, rebase_report_path,
                        collector_summary_path, seed_manifest_path,
                        snapshot_paths, output_dir, seed_video_evidence_path=None,
@@ -1144,6 +1144,12 @@ def merge_radio_growth(*, track_snapshot, identity_map_path, baseline_state_path
     }
     write_json(output_dir / 'merge-audit.json', audit)
     return audit
+
+
+def merge_radio_growth(*args, **kwargs):
+    from radio_snapshot_proof import radio_snapshot_proof_cache_scope
+    with radio_snapshot_proof_cache_scope():
+        return _merge_radio_growth_with_radio_proof_cache(*args, **kwargs)
 
 
 def main():

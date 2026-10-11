@@ -1274,7 +1274,7 @@ def _invoke(command):
     return subprocess.run(command, check=False).returncode
 
 
-def run(args):
+def _run_with_radio_proof_cache(args):
     output = args.output.resolve()
     tracks, library_hash, _ = load_library(track_snapshot=args.track_snapshot)
     map_bytes = args.identity_map.read_bytes()
@@ -1346,6 +1346,9 @@ def run(args):
     }
     if getattr(args, 'source_policy', None) is not None:
         config['source_policy'] = args.source_policy
+    collector_collection_mode = getattr(args, 'collector_collection_mode', None)
+    if collector_collection_mode is not None:
+        config['collector_collection_mode'] = collector_collection_mode
     if progress_path.exists():
         progress = _read_json(progress_path)
         if (progress.get('config') != config
@@ -1543,6 +1546,8 @@ def run(args):
                    '--auth', str(args.auth), '--output', str(collector_dir),
                    '--request-budget', str(request_budget), '--interval', str(args.interval),
                    '--candidate-limit', str(candidate_limit)]
+        if collector_collection_mode is not None:
+            command.extend(['--collection-mode', collector_collection_mode])
         if args.deadline:
             command.extend(['--deadline', args.deadline])
         _invoke(command)
@@ -1574,6 +1579,12 @@ def run(args):
     return progress
 
 
+def run(*args, **kwargs):
+    from radio_snapshot_proof import radio_snapshot_proof_cache_scope
+    with radio_snapshot_proof_cache_scope():
+        return _run_with_radio_proof_cache(*args, **kwargs)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--track-snapshot', type=Path, required=True)
@@ -1587,6 +1598,8 @@ def main():
                         help='Optional strict current-map saved radio/catalog seed-video evidence')
     parser.add_argument('--dynamic-current-radio-hints', action='store_true',
                         help='Build a per-batch typed composite from the rebound sidecar and current accepted radio snapshots')
+    parser.add_argument('--collector-collection-mode', choices=('radio-only-v1',),
+                        help='Declare the opt-in collector mode in the immutable runner config')
     parser.add_argument('--source-policy', choices=('authenticated-watch-radio-only-v1',),
                         help='Versioned source qualification policy for new collector snapshots')
     parser.add_argument('--prior-attempt-ledger', type=Path,

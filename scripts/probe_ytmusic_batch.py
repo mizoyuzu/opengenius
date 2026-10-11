@@ -11,6 +11,7 @@ import json
 import math
 import re
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 import time
 import traceback
 
@@ -152,6 +153,38 @@ class AuthenticationUnconfirmed(Exception):
     pass
 
 
+def _has_continuation_field(value):
+    if isinstance(value, dict):
+        return any(str(key).lower() in {
+            'ctoken', 'continuation', 'continuationtoken', 'continuation_token'}
+                   or _has_continuation_field(child)
+                   for key, child in value.items())
+    if isinstance(value, list):
+        return any(_has_continuation_field(child) for child in value)
+    return False
+
+
+def _http_request_category(url, body):
+    """Return a fixed label only; never persist URL, query values, or body."""
+    parts = urlsplit(url)
+    path = parts.path.rstrip('/')
+    query_names = {key.lower() for key, _ in parse_qsl(parts.query, keep_blank_values=True)}
+    continuation = (bool(query_names & {'ctoken', 'continuation'})
+                    or _has_continuation_field(body))
+    params = body.get('params') if isinstance(body, dict) else None
+    if path.endswith('/account/account_menu'):
+        return 'account_preflight'
+    if path.endswith('/next'):
+        if params == 'wAEB':
+            return 'radio_continuation' if continuation else 'radio_page'
+        return 'watch_seed_continuation' if continuation else 'watch_seed_page'
+    if path.endswith('/browse'):
+        return 'related_continuation' if continuation else 'related_page'
+    if path.endswith('/search'):
+        return 'search_continuation' if continuation else 'search_page'
+    return 'other'
+
+
 class CollectionDeadlineReached(Exception):
     """Raised before sending an HTTP request at or after the configured deadline."""
 
@@ -198,6 +231,7 @@ def create_paced_session(interval, request_budget, deadline=None, deadline_clock
         def __init__(self):
             super().__init__()
             self.last_start, self.count = None, 0
+            self.request_categories = Counter()
 
         def request(self, *positional, **kwargs):
             if self.count >= request_budget:
@@ -212,6 +246,9 @@ def create_paced_session(interval, request_budget, deadline=None, deadline_clock
                     raise CollectionDeadlineReached('Collection deadline reached before request')
             self.last_start = time.monotonic()
             self.count += 1
+            url = positional[0] if positional else kwargs.get('url', '')
+            self.request_categories[_http_request_category(
+                url, kwargs.get('json'))] += 1
             kwargs['timeout'] = 25
             # Redirect sends bypass Session.request(), including its pacing/budget.
             kwargs['allow_redirects'] = False
@@ -291,6 +328,8 @@ def main():
     parser.add_argument('--seeds', type=int, default=10)
     parser.add_argument('--candidate-limit', type=int, default=25,
                         help='Radio candidate observation window (25..100); seed search and watch request stay at 25')
+    parser.add_argument('--collection-mode', choices=('related-v1', 'radio-only-v1'),
+                        default='related-v1', help='Opt-in to collecting only authenticated radio rows')
     parser.add_argument('--seed-query-fallback', action='store_true',
                         help='After an unresolved title+artist search, try one cached title-only songs search (limit 5) with the same strict identity matcher')
     parser.add_argument('--interval', type=float, default=5, help='Minimum seconds between HTTP request starts')
@@ -321,6 +360,8 @@ def main():
               'request_budget': args.request_budget, 'identity_status': 'unverified',
               'radio_candidate_limit': args.candidate_limit,
               'radio_window_note': 'The service may paginate or return fewer candidates; added coverage is uncertain.'}
+    if args.collection_mode != 'related-v1':
+        report['collector_collection_mode'] = args.collection_mode
     if args.deadline is not None:
         report['deadline'] = args.deadline
         report['deadline_stop_at'] = None
@@ -383,6 +424,8 @@ def main():
                     'language': args.language, 'seeds': seeds,
                     'seed_evidence_sha256': seed_evidence_hash,
                     'selection': selection}
+        if args.collection_mode != 'related-v1':
+            manifest['collector_collection_mode'] = args.collection_mode
         if args.seed_video_evidence:
             manifest['seed_video_evidence_sha256'] = seed_video_evidence_hash
             manifest['seed_video_evidence_sources'] = seed_video_sources
@@ -457,7 +500,8 @@ def main():
                         continue
                     ids = {selected_video}
                 snapshot = collect(cached, seed, tracks, next(iter(ids)), args.candidate_limit,
-                                   candidate_matcher=matcher.match if matcher else None)
+                                   candidate_matcher=matcher.match if matcher else None,
+                                   collection_mode=args.collection_mode)
                 snapshot['library_sha256'] = library_hash
                 snapshot['library_input'] = provenance
                 snapshot['identity_map_sha256'] = map_hash
@@ -522,6 +566,10 @@ def main():
               '); no automatic retry.', flush=True)
     finally:
         report['http_requests'] = session.count if session else 0
+        if session is not None and args.collection_mode == 'radio-only-v1':
+            report['http_request_categories'] = dict(sorted(session.request_categories.items()))
+            report['http_request_categories_match_total'] = (
+                sum(report['http_request_categories'].values()) == session.count)
         report['finished_at'] = datetime.now(timezone.utc).isoformat()
         # Separate run summaries retain previous observations on resumed runs.
         save(output / ('summary-' + str(time.time_ns()) + '.json'), report)

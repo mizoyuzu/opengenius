@@ -198,7 +198,13 @@ def _verify_dynamic_current_radio_binding(intent, evidence, config):
         raise RecoveryUnsafe('Static evidence intent unexpectedly includes current-radio evidence')
 
 
-def recover_orphan_batch(batch_dir, *, expected_config_sha256,
+def recover_orphan_batch(*args, **kwargs):
+    from radio_snapshot_proof import radio_snapshot_proof_cache_scope
+    with radio_snapshot_proof_cache_scope():
+        return _recover_orphan_batch_with_radio_proof_cache(*args, **kwargs)
+
+
+def _recover_orphan_batch_with_radio_proof_cache(batch_dir, *, expected_config_sha256,
                          library_sha256, identity_map_sha256,
                          expected_previous_growth=None,
                          expected_request_budget=None):
