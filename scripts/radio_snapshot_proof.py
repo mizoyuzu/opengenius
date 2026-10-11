@@ -52,6 +52,9 @@ def radio_snapshot_proof_cache_scope():
     cache.stats = {
         'nested_scope_count': 0,
         'verify_calls': 0,
+        'creation_replays': 0,
+        'creation_full_source_replay_seconds': 0.0,
+        'creation_closure_seal_seconds': 0.0,
         'cache_hits': 0,
         'cache_misses': 0,
         'cache_evictions': 0,
@@ -398,13 +401,13 @@ def _search_derived_seed_binding(*, snapshot, snapshot_path, local_seed,
     strict_video_ids = sorted(video for video, pids in strict_by_video.items()
                               if pid in pids)
     selected_video_strict = strict_by_video.get(selected_video_id, set())
-    if (strict_video_ids != [selected_video_id]
-            or selected_video_strict != {pid}
-            or not selected_video_strict_rows
-            or any(row_pids != {pid} for row_pids in selected_video_strict_rows)):
-        raise ValueError('Seed search does not have one strict unique video for its local PID')
-    return {
-        'kind': 'authenticated-search-strict-unique-seed-v1',
+    strict_unique = (strict_video_ids == [selected_video_id]
+                     and selected_video_strict == {pid}
+                     and bool(selected_video_strict_rows)
+                     and all(row_pids == {pid} for row_pids in selected_video_strict_rows))
+    binding = {
+        'kind': ('authenticated-search-strict-unique-seed-v1' if strict_unique
+                 else 'authenticated-search-resolver-seed-ineligible-v1'),
         'request': {'endpoint': 'search', 'arguments': arguments,
                     'observed_at': request['observed_at'], 'cache_hit': False},
         'raw_search_cache': {'path': str(cache_path), 'sha256': _sha(cache_bytes),
@@ -413,8 +416,19 @@ def _search_derived_seed_binding(*, snapshot, snapshot_path, local_seed,
                      'candidate_video_count': candidate_video_count,
                      'status': resolver_status},
         'strict_unique_video_ids': strict_video_ids,
+        'selected_video_strict_candidate_pids': sorted(selected_video_strict),
+        'selected_video_strict_row_candidate_pids': [sorted(row_pids)
+                                                     for row_pids in selected_video_strict_rows],
+        'strict_unique': strict_unique,
         'persistent_id': pid,
     }
+    if strict_unique:
+        # Preserve the established eligible proof schema exactly. The richer
+        # resolver-only receipt is used solely on the typed ineligible path.
+        return {key: value for key, value in binding.items()
+                if key not in {'selected_video_strict_candidate_pids',
+                               'selected_video_strict_row_candidate_pids', 'strict_unique'}}
+    return binding
 
 
 def _check_collector_summary(summary, persistent_id, library_hash, snapshot):
@@ -649,7 +663,13 @@ def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
                      == version_signature(seed_title or ''))}
                 for row in seed_candidates],
         }
+        if seed_video_search_binding is not None:
+            details['seed_video_search_binding'] = seed_video_search_binding
         raise RadioSnapshotIneligible(pid, 'seed_not_strictly_matched', details)
+    if (seed_video_search_binding is not None
+            and seed_video_search_binding.get('kind') !=
+            'authenticated-search-strict-unique-seed-v1'):
+        raise ValueError('Search-derived seed does not have one strict unique video in its source')
 
     observations_by_video = {}
     strict_by_position = {}
@@ -776,16 +796,84 @@ def create_radio_snapshot_proof(*, track_snapshot_path, identity_map_path,
         raise FileExistsError('Radio proof output exists; choose a new path')
     if sealed_at_utc is None:
         sealed_at_utc = datetime.now(timezone.utc).isoformat()
-    proof = _proof_from_inputs(
-        track_snapshot_path=track_snapshot_path, identity_map_path=identity_map_path,
-        snapshot_path=snapshot_path, collector_summary_path=collector_summary_path,
-        collector_seed_manifest_path=collector_seed_manifest_path,
-        batch_intent_path=batch_intent_path,
-        raw_radio_cache_path=raw_radio_cache_path, sealed_at_utc=sealed_at_utc)
+    cache = _ACTIVE_VERIFICATION_CACHE.get()
+    directory_state_before = None
+    seed_evidence_before = None
+    if cache is not None:
+        intent_path = Path(batch_intent_path).resolve()
+        intent_doc = json.loads(intent_path.read_bytes())
+        evidence_ref = intent_doc.get('seed_video_evidence')
+        if (not isinstance(evidence_ref, dict)
+                or not isinstance(evidence_ref.get('path'), str)
+                or not isinstance(evidence_ref.get('sha256'), str)):
+            raise ValueError('Batch intent lacks the exact seed-video evidence receipt')
+        evidence_path = Path(evidence_ref['path']).resolve()
+        seed_evidence_before = {
+            'path': str(evidence_path), 'sha256': evidence_ref['sha256']}
+        directory_state_before = _replay_scanned_directory_state(
+            {'seed_video_evidence': seed_evidence_before})
+    replay_started = time.perf_counter()
+    if cache is not None:
+        cache.stats['creation_replays'] += 1
+    try:
+        proof = _proof_from_inputs(
+            track_snapshot_path=track_snapshot_path, identity_map_path=identity_map_path,
+            snapshot_path=snapshot_path, collector_summary_path=collector_summary_path,
+            collector_seed_manifest_path=collector_seed_manifest_path,
+            batch_intent_path=batch_intent_path,
+            raw_radio_cache_path=raw_radio_cache_path, sealed_at_utc=sealed_at_utc)
+    finally:
+        if cache is not None:
+            cache.stats['creation_full_source_replay_seconds'] += (
+                time.perf_counter() - replay_started)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open('x', encoding='utf-8') as handle:
         json.dump(proof, handle, ensure_ascii=False, indent=2)
         handle.write('\n')
+        handle.flush()
+    if cache is not None:
+        # The creation replay is the full source validation. Bind its exact
+        # persisted artifact and seal the same source closure the verifier
+        # uses, so the ordinary verify call can only take the normal
+        # hash-and-closure-checked memo-hit path.
+        proof_file, proof_bytes, persisted = _read(output)
+        if persisted != proof:
+            raise ValueError('Persisted radio proof differs from the verified creation result')
+        if proof.get('seed_video_evidence') != seed_evidence_before:
+            raise ValueError('Seed-video evidence changed during radio proof creation')
+        directory_state_after = _replay_scanned_directory_state(persisted)
+        if directory_state_before != directory_state_after:
+            raise ValueError('A cached-search source directory changed during radio proof creation')
+        closure_started = time.perf_counter()
+        try:
+            source_closure = _verified_source_closure(persisted)
+            closure_directory_state = tuple(sorted(
+                (path[len('@directory:'):], digest)
+                for path, digest in source_closure
+                if path.startswith('@directory:')))
+            if directory_state_after != closure_directory_state:
+                raise ValueError('A cached-search source directory changed while sealing created proof')
+            _rehash_cached_closure(source_closure)
+        finally:
+            cache.stats['creation_closure_seal_seconds'] += (
+                time.perf_counter() - closure_started)
+        cache_key = (str(proof_file), _sha(proof_bytes),
+                     (persisted.get('identity_map') or {}).get('sha256'),
+                     persisted.get('library_sha256'))
+        result = {'verified': True, 'proof_path': str(proof_file),
+                  'proof_sha256': _sha(proof_bytes),
+                  'persistent_id': persisted['selected_seed']['persistent_id'],
+                  'outgoing_target_count': len(persisted['outgoing_target_pids']),
+                  'outgoing_edge_count': len(persisted['outgoing_recommendation_edges']),
+                  'raw_radio_cache_sha256': persisted['raw_radio_cache']['sha256'],
+                  'collector_snapshot_sha256': persisted['collector_snapshot']['sha256'],
+                  'collector_summary_sha256': persisted['collector_summary']['sha256']}
+        cache[cache_key] = {'source_closure': source_closure,
+                            'result': deepcopy(result)}
+        cache.move_to_end(cache_key)
+        if len(cache) > _CACHE_LIMIT:
+            cache.popitem(last=False)
+            cache.stats['cache_evictions'] += 1
     return proof
 
 

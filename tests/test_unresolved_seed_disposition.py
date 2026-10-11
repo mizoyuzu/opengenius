@@ -69,6 +69,7 @@ class UnresolvedSeedDispositionTests(unittest.TestCase):
             'collector_collection_mode': 'radio-only-v1',
             'library_sha256': LIBRARY_HASH, 'http_requests': 5,
             'request_budget': 90,
+            'finished_at': '2026-10-11T16:02:38.256582+00:00',
             'results': [{'persistent_id': PID, 'status': 'search_unresolved',
                          'candidate_video_ids': 0, 'title_fallback_attempted': False}],
         }
@@ -149,6 +150,12 @@ class UnresolvedSeedDispositionTests(unittest.TestCase):
                          'opengenius-authenticated-search-unresolved-seed-v1')
         self.assertEqual(receipt['persistent_id'], PID)
         self.assertEqual(receipt['status'], 'search_unresolved')
+        self.assertEqual(set(receipt), {
+            'schema_version', 'producer', 'persistent_id', 'status',
+            'candidate_video_ids', 'title_fallback_attempted', 'source_policy',
+            'collector_summary', 'batch_intent', 'seed_manifest', 'seed_plan',
+            'seed_video_evidence', 'current_radio_evidence',
+            'absent_snapshot_paths'})
         self.assertEqual(len(receipt['absent_snapshot_paths']), 3)
         self.assertTrue(all(row['exists'] is False
                             for row in receipt['absent_snapshot_paths']))
@@ -167,8 +174,126 @@ class UnresolvedSeedDispositionTests(unittest.TestCase):
             self.disposition()
         self.summary['account_authentication_verified'] = True
         self.summary['results'][0]['candidate_video_ids'] = 1
-        with self.assertRaisesRegex(ValueError, 'inconsistent search disposition'):
+        with self.assertRaisesRegex(ValueError, 'current Library search context'):
             self.disposition()
+
+    def test_nonzero_unresolved_candidate_replays_exact_batch_local_search(self):
+        seed = self.manifest['seeds'][0]
+        seed.update({'title': 'Seed Song', 'artist': 'Seed Artist', 'album': 'Seed Album'})
+        self.write_json(self.manifest_path, self.manifest)
+        self.summary['results'][0]['candidate_video_ids'] = 2
+        self.write_json(self.summary_path, self.summary)
+        arguments = {'query': 'Seed Song Seed Artist', 'filter': 'songs', 'limit': 5}
+        key = json.dumps(['search', arguments], sort_keys=True, ensure_ascii=False).encode('utf-8')
+        search_path = self.collector_dir / 'requests' / (self.sha_bytes(key) + '.json')
+        search_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(search_path, {
+            'endpoint': 'search', 'arguments': arguments,
+            'observed_at': '2026-10-11T16:02:01.986492+00:00',
+            'response': [
+                {'videoId': 'abcdefghijk', 'title': 'Seed Song', 'album': {'name': 'Seed Album'}},
+                {'videoId': 'lmnopqrstuv', 'title': 'Seed Song', 'album': {'name': 'Seed Album'}},
+            ],
+        })
+        class Matcher:
+            @staticmethod
+            def match(row):
+                return [{'persistent_id': PID}]
+        receipt = self.disposition(tracks=[seed], matcher=Matcher())
+        self.assertEqual(receipt['candidate_video_ids'], 2)
+        self.assertEqual(len(receipt['search_request_receipts']), 1)
+        self.assertEqual(receipt['search_request_receipts'][0]['path'], str(search_path.resolve()))
+        self.assertEqual(receipt['search_request_receipts'][0]['sha256'], self.sha(search_path))
+
+    def test_nonzero_unresolved_rejects_title_fallback_mode(self):
+        seed = self.manifest['seeds'][0]
+        seed.update({'title': 'Seed Song', 'artist': 'Seed Artist', 'album': 'Seed Album'})
+        self.manifest['seed_query_fallback'] = True
+        self.write_json(self.manifest_path, self.manifest)
+        result = self.summary['results'][0]
+        result.update({'candidate_video_ids': 2, 'title_fallback_attempted': True,
+                       'title_fallback_candidate_video_ids': 0})
+        self.write_json(self.summary_path, self.summary)
+        with self.assertRaisesRegex(ValueError, 'fallback'):
+            self.disposition(tracks=[seed], matcher=object())
+
+    def test_nonzero_unresolved_rejects_malformed_fallback_flags(self):
+        seed = self.manifest['seeds'][0]
+        seed.update({'title': 'Seed Song', 'artist': 'Seed Artist', 'album': 'Seed Album'})
+        self.manifest['seed_query_fallback'] = 'false'
+        self.write_json(self.manifest_path, self.manifest)
+        self.summary['results'][0]['candidate_video_ids'] = 2
+        self.write_json(self.summary_path, self.summary)
+        with self.assertRaisesRegex(ValueError, 'fallback'):
+            self.disposition(tracks=[seed], matcher=object())
+
+    def test_nonzero_unresolved_candidate_rejects_tampered_search_receipt(self):
+        seed = self.manifest['seeds'][0]
+        seed.update({'title': 'Seed Song', 'artist': 'Seed Artist', 'album': 'Seed Album'})
+        self.write_json(self.manifest_path, self.manifest)
+        self.summary['results'][0]['candidate_video_ids'] = 2
+        self.write_json(self.summary_path, self.summary)
+        arguments = {'query': 'Seed Song Seed Artist', 'filter': 'songs', 'limit': 5}
+        key = json.dumps(['search', arguments], sort_keys=True, ensure_ascii=False).encode('utf-8')
+        search_path = self.collector_dir / 'requests' / (self.sha_bytes(key) + '.json')
+        search_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(search_path, {
+            'endpoint': 'search', 'arguments': {'query': 'wrong query', 'filter': 'songs', 'limit': 5},
+            'observed_at': '2026-10-11T16:02:01.986492+00:00',
+            'response': [{'videoId': 'abcdefghijk', 'title': 'Seed Song'},
+                         {'videoId': 'lmnopqrstuv', 'title': 'Seed Song'}],
+        })
+        class Matcher:
+            @staticmethod
+            def match(row):
+                return [{'persistent_id': PID}]
+        with self.assertRaisesRegex(ValueError, 'exact request'):
+            self.disposition(tracks=[seed], matcher=Matcher())
+
+    def test_nonzero_unresolved_search_timestamp_must_be_inside_run(self):
+        seed = self.manifest['seeds'][0]
+        seed.update({'title': 'Seed Song', 'artist': 'Seed Artist', 'album': 'Seed Album'})
+        self.write_json(self.manifest_path, self.manifest)
+        self.summary['results'][0]['candidate_video_ids'] = 2
+        self.write_json(self.summary_path, self.summary)
+        arguments = {'query': 'Seed Song Seed Artist', 'filter': 'songs', 'limit': 5}
+        key = json.dumps(['search', arguments], sort_keys=True, ensure_ascii=False).encode('utf-8')
+        path = self.collector_dir / 'requests' / (self.sha_bytes(key) + '.json')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(path, {'endpoint': 'search', 'arguments': arguments,
+                               'observed_at': '2026-10-11T16:02:39+00:00',
+                               'response': [{'videoId': 'abcdefghijk', 'title': 'Seed Song'},
+                                            {'videoId': 'lmnopqrstuv', 'title': 'Seed Song'}]})
+        class Matcher:
+            @staticmethod
+            def match(row):
+                return [{'persistent_id': PID}]
+        with self.assertRaisesRegex(ValueError, 'outside the collector run window'):
+            self.disposition(tracks=[seed], matcher=Matcher())
+
+    def test_nonzero_unresolved_candidate_rejects_a_unique_resolver_result(self):
+        seed = self.manifest['seeds'][0]
+        seed.update({'title': 'Seed Song', 'artist': 'Seed Artist', 'album': 'Seed Album'})
+        self.write_json(self.manifest_path, self.manifest)
+        self.summary['results'][0]['candidate_video_ids'] = 2
+        self.write_json(self.summary_path, self.summary)
+        arguments = {'query': 'Seed Song Seed Artist', 'filter': 'songs', 'limit': 5}
+        key = json.dumps(['search', arguments], sort_keys=True, ensure_ascii=False).encode('utf-8')
+        search_path = self.collector_dir / 'requests' / (self.sha_bytes(key) + '.json')
+        search_path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(search_path, {
+            'endpoint': 'search', 'arguments': arguments,
+            'observed_at': '2026-10-11T16:02:01.986492+00:00',
+            'response': [{'videoId': 'abcdefghijk', 'title': 'Seed Song'}],
+        })
+        class Matcher:
+            @staticmethod
+            def match(row):
+                return [{'persistent_id': PID}]
+        self.summary['results'][0]['candidate_video_ids'] = 1
+        self.write_json(self.summary_path, self.summary)
+        with self.assertRaisesRegex(ValueError, 'does not replay'):
+            self.disposition(tracks=[seed], matcher=Matcher())
 
     def test_unresolved_pid_must_match_intent_manifest_and_summary_order(self):
         self.intent['seed_pids'] = ['0000000000000001']

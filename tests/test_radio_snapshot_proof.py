@@ -171,6 +171,11 @@ class RadioSnapshotProofTests(unittest.TestCase):
         self.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False),
                                       encoding='utf-8')
         intent = json.loads(self.intent_path.read_text(encoding='utf-8'))
+        track_doc = json.loads(self.track_path.read_text(encoding='utf-8'))
+        track_doc['source_sha256'] = LIBRARY
+        self.track_path.write_text(json.dumps(track_doc), encoding='utf-8')
+        intent['runner_config']['track_snapshot'] = {
+            'path': str(self.track_path.resolve()), 'sha256': self.digest(self.track_path)}
         intent['seed_video_evidence']['sha256'] = self.digest(self.seed_evidence_path)
         self.intent_path.write_text(json.dumps(intent, ensure_ascii=False),
                                     encoding='utf-8')
@@ -284,6 +289,155 @@ class RadioSnapshotProofTests(unittest.TestCase):
         self.assertEqual(replay.call_count, 1)
         self.assertTrue(second['verified'])
         self.assertEqual(second['persistent_id'], ROOT)
+
+    def test_creation_replay_seals_exact_written_proof_for_normal_verify_path(self):
+        output = self.root / 'proof-created-and-verified.json'
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        with load_patch, selector_patch, patch(
+                'radio_snapshot_proof._proof_from_inputs',
+                wraps=radio_proof._proof_from_inputs) as replay:
+            with radio_snapshot_proof_cache_scope() as stats:
+                created = self.create(output)
+                self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+                self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+                self.assertEqual(json.loads(output.read_text()), created)
+                self.assertEqual(stats['cache_hits'], 2)
+                self.assertEqual(stats['cache_misses'], 0)
+                self.assertEqual(stats['creation_replays'], 1)
+                self.assertGreater(stats['creation_full_source_replay_seconds'], 0.0)
+                self.assertGreater(stats['creation_closure_seal_seconds'], 0.0)
+            # A separate top-level invocation has no memo and still performs
+            # the ordinary full independent replay.
+            with radio_snapshot_proof_cache_scope() as fresh_stats:
+                independently_verified = verify_radio_snapshot_proof(output)
+                self.assertTrue(independently_verified['verified'])
+                self.assertEqual(fresh_stats['cache_misses'], 1)
+                self.assertEqual(fresh_stats['cache_hits'], 0)
+                self.assertEqual(fresh_stats['verified_results'], 1)
+                self.assertEqual(fresh_stats['creation_replays'], 0)
+        # One creation replay plus one fresh-scope replay. The two verifies in
+        # the creation scope take the normal exact-byte/closure cache-hit path.
+        self.assertEqual(replay.call_count, 2)
+
+    def test_creation_memo_supports_search_bound_seed_and_rehashes_search_cache(self):
+        self.configure_search_derived_seed()
+        output = self.root / 'proof-created-search-bound.json'
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence',
+                      return_value={}), \
+                patch('radio_snapshot_proof._proof_from_inputs',
+                      wraps=radio_proof._proof_from_inputs) as replay:
+            with radio_snapshot_proof_cache_scope() as stats:
+                proof = create_radio_snapshot_proof(
+                    track_snapshot_path=self.track_path,
+                    identity_map_path=self.identity_path,
+                    snapshot_path=self.snapshot_path,
+                    collector_summary_path=self.summary_path,
+                    collector_seed_manifest_path=self.manifest_path,
+                    batch_intent_path=self.intent_path,
+                    raw_radio_cache_path=self.cache_path,
+                    output_path=output,
+                    sealed_at_utc='2026-10-10T12:10:00+00:00')
+                self.assertEqual(proof['seed_video_search_binding']['persistent_id'], ROOT)
+                self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+                self.assertEqual(stats['cache_hits'], 1)
+                self.assertEqual(stats['cache_misses'], 0)
+            with radio_snapshot_proof_cache_scope() as fresh_stats:
+                self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+                self.assertEqual(fresh_stats['cache_misses'], 1)
+        self.assertEqual(replay.call_count, 2)
+
+        # A normal memo hit after creation also rehashes the raw search result,
+        # not only the original radio cache.
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence',
+                      return_value={}):
+            with radio_snapshot_proof_cache_scope():
+                create_radio_snapshot_proof(
+                    track_snapshot_path=self.track_path,
+                    identity_map_path=self.identity_path,
+                    snapshot_path=self.snapshot_path,
+                    collector_summary_path=self.summary_path,
+                    collector_seed_manifest_path=self.manifest_path,
+                    batch_intent_path=self.intent_path,
+                    raw_radio_cache_path=self.cache_path,
+                    output_path=self.root / 'proof-created-search-source-tamper.json',
+                    sealed_at_utc='2026-10-10T12:10:00+00:00')
+                self.search_cache_path.write_text('{"tampered":true}', encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'cached radio-proof source receipt changed'):
+                    verify_radio_snapshot_proof(
+                        self.root / 'proof-created-search-source-tamper.json')
+
+    def test_creation_memo_rejects_source_mutation_before_verify(self):
+        output = self.root / 'proof-created-source-mutation.json'
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        with load_patch, selector_patch, radio_snapshot_proof_cache_scope():
+            self.create(output)
+            self.cache_path.write_text('{"tampered":true}', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'cached radio-proof source receipt changed'):
+                verify_radio_snapshot_proof(output)
+
+    def test_creation_memo_rejects_search_tree_membership_change(self):
+        collector_dir, _, _, _, _ = self._install_dynamic_source_fixture()
+        output = self.root / 'proof-created-tree-mutation.json'
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        with load_patch, selector_patch, radio_snapshot_proof_cache_scope():
+            self.create(output)
+            (collector_dir / 'summary-after-create.json').write_text('{}', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'cached radio-proof source directory changed'):
+                verify_radio_snapshot_proof(output)
+
+    def test_creation_memo_miss_after_written_proof_bytes_change(self):
+        output = self.root / 'proof-created-bytes-change.json'
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        with load_patch, selector_patch, patch(
+                'radio_snapshot_proof._proof_from_inputs',
+                wraps=radio_proof._proof_from_inputs) as replay:
+            with radio_snapshot_proof_cache_scope():
+                self.create(output)
+                changed = json.loads(output.read_text())
+                changed['outgoing_target_pids'] = []
+                output.write_text(json.dumps(changed), encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'differs from full raw response'):
+                    verify_radio_snapshot_proof(output)
+        self.assertEqual(replay.call_count, 2)
+
+    def test_creation_does_not_seal_directory_changed_during_full_replay(self):
+        collector_dir, _, _, _, _ = self._install_dynamic_source_fixture()
+        output = self.root / 'proof-created-directory-race.json'
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        original = radio_proof._proof_from_inputs
+
+        def replay_then_add(*args, **kwargs):
+            result = original(*args, **kwargs)
+            (collector_dir / 'summary-created-race.json').write_text('{}', encoding='utf-8')
+            return result
+
+        with load_patch, selector_patch, radio_snapshot_proof_cache_scope(), \
+                patch('radio_snapshot_proof._proof_from_inputs', side_effect=replay_then_add):
+            with self.assertRaisesRegex(ValueError, 'directory changed during radio proof creation'):
+                self.create(output)
+            cache = radio_proof._ACTIVE_VERIFICATION_CACHE.get()
+            self.assertFalse(any(key[0] == str(output.resolve()) for key in cache))
+
+    def test_creation_does_not_seal_changed_direct_source_after_replay(self):
+        output = self.root / 'proof-created-source-race.json'
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        original = radio_proof._proof_from_inputs
+
+        def replay_then_mutate(*args, **kwargs):
+            result = original(*args, **kwargs)
+            self.cache_path.write_text('{"changed_after_read":true}', encoding='utf-8')
+            return result
+
+        with load_patch, selector_patch, radio_snapshot_proof_cache_scope(), \
+                patch('radio_snapshot_proof._proof_from_inputs', side_effect=replay_then_mutate):
+            with self.assertRaisesRegex(ValueError, 'verified radio-proof source changed'):
+                self.create(output)
+            cache = radio_proof._ACTIVE_VERIFICATION_CACHE.get()
+            self.assertFalse(any(key[0] == str(output.resolve()) for key in cache))
 
     def test_nested_scopes_share_memo_rehash_tampering_and_restore_outer_context(self):
         output = self.root / 'nested-proof-cache.json'
@@ -991,6 +1145,251 @@ class RadioSnapshotProofTests(unittest.TestCase):
                     source_policy='authenticated-watch-radio-only-v1',
                     identity_map_sha256=self.map_hash)
 
+    def test_merge_types_only_fully_replayed_search_strict_ineligibility(self):
+        self.configure_search_derived_seed()
+        snapshot = json.loads(self.snapshot_path.read_text(encoding='utf-8'))
+        raw_radio = json.loads(self.cache_path.read_text(encoding='utf-8'))
+        raw_radio['response']['tracks'][0]['album']['name'] = 'Different Album'
+        self.cache_path.write_text(json.dumps(raw_radio, ensure_ascii=False), encoding='utf-8')
+        search_cache = json.loads(self.search_cache_path.read_text(encoding='utf-8'))
+        search_cache['response'][0]['album']['name'] = 'Different Album'
+        search_cache['response'] = search_cache['response'][:1]
+        self.search_cache_path.write_text(json.dumps(search_cache, ensure_ascii=False),
+                                          encoding='utf-8')
+        snapshot['observations'] = observe(
+            raw_radio['response']['tracks'], 'radio', self.observed_at,
+            self.tracks, self.arguments['videoId'], candidate_matcher=self.matcher.match)
+        self.snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False), encoding='utf-8')
+        summary = json.loads(self.summary_path.read_text(encoding='utf-8'))
+        summary['results'] = [{**collector_result_summary(snapshot), 'status': 'collected'}]
+        self.summary_path.write_text(json.dumps(summary), encoding='utf-8')
+        batch, manifest_path, summary_path, evidence_path, snapshot_paths = \
+            self._relocate_search_fixture_to_radio_only_batch(snapshot, summary)
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        seed = manifest['seeds'][0]
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            receipt = radio_growth_merge._collected_seed_ineligible_disposition(
+                seed, {}, source_policy='authenticated-watch-radio-only-v1',
+                collector_summary=json.loads(summary_path.read_text()),
+                collector_summary_path=summary_path,
+                seed_manifest=manifest, seed_manifest_path=manifest_path,
+                seed_video_evidence_path=evidence_path,
+                snapshot_paths=snapshot_paths, track_snapshot_path=self.track_path,
+                identity_map_path=self.identity_path, library_hash=LIBRARY,
+                identity_hash=self.map_hash)
+        self.assertEqual(receipt['status'], 'collected_seed_strictly_ineligible')
+        self.assertEqual(receipt['reason'], 'seed_not_strictly_matched')
+        self.assertEqual(receipt['details']['seed_video_search_binding']['kind'],
+                         'authenticated-search-resolver-seed-ineligible-v1')
+        self.assertEqual(receipt['accepted_edges'], [])
+
+    def test_merge_refuses_to_type_a_fully_eligible_seed_as_ineligible(self):
+        self.configure_search_derived_seed()
+        snapshot = json.loads(self.snapshot_path.read_text(encoding='utf-8'))
+        summary = json.loads(self.summary_path.read_text(encoding='utf-8'))
+        batch, manifest_path, summary_path, evidence_path, snapshot_paths = \
+            self._relocate_search_fixture_to_radio_only_batch(snapshot, summary)
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            result = radio_growth_merge._collected_seed_ineligible_disposition(
+                manifest['seeds'][0], {}, source_policy='authenticated-watch-radio-only-v1',
+                collector_summary=json.loads(summary_path.read_text()),
+                collector_summary_path=summary_path, seed_manifest=manifest,
+                seed_manifest_path=manifest_path,
+                seed_video_evidence_path=evidence_path,
+                snapshot_paths=snapshot_paths, track_snapshot_path=self.track_path,
+                identity_map_path=self.identity_path, library_hash=LIBRARY,
+                identity_hash=self.map_hash)
+        self.assertIsNone(result)
+
+    def test_hintless_snapshot_is_deferred_to_strict_proof_validator(self):
+        self.configure_search_derived_seed()
+        snapshot = json.loads(self.snapshot_path.read_text(encoding='utf-8'))
+        summary = json.loads(self.summary_path.read_text(encoding='utf-8'))
+        batch, manifest_path, summary_path, evidence_path, _ = \
+            self._relocate_search_fixture_to_radio_only_batch(snapshot, summary)
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        seed = manifest['seeds'][0]
+        forged = self.write('hintless-forged-snapshot.json', {'local_seed': seed})
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            result = radio_growth_merge._collected_seed_ineligible_disposition(
+                seed, {}, source_policy='authenticated-watch-radio-only-v1',
+                collector_summary=json.loads(summary_path.read_text()),
+                collector_summary_path=summary_path, seed_manifest=manifest,
+                seed_manifest_path=manifest_path,
+                seed_video_evidence_path=evidence_path,
+                snapshot_paths=[forged], track_snapshot_path=self.track_path,
+                identity_map_path=self.identity_path, library_hash=LIBRARY,
+                identity_hash=self.map_hash)
+        self.assertIsNone(result)
+        with self.assertRaisesRegex(ValueError, 'complete current collector source receipts'):
+            radio_growth_merge._validate_collector_seed_video_binding(
+                seed, {}, [forged], 'authenticated-watch-radio-only-v1',
+                LIBRARY, self.map_hash, {})
+
+    def test_standard_batch_proof_path_is_deferred_but_forgery_and_missing_input_fail(self):
+        self.configure_search_derived_seed()
+        snapshot = json.loads(self.snapshot_path.read_text(encoding='utf-8'))
+        summary = json.loads(self.summary_path.read_text(encoding='utf-8'))
+        batch, manifest_path, summary_path, evidence_path, _ = \
+            self._relocate_search_fixture_to_radio_only_batch(snapshot, summary)
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        seed = manifest['seeds'][0]
+        collector_snapshot = manifest_path.parent / (ROOT + '.json')
+        intent_path = batch / 'intent.json'
+        raw_radio_path = radio_proof._request_cache_path(
+            collector_snapshot, 'get_watch_playlist', self.arguments)
+        proof_dir = batch / 'radio-only-source'
+        proof_path = proof_dir / (ROOT + '.proof.json')
+        derived_path = proof_dir / (ROOT + '.snapshot.json')
+        proof_dir.mkdir(parents=True)
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            create_radio_snapshot_proof(
+                track_snapshot_path=self.track_path, identity_map_path=self.identity_path,
+                snapshot_path=collector_snapshot, collector_summary_path=summary_path,
+                collector_seed_manifest_path=manifest_path,
+                batch_intent_path=intent_path, raw_radio_cache_path=raw_radio_path,
+                output_path=proof_path, sealed_at_utc='2026-10-10T12:10:00+00:00')
+            sanitized = radio_only_snapshot_from_proof(proof_path)
+        derived_path.write_text(json.dumps(sanitized, ensure_ascii=False), encoding='utf-8')
+        expected_sources = {
+            'track_snapshot': self.track_path,
+            'identity_map': self.identity_path,
+            'collector_snapshot': collector_snapshot,
+            'collector_summary': summary_path,
+            'collector_seed_manifest': manifest_path,
+            'batch_intent': intent_path,
+            'seed_plan': batch / 'seed-plan.json',
+            'seed_video_evidence': evidence_path,
+        }
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            # Recovery writes proof products under this standard batch path.
+            # The ineligible classifier must defer the matching PID to the
+            # ordinary proof consumer instead of rejecting the mere files.
+            self.assertIsNone(radio_growth_merge._collected_seed_ineligible_disposition(
+                seed, {}, source_policy='authenticated-watch-radio-only-v1',
+                collector_summary=json.loads(summary_path.read_text()),
+                collector_summary_path=summary_path, seed_manifest=manifest,
+                seed_manifest_path=manifest_path,
+                seed_video_evidence_path=evidence_path,
+                snapshot_paths=[derived_path], track_snapshot_path=self.track_path,
+                identity_map_path=self.identity_path, library_hash=LIBRARY,
+                identity_hash=self.map_hash))
+            accepted = radio_growth_merge._validate_collector_seed_video_binding(
+                seed, {}, [derived_path], 'authenticated-watch-radio-only-v1',
+                LIBRARY, self.map_hash, expected_sources)
+            self.assertEqual(accepted['video_id'], self.arguments['videoId'])
+
+            forged = copy.deepcopy(sanitized)
+            forged['observations'] = []
+            forged_path = self.write('standard-path-forged-snapshot.json', forged)
+            self.assertIsNone(radio_growth_merge._collected_seed_ineligible_disposition(
+                seed, {}, source_policy='authenticated-watch-radio-only-v1',
+                collector_summary=json.loads(summary_path.read_text()),
+                collector_summary_path=summary_path, seed_manifest=manifest,
+                seed_manifest_path=manifest_path,
+                seed_video_evidence_path=evidence_path,
+                snapshot_paths=[forged_path], track_snapshot_path=self.track_path,
+                identity_map_path=self.identity_path, library_hash=LIBRARY,
+                identity_hash=self.map_hash))
+            with self.assertRaisesRegex(ValueError, 'differs from its proof'):
+                radio_growth_merge._validate_collector_seed_video_binding(
+                    seed, {}, [forged_path], 'authenticated-watch-radio-only-v1',
+                    LIBRARY, self.map_hash, expected_sources)
+
+            # Unexpected proof files remain fatal when no matching graph
+            # snapshot is supplied; they cannot be hidden by an empty list.
+            with self.assertRaisesRegex(ValueError, 'unexpectedly has a proof'):
+                radio_growth_merge._collected_seed_ineligible_disposition(
+                    seed, {}, source_policy='authenticated-watch-radio-only-v1',
+                    collector_summary=json.loads(summary_path.read_text()),
+                    collector_summary_path=summary_path, seed_manifest=manifest,
+                    seed_manifest_path=manifest_path,
+                    seed_video_evidence_path=evidence_path,
+                    snapshot_paths=[], track_snapshot_path=self.track_path,
+                    identity_map_path=self.identity_path, library_hash=LIBRARY,
+                    identity_hash=self.map_hash)
+
+    def _relocate_search_fixture_to_radio_only_batch(self, snapshot, summary):
+        batch = self.root / 'typed-radio-only-batch' / 'batch-0001'
+        collector = batch / 'collector'
+        request_dir = collector / 'requests'
+        request_dir.mkdir(parents=True)
+        snapshot = copy.deepcopy(snapshot)
+        snapshot['collector_collection_mode'] = 'radio-only-v1'
+        snapshot['related_status'] = 'not_requested'
+        snapshot['requests'] = [{
+            'endpoint': 'watch_radio', 'observed_at': self.observed_at,
+            'returned_track_count': len(self.raw_tracks)}]
+        snapshot_path = collector / (ROOT + '.json')
+        snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False), encoding='utf-8')
+        summary = copy.deepcopy(summary)
+        summary['collector_collection_mode'] = 'radio-only-v1'
+        summary['results'] = [{**collector_result_summary(snapshot), 'status': 'collected'}]
+        summary_path = collector / 'summary-1.json'
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False), encoding='utf-8')
+        manifest = json.loads(self.manifest_path.read_text(encoding='utf-8'))
+        manifest['collector_collection_mode'] = 'radio-only-v1'
+        manifest_path = collector / 'seeds.json'
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding='utf-8')
+        intent = json.loads(self.intent_path.read_text(encoding='utf-8'))
+        plan_path = batch / 'seed-plan.json'
+        evidence_path = batch / 'seed-video-evidence.json'
+        shutil.copyfile(self.seed_plan_path, plan_path)
+        shutil.copyfile(self.seed_evidence_path, evidence_path)
+        intent['seed_plan'] = {'path': str(plan_path.resolve()),
+                               'sha256': self.digest(plan_path)}
+        intent['seed_video_evidence'] = {'path': str(evidence_path.resolve()),
+                                         'sha256': self.digest(evidence_path)}
+        intent['runner_config']['collector_collection_mode'] = 'radio-only-v1'
+        intent_path = batch / 'intent.json'
+        intent_path.write_text(json.dumps(intent, ensure_ascii=False), encoding='utf-8')
+        for endpoint, arguments, source in (
+                ('get_watch_playlist', self.arguments, self.cache_path),
+                ('search', {'query': 'Seed Song Seed Artist', 'filter': 'songs', 'limit': 5},
+                 self.search_cache_path)):
+            key = json.dumps([endpoint, arguments], sort_keys=True,
+                             ensure_ascii=False).encode('utf-8')
+            target = request_dir / (hashlib.sha256(key).hexdigest() + '.json')
+            shutil.copyfile(source, target)
+        return (batch, manifest_path, summary_path, evidence_path, [])
+
+    def test_merge_does_not_type_bad_saved_observations_as_ineligible(self):
+        self.configure_search_derived_seed()
+        snapshot = json.loads(self.snapshot_path.read_text(encoding='utf-8'))
+        snapshot['observations'] = []
+        self.snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False), encoding='utf-8')
+        summary = json.loads(self.summary_path.read_text(encoding='utf-8'))
+        summary['results'] = [{**collector_result_summary(snapshot), 'status': 'collected'}]
+        self.summary_path.write_text(json.dumps(summary), encoding='utf-8')
+        batch, manifest_path, summary_path, evidence_path, snapshot_paths = \
+            self._relocate_search_fixture_to_radio_only_batch(snapshot, summary)
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        seed = manifest['seeds'][0]
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            with self.assertRaisesRegex(ValueError, 'Raw radio response does not reproduce'):
+                radio_growth_merge._collected_seed_ineligible_disposition(
+                    seed, {}, source_policy='authenticated-watch-radio-only-v1',
+                    collector_summary=json.loads(summary_path.read_text()),
+                    collector_summary_path=summary_path,
+                    seed_manifest=manifest, seed_manifest_path=manifest_path,
+                    seed_video_evidence_path=evidence_path,
+                    snapshot_paths=snapshot_paths, track_snapshot_path=self.track_path,
+                    identity_map_path=self.identity_path, library_hash=LIBRARY,
+                    identity_hash=self.map_hash)
+
     def test_new_consumer_policy_rejects_an_ordinary_authenticated_envelope(self):
         path = self.write('ordinary-snapshot.json', self.snapshot())
         with self.assertRaisesRegex(ValueError, 'No valid recommendation snapshots'):
@@ -1236,6 +1635,109 @@ class RadioSnapshotProofTests(unittest.TestCase):
                     patch('radio_snapshot_proof.select_seed_video_evidence',
                           return_value={}):
                 self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+
+    def test_search_derived_strict_seed_failure_is_source_bound_ineligible(self):
+        self.configure_search_derived_seed()
+        # Keep the resolver's exact-album preference, but make the observed
+        # seed credit partial in both independent source responses. The full
+        # search and radio replays must complete before strict seed rejection.
+        snapshot = json.loads(self.snapshot_path.read_text(encoding='utf-8'))
+        radio_cache = json.loads(self.cache_path.read_text(encoding='utf-8'))
+        radio_cache['response']['tracks'][0]['artists'] = [
+            {'name': 'Seed Artist', 'id': 'UCseed'},
+            {'name': 'VISUAL ARTS / Key', 'id': 'UCkey'},
+        ]
+        self.cache_path.write_text(json.dumps(radio_cache, ensure_ascii=False),
+                                   encoding='utf-8')
+        search_cache = json.loads(self.search_cache_path.read_text(encoding='utf-8'))
+        search_cache['response'][0]['artists'] = [
+            {'name': 'Seed Artist', 'id': 'UCseed'},
+            {'name': 'VISUAL ARTS / Key', 'id': 'UCkey'},
+        ]
+        self.search_cache_path.write_text(json.dumps(search_cache, ensure_ascii=False),
+                                          encoding='utf-8')
+        snapshot['observations'] = observe(
+            radio_cache['response']['tracks'], 'radio', self.observed_at,
+            self.tracks, self.arguments['videoId'], candidate_matcher=self.matcher.match)
+        self.snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False),
+                                      encoding='utf-8')
+        summary = json.loads(self.summary_path.read_text(encoding='utf-8'))
+        summary['results'] = [{**collector_result_summary(snapshot), 'status': 'collected'}]
+        self.summary_path.write_text(json.dumps(summary, ensure_ascii=False),
+                                     encoding='utf-8')
+
+        output = self.root / 'strict-seed-ineligible-proof.json'
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            with self.assertRaises(RadioSnapshotIneligible) as caught:
+                create_radio_snapshot_proof(
+                    track_snapshot_path=self.track_path,
+                    identity_map_path=self.identity_path,
+                    snapshot_path=self.snapshot_path,
+                    collector_summary_path=self.summary_path,
+                    collector_seed_manifest_path=self.manifest_path,
+                    batch_intent_path=self.intent_path,
+                    raw_radio_cache_path=self.cache_path,
+                    output_path=output,
+                    sealed_at_utc='2026-10-10T12:10:00+00:00')
+        error = caught.exception
+        self.assertEqual(error.persistent_id, ROOT)
+        self.assertEqual(error.reason, 'seed_not_strictly_matched')
+        self.assertFalse(output.exists())
+        binding = error.details['seed_video_search_binding']
+        self.assertEqual(binding['kind'],
+                         'authenticated-search-resolver-seed-ineligible-v1')
+        self.assertEqual(binding['resolver']['video_id'], self.arguments['videoId'])
+        self.assertEqual(binding['resolver']['candidate_video_count'], 2)
+        self.assertEqual(binding['resolver']['status'],
+                         'unique_album_metadata_preference_unverified')
+        self.assertFalse(binding['strict_unique'])
+        self.assertEqual(binding['raw_search_cache']['sha256'], self.digest(self.search_cache_path))
+        self.assertEqual(binding['request']['arguments'], {
+            'query': 'Seed Song Seed Artist', 'filter': 'songs', 'limit': 5})
+        self.assertEqual(error.details['candidate_dispositions'][0]['artist_credit_match'],
+                         'partial')
+
+        snapshot_bytes = self.snapshot_path.read_bytes()
+        radio_cache_bytes = self.cache_path.read_bytes()
+        changed_snapshot = json.loads(snapshot_bytes)
+        changed_snapshot['observations'][0]['track']['title'] = 'Forged observed seed'
+        self.snapshot_path.write_text(json.dumps(changed_snapshot, ensure_ascii=False),
+                                      encoding='utf-8')
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            with self.assertRaisesRegex(ValueError, 'does not reproduce'):
+                create_radio_snapshot_proof(
+                    track_snapshot_path=self.track_path,
+                    identity_map_path=self.identity_path,
+                    snapshot_path=self.snapshot_path,
+                    collector_summary_path=self.summary_path,
+                    collector_seed_manifest_path=self.manifest_path,
+                    batch_intent_path=self.intent_path,
+                    raw_radio_cache_path=self.cache_path,
+                    output_path=self.root / 'tampered-observation.json',
+                    sealed_at_utc='2026-10-10T12:10:00+00:00')
+        self.snapshot_path.write_bytes(snapshot_bytes)
+
+        malformed_radio_cache = json.loads(radio_cache_bytes)
+        malformed_radio_cache['response']['tracks'] = []
+        self.cache_path.write_text(json.dumps(malformed_radio_cache), encoding='utf-8')
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            with self.assertRaisesRegex(ValueError, 'response count differs'):
+                create_radio_snapshot_proof(
+                    track_snapshot_path=self.track_path,
+                    identity_map_path=self.identity_path,
+                    snapshot_path=self.snapshot_path,
+                    collector_summary_path=self.summary_path,
+                    collector_seed_manifest_path=self.manifest_path,
+                    batch_intent_path=self.intent_path,
+                    raw_radio_cache_path=self.cache_path,
+                    output_path=self.root / 'malformed-radio-cache.json',
+                    sealed_at_utc='2026-10-10T12:10:00+00:00')
 
     def test_search_derived_seed_binding_rejects_multiple_strict_videos(self):
         duplicate = {

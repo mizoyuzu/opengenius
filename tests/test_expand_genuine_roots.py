@@ -1,9 +1,12 @@
 """Offline checks for bounded genuine recommendation-root growth."""
 import json
+import hashlib
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
@@ -24,6 +27,166 @@ class Matcher:
 
 
 class GenuineRootRunnerTests(unittest.TestCase):
+    def test_merge_batch_calls_python_merge_and_preserves_failure_cause(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            batch = root / 'batch-0001'
+            collector = batch / 'collector'
+            collector.mkdir(parents=True)
+            args = SimpleNamespace(
+                track_snapshot=root / 'tracks.json', identity_map=root / 'map.json',
+                baseline_state=root / 'state.json',
+                baseline_graph_export=root / 'graph.json',
+                rebase_report=root / 'rebase.json',
+                source_policy='authenticated-watch-radio-only-v1')
+            summary, evidence = root / 'summary.json', root / 'evidence.json'
+            snapshots = [root / 'second.json', root / 'first.json']
+            parent = root / 'previous'
+            import merge_rebased_radio_growth as merger
+            with patch.object(merger, 'merge_radio_growth', return_value={'ok': True}) as merge:
+                result = runner._merge_batch(args, batch, summary, evidence,
+                                             snapshots, parent, root / 'scripts')
+            self.assertEqual(result, batch / 'growth')
+            merge.assert_called_once_with(
+                track_snapshot=args.track_snapshot,
+                identity_map_path=args.identity_map,
+                baseline_state_path=args.baseline_state,
+                baseline_graph_export_path=args.baseline_graph_export,
+                rebase_report_path=args.rebase_report,
+                collector_summary_path=summary,
+                seed_manifest_path=collector / 'seeds.json',
+                seed_video_evidence_path=evidence,
+                snapshot_paths=snapshots,
+                output_dir=batch / 'growth', previous_growth_dir=parent,
+                source_policy='authenticated-watch-radio-only-v1')
+
+            failure = ValueError('fixture rejection')
+            with patch.object(merger, '_merge_radio_growth_with_radio_proof_cache',
+                              side_effect=failure):
+                with self.assertRaisesRegex(
+                        runner.RecoveryUnsafe, 'Typed merge rejected') as raised:
+                    runner._merge_batch(args, batch, summary, evidence,
+                                        snapshots, parent, root / 'scripts')
+            self.assertIs(raised.exception.__cause__, failure)
+            self.assertFalse((batch / 'growth').exists())
+            import radio_snapshot_proof
+            import seed_video_evidence
+            self.assertIsNone(radio_snapshot_proof._ACTIVE_VERIFICATION_CACHE.get())
+            self.assertIsNone(seed_video_evidence._ACTIVE_SELECTOR_INDEX.get())
+
+    def test_inline_merge_and_cli_write_identical_bytes_at_same_output_path(self):
+        import merge_rebased_radio_growth as merger
+        from music_identity_map import IdentityMap, build_map
+        from plan_genius_update import make_synthetic_state
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pids = ['0000000000000001', '0000000000000002', '0000000000000003']
+            tracks = [
+                {'persistent_id': pid, 'title': 'Song ' + str(index),
+                 'artist': 'Artist ' + str(index), 'album': 'Album ' + str(index),
+                 'duration_ms': 100000}
+                for index, pid in enumerate(pids, 1)]
+            library_hash = 'a' * 64
+            track_path = root / 'tracks.json'
+            track_path.write_text(json.dumps({'source_sha256': library_hash,
+                                              'tracks': tracks}), encoding='utf-8')
+            map_doc = build_map(tracks, library_hash)
+            map_path = root / 'map.json'
+            map_path.write_text(json.dumps(map_doc), encoding='utf-8')
+            map_hash = hashlib.sha256(map_path.read_bytes()).hexdigest()
+            matcher = IdentityMap(map_doc, tracks, library_hash)
+            baseline_roots = [{'root_pid': pid, 'ordered_target_pids': []}
+                              for pid in pids]
+            baseline_state = make_synthetic_state(
+                baseline_roots, matcher, library_hash, map_hash)
+            state_path = root / 'state.json'
+            state_path.write_text(json.dumps(baseline_state), encoding='utf-8')
+            graph_path, rebase_path = root / 'graph.json', root / 'rebase.json'
+            graph_path.write_text('{}', encoding='utf-8')
+            rebase_path.write_text('{}', encoding='utf-8')
+            graph_doc = {'accepted_roots': baseline_roots}
+            report = {'indexed_tracks': len(tracks), 'relation_revalidation': {
+                'output_directed_edge_count': 0}}
+            provenance = {
+                'graph_export_path': str(graph_path.resolve()),
+                'graph_export_sha256': hashlib.sha256(graph_path.read_bytes()).hexdigest(),
+                'rebase_report_path': str(rebase_path.resolve()),
+                'rebase_report_sha256': hashlib.sha256(rebase_path.read_bytes()).hexdigest(),
+                'state_path': str(state_path.resolve()),
+                'state_file_sha256': hashlib.sha256(state_path.read_bytes()).hexdigest(),
+                'raw_observation_receipt_count': 0, 'anchored_observation_count': 0,
+                'accepted_input_manifest_sha256': 'b' * 64,
+                'proof_input_receipts': [],
+            }
+            summary_path = root / 'summary.json'
+            summary_path.write_text(json.dumps({
+                'schema_version': 1, 'status': 'completed',
+                'account_authentication_verified': True,
+                'library_sha256': library_hash, 'http_requests': 2,
+                'request_budget': 10,
+                'results': [{'persistent_id': pids[0], 'status': 'collected'}],
+            }), encoding='utf-8')
+            batch = root / 'batch-0001'
+            collector = batch / 'collector'
+            collector.mkdir(parents=True)
+            manifest_path = collector / 'seeds.json'
+            manifest_path.write_text(json.dumps({
+                'library_sha256': library_hash, 'identity_map_sha256': map_hash,
+                'seeds': [{'persistent_id': pids[0]}],
+            }), encoding='utf-8')
+            snapshot_path = collector / (pids[0] + '.json')
+            video_ids = ['AAAAAAAAAAA', 'BBBBBBBBBBB']
+            observations = []
+            for position, (pid, video_id) in enumerate(zip(pids[:2], video_ids), 1):
+                track = tracks[position - 1]
+                observations.append({
+                    'source': 'ytmusic', 'relation': 'radio', 'is_seed': position == 1,
+                    'position': position, 'observed_at': '2026-01-01T00:00:00+00:00',
+                    'track': {'video_id': video_id, 'title': track['title'],
+                              'artists': [{'name': track['artist']}],
+                              'album': {'name': track['album']},
+                              'duration_seconds': 100},
+                })
+            snapshot_path.write_text(json.dumps({
+                'schema_version': 1, 'library_sha256': library_hash,
+                'account_authentication_verified': True, 'related_status': 'collected',
+                'selected_video_id': video_ids[0],
+                'requests': [{'endpoint': name} for name in
+                             ('watch_radio', 'watch_seed', 'song_related')],
+                'observations': observations,
+            }), encoding='utf-8')
+            args = SimpleNamespace(
+                track_snapshot=track_path, identity_map=map_path,
+                baseline_state=state_path, baseline_graph_export=graph_path,
+                rebase_report=rebase_path, source_policy=None)
+            fixed_time = SimpleNamespace(now=lambda _tz=None: __import__(
+                'datetime').datetime(2026, 1, 1, tzinfo=__import__('datetime').timezone.utc))
+            with patch.object(merger, '_verify_rebase_receipt',
+                              return_value=(graph_doc, report, baseline_state, provenance)), \
+                    patch.object(merger, 'datetime', fixed_time):
+                runner._merge_batch(args, batch, summary_path, None,
+                                    [snapshot_path], None, root / 'scripts')
+            output_path = batch / 'growth'
+            inline_bytes = {path.name: path.read_bytes()
+                            for path in output_path.iterdir() if path.is_file()}
+            shutil.rmtree(output_path)
+
+            argv = [
+                'merge_rebased_radio_growth.py', '--track-snapshot', str(track_path),
+                '--identity-map', str(map_path), '--baseline-state', str(state_path),
+                '--baseline-graph-export', str(graph_path), '--rebase-report', str(rebase_path),
+                '--collector-summary', str(summary_path), '--seed-manifest', str(manifest_path),
+                '--snapshot', str(snapshot_path), '--output', str(output_path),
+            ]
+            with patch.object(merger, '_verify_rebase_receipt',
+                              return_value=(graph_doc, report, baseline_state, provenance)), \
+                    patch.object(merger, 'datetime', fixed_time), \
+                    patch.object(sys, 'argv', argv):
+                merger.main()
+            cli_bytes = {path.name: path.read_bytes()
+                         for path in output_path.iterdir() if path.is_file()}
+            self.assertEqual(inline_bytes, cli_bytes)
     def test_v03_progress_config_without_dynamic_flag_remains_compatible(self):
         config = {'schema_version': 1, 'dynamic_current_radio_hints': False,
                   'deadline': None, 'batch_request_budget': 90,
@@ -811,11 +974,43 @@ class GenuineRootRunnerTests(unittest.TestCase):
                 return {'outgoing_root_count': 1,
                         'accepted_graphs_sha256': runner._sha(path.read_bytes())}
 
+            def merge_inline(**kwargs):
+                output_dir = Path(kwargs['output_dir'])
+                summary_path = Path(kwargs['collector_summary_path'])
+                manifest_path = Path(kwargs['seed_manifest_path'])
+                snapshot_path = Path(kwargs['snapshot_paths'][0])
+                summary = json.loads(summary_path.read_text())
+                manifest = json.loads(manifest_path.read_text())
+                inputs = [{'path': str(snapshot_path.resolve()),
+                           'sha256': runner._sha(snapshot_path.read_bytes())}]
+                run = {
+                    'collector_summary': {
+                        'path': str(summary_path.resolve()),
+                        'sha256': runner._sha(summary_path.read_bytes()),
+                        'http_requests': summary['http_requests'],
+                        'request_budget': summary['request_budget']},
+                    'seed_manifest': {
+                        'path': str(manifest_path.resolve()),
+                        'sha256': runner._sha(manifest_path.read_bytes()),
+                        'seed_count': len(manifest['seeds'])},
+                    'snapshot_inputs': inputs,
+                }
+                output_dir.mkdir()
+                (output_dir / 'accepted-graphs.json').write_text(json.dumps({
+                    'producer': 'opengenius-ytmusic-recommendation-growth-rebased-merge-v1',
+                    'growth_runs': [run], 'accepted_roots': [
+                        {'root_pid': pid, 'ordered_target_pids': ['0000000000000002']}],
+                }), encoding='utf-8')
+                return {'accepted_root_count': 1}
+
+            import merge_rebased_radio_growth as merger
+
             with patch.object(runner, 'load_library', return_value=(tracks, LIBRARY, {})), \
                     patch.object(runner, 'IdentityMap', return_value=Matcher()), \
                     patch('evaluate_ytmusic_batch.collect_graphs', return_value=([{'root_pid': pid}], [], [])), \
                     patch.object(runner, '_replay_checkpoint', side_effect=replay), \
                     patch.object(runner, '_invoke', side_effect=invoke), \
+                    patch.object(merger, 'merge_radio_growth', side_effect=merge_inline), \
                     patch.object(runner, '_write_atomic', side_effect=RuntimeError('simulated crash')):
                 with self.assertRaisesRegex(RuntimeError, 'simulated crash'):
                     runner.run(args)

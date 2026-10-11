@@ -139,6 +139,69 @@ class RebasedRadioGrowthTests(unittest.TestCase):
                  if row['root_pid'] == pid)[:len(edges)] == edges
             for pid, edges in old_edges.items()))
 
+    def test_fresh_legacy_merge_without_video_evidence_preserves_old_run_shape(self):
+        track_path = self.write_json(self.root / 'tracks.json', {'fixture': True})
+        map_doc = build_map(self.tracks, LIBRARY_HASH)
+        map_path = self.write_json(self.root / 'map.json', map_doc)
+        map_hash = hashlib.sha256(map_path.read_bytes()).hexdigest()
+        summary_path = self.write_json(self.root / 'summary.json', {
+            'schema_version': 1, 'status': 'completed',
+            'account_authentication_verified': True,
+            'library_sha256': LIBRARY_HASH, 'http_requests': 1,
+            'request_budget': 5,
+            'results': [{'persistent_id': PID2, 'status': 'collected'}],
+        })
+        manifest_path = self.write_json(self.root / 'seeds.json', {
+            'library_sha256': LIBRARY_HASH, 'identity_map_sha256': map_hash,
+            'seeds': [{'persistent_id': PID2}],
+        })
+        snapshot_path = self.write_json(self.root / 'legacy-snapshot.json', {})
+        baseline_state_path = self.write_json(self.root / 'baseline-state.json', self.baseline)
+        baseline_graph_path = self.write_json(self.root / 'baseline-graph.json', {
+            'accepted_roots': merger._state_graph_rows(self.baseline)})
+        rebase_path = self.write_json(self.root / 'rebase-report.json', {})
+        graph_roots = merger._state_graph_rows(self.baseline)
+        baseline_edge_count = sum(len(row['ordered_target_pids']) for row in graph_roots)
+        report = {'indexed_tracks': len(graph_roots),
+                  'relation_revalidation': {
+                      'output_directed_edge_count': baseline_edge_count}}
+        graph = {'root_pid': PID2, 'ordered_target_pids': [PID3],
+                 'observations': [{'relation': 'radio'}],
+                 'input': {'path': str(snapshot_path.resolve()),
+                           'sha256': hashlib.sha256(snapshot_path.read_bytes()).hexdigest()}}
+        output = self.root / 'legacy-output'
+        provenance = {
+            'state_file_sha256': hashlib.sha256(baseline_state_path.read_bytes()).hexdigest(),
+            'graph_export_path': str(baseline_graph_path.resolve()),
+            'graph_export_sha256': hashlib.sha256(baseline_graph_path.read_bytes()).hexdigest(),
+            'rebase_report_path': str(rebase_path.resolve()),
+            'rebase_report_sha256': hashlib.sha256(rebase_path.read_bytes()).hexdigest(),
+        }
+        with patch.object(merger, 'load_library',
+                          return_value=(self.tracks, LIBRARY_HASH, {'source': 'fixture'})), \
+                patch.object(merger, '_verify_rebase_receipt',
+                             return_value=({'accepted_roots': graph_roots}, report,
+                                           self.baseline, provenance)), \
+                patch.object(merger, '_require_legacy_source_policy'), \
+                patch.object(merger, 'collect_graphs',
+                             return_value=([graph], [], [graph['input']])), \
+                patch.object(merger, 'merge_graphs',
+                             return_value=[{'root_pid': PID2,
+                                            'ordered_target_pids': [PID3]}]):
+            merger._merge_radio_growth_with_radio_proof_cache(
+                track_snapshot=track_path, identity_map_path=map_path,
+                baseline_state_path=baseline_state_path,
+                baseline_graph_export_path=baseline_graph_path,
+                rebase_report_path=rebase_path,
+                collector_summary_path=summary_path,
+                seed_manifest_path=manifest_path,
+                snapshot_paths=[snapshot_path], output_dir=output,
+                seed_video_evidence_path=None, previous_growth_dir=None,
+                source_policy=None)
+        run = json.loads((output / 'accepted-graphs.json').read_bytes())['growth_runs'][0]
+        self.assertNotIn('unresolved_seed_dispositions', run)
+        self.assertNotIn('collected_seed_ineligible_dispositions', run)
+
     def test_replay_and_append_preserves_typed_boundary_across_two_radio_runs(self):
         legacy_run, legacy_input, legacy_pid, legacy_targets = self.run_receipt(
             PID2, [PID3], 'boundary-legacy')

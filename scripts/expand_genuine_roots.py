@@ -68,24 +68,30 @@ def _merge_batch(args, batch_dir, summary_path, evidence_path, snapshot_paths,
                  active_growth, script_dir):
     collector_dir = batch_dir / 'collector'
     output = batch_dir / 'growth'
-    command = [sys.executable, str(script_dir / 'merge_rebased_radio_growth.py'),
-               '--track-snapshot', str(args.track_snapshot),
-               '--identity-map', str(args.identity_map),
-               '--baseline-state', str(args.baseline_state),
-               '--baseline-graph-export', str(args.baseline_graph_export),
-               '--rebase-report', str(args.rebase_report),
-               '--collector-summary', str(summary_path), '--seed-manifest',
-               str(collector_dir / 'seeds.json'), '--seed-video-evidence',
-               str(evidence_path), '--output', str(output)]
     source_policy = getattr(args, 'source_policy', None)
-    if source_policy is not None:
-        command.extend(['--source-policy', source_policy])
-    for snapshot_path in snapshot_paths:
-        command.extend(['--snapshot', str(snapshot_path)])
-    if active_growth:
-        command.extend(['--previous-growth', str(active_growth)])
-    if _invoke(command) != 0:
-        raise RecoveryUnsafe('Typed merge rejected the recovered collector batch')
+    try:
+        # Keep merge in this process so the already-open, invocation-scoped
+        # proof and selector caches can serve repeated source validation.
+        # The merge implementation still performs its full receipt closure
+        # checks and opens nested cache scopes that share the active scopes.
+        from merge_rebased_radio_growth import merge_radio_growth
+        merge_radio_growth(
+            track_snapshot=args.track_snapshot,
+            identity_map_path=args.identity_map,
+            baseline_state_path=args.baseline_state,
+            baseline_graph_export_path=args.baseline_graph_export,
+            rebase_report_path=args.rebase_report,
+            collector_summary_path=summary_path,
+            seed_manifest_path=collector_dir / 'seeds.json',
+            seed_video_evidence_path=evidence_path,
+            snapshot_paths=list(snapshot_paths),
+            output_dir=output,
+            previous_growth_dir=active_growth,
+            source_policy=source_policy,
+        )
+    except Exception as error:
+        raise RecoveryUnsafe(
+            'Typed merge rejected the recovered collector batch') from error
     return output
 
 

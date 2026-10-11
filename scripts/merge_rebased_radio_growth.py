@@ -16,6 +16,7 @@ from evaluate_ytmusic_batch import collect_graphs, merge_graphs
 from music_identity_map import IdentityMap, load_library
 from plan_genius_update import _source as _identity_source, plan_genius_update
 from seed_video_evidence import select_seed_video_evidence
+from probe_ytmusic_batch import resolve_seed_search
 from update_genius_bundle import state_rows
 from genius_format import parse_similarities
 
@@ -609,6 +610,7 @@ def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
             [{'persistent_id': pid} for pid in manifest_pids], tracks, matcher,
             library_hash, identity_hash)
         unresolved_dispositions = []
+        collected_ineligible_dispositions = []
         batch_dir = manifest_path.parent.parent
         intent_config = None
         for seed in manifest['seeds']:
@@ -625,7 +627,8 @@ def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
                     seed_video_evidence_path=evidence_path,
                     snapshot_paths=[Path(row['path']) for row in snapshot_inputs
                                     if isinstance(row, dict) and isinstance(row.get('path'), str)],
-                    library_hash=library_hash, identity_hash=identity_hash)
+                    library_hash=library_hash, identity_hash=identity_hash,
+                    tracks=tracks, matcher=matcher)
             if disposition is not None:
                 unresolved_dispositions.append(disposition)
                 continue
@@ -651,6 +654,23 @@ def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
                     'seed_plan': batch_dir / 'seed-plan.json',
                     'seed_video_evidence': evidence_path,
                 }
+                if 'collected_seed_ineligible_dispositions' in run:
+                    ineligible = _collected_seed_ineligible_disposition(
+                        seed, hints, source_policy=source_policy,
+                        collector_summary=collector,
+                        collector_summary_path=summary_path,
+                        seed_manifest=manifest,
+                        seed_manifest_path=manifest_path,
+                        seed_video_evidence_path=evidence_path,
+                        snapshot_paths=[Path(row['path']) for row in snapshot_inputs
+                                        if isinstance(row, dict)
+                                        and isinstance(row.get('path'), str)],
+                        track_snapshot_path=expected_receipt_paths['track_snapshot'],
+                        identity_map_path=expected_receipt_paths['identity_map'],
+                        library_hash=library_hash, identity_hash=identity_hash)
+                    if ineligible is not None:
+                        collected_ineligible_dispositions.append(ineligible)
+                        continue
             try:
                 _validate_collector_seed_video_binding(
                     seed, hints,
@@ -663,6 +683,10 @@ def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
         if ('unresolved_seed_dispositions' in run
                 and run.get('unresolved_seed_dispositions') != unresolved_dispositions):
             raise ValueError('Previous unresolved seed dispositions differ from current receipts')
+        if ('collected_seed_ineligible_dispositions' in run
+                and run.get('collected_seed_ineligible_dispositions')
+                != collected_ineligible_dispositions):
+            raise ValueError('Previous strict-ineligible seed dispositions differ from current receipts')
     elif manifest.get('seed_video_evidence_sha256') is not None:
         raise ValueError('Previous strict seed-video sidecar receipt is missing')
     collected = {row.get('persistent_id') for row in collector.get('results', [])
@@ -722,6 +746,8 @@ def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
             'path': str(evidence_path), 'sha256': evidence_info['sha256']}
     if 'unresolved_seed_dispositions' in run:
         normalized_run['unresolved_seed_dispositions'] = unresolved_dispositions
+    if 'collected_seed_ineligible_dispositions' in run:
+        normalized_run['collected_seed_ineligible_dispositions'] = collected_ineligible_dispositions
     if run.get('resulting_state_sha256'):
         normalized_run['resulting_state_sha256'] = run['resulting_state_sha256']
     return incoming_roots, normalized_run
@@ -914,7 +940,7 @@ def _unresolved_seed_disposition(seed, selected_hints, *, source_policy,
                                  seed_manifest, seed_manifest_path,
                                  seed_video_evidence_path, snapshot_paths,
                                  library_hash, identity_hash,
-                                 expected_source_paths=None):
+                                 expected_source_paths=None, tracks=None, matcher=None):
     """Return a typed receipt for a genuinely unresolved, uncollected seed.
 
     This is deliberately narrower than a missing hint. Only an authenticated
@@ -934,13 +960,112 @@ def _unresolved_seed_disposition(seed, selected_hints, *, source_policy,
         return None
     if len(result_rows) != 1:
         raise ValueError('Unresolved collector seed has duplicate summary results')
-    if (set(result_rows[0]) != {'persistent_id', 'status', 'candidate_video_ids',
-                               'title_fallback_attempted'}
-            or seed.get('seed_video_id') is not None or seed.get('seed_video_source') is not None
-            or type(result_rows[0].get('candidate_video_ids')) is not int
-            or result_rows[0]['candidate_video_ids'] != 0
-            or result_rows[0].get('title_fallback_attempted') is not False):
+    result = result_rows[0]
+    manifest_path = Path(seed_manifest_path).resolve()
+    summary_path = Path(collector_summary_path).resolve()
+    batch_dir = manifest_path.parent.parent
+    intent_path = batch_dir / 'intent.json'
+    plan_path = batch_dir / 'seed-plan.json'
+    candidate_count = result.get('candidate_video_ids')
+    if (seed.get('seed_video_id') is not None or seed.get('seed_video_source') is not None
+            or type(candidate_count) is not int or candidate_count < 0
+            or type(result.get('title_fallback_attempted')) is not bool):
         raise ValueError('Unresolved collector seed has inconsistent search disposition')
+    search_receipts = []
+    finish_at = None
+    start_at = None
+    if candidate_count > 0:
+        # A nonzero candidate disposition is only valid for a batch-local
+        # response observed inside the authenticated collector run window.
+        # Current summaries always carry finished_at; older/alternate sources
+        # may also carry started_at, which is enforced when present.
+        for label, value in (('finished_at', collector_summary.get('finished_at')),
+                             ('started_at', collector_summary.get('started_at'))):
+            if value is None and label == 'started_at':
+                continue
+            try:
+                parsed = datetime.fromisoformat(value)
+            except (TypeError, ValueError):
+                raise ValueError('Ambiguous unresolved summary has an invalid run timestamp') from None
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError('Ambiguous unresolved summary run timestamp must include a timezone')
+            if label == 'finished_at':
+                finish_at = parsed
+            else:
+                start_at = parsed
+        if start_at is not None and finish_at < start_at:
+            raise ValueError('Ambiguous unresolved collector run window is reversed')
+    def replay_search_attempt(query, expected_count, label, *, require_positive):
+        request_arguments = {'query': query, 'filter': 'songs', 'limit': 5}
+        cache_key = json.dumps(['search', request_arguments], sort_keys=True,
+                               ensure_ascii=False).encode('utf-8')
+        collector_dir = manifest_path.parent.resolve()
+        request_dir = manifest_path.parent / 'requests'
+        if (request_dir.is_symlink()
+                or request_dir.resolve().parent != collector_dir):
+            raise ValueError('Ambiguous unresolved search directory escapes its collector batch')
+        request_candidate = request_dir / (sha(cache_key) + '.json')
+        if request_candidate.is_symlink():
+            raise ValueError('Ambiguous unresolved search cache must not be a symlink')
+        request_path = request_candidate.resolve()
+        if request_path.parent != request_dir.resolve():
+            raise ValueError('Ambiguous unresolved search cache path escapes its collector batch')
+        try:
+            request_bytes = request_path.read_bytes()
+            request_document = json.loads(request_bytes)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError('Ambiguous unresolved seed lacks its exact batch-local search response') from None
+        observed_at = request_document.get('observed_at') if isinstance(request_document, dict) else None
+        try:
+            parsed_at = datetime.fromisoformat(observed_at)
+        except (TypeError, ValueError):
+            raise ValueError('Ambiguous unresolved search receipt has an invalid timestamp') from None
+        if (parsed_at.tzinfo is None or parsed_at.utcoffset() is None
+                or set(request_document) != {'endpoint', 'arguments', 'observed_at', 'response'}
+                or request_document.get('endpoint') != 'search'
+                or request_document.get('arguments') != request_arguments
+                or not isinstance(request_document.get('response'), list)):
+            raise ValueError('Ambiguous unresolved search receipt differs from its exact request')
+        if (finish_at is None or parsed_at > finish_at
+                or (start_at is not None and parsed_at < start_at)):
+            raise ValueError('Ambiguous unresolved search timestamp is outside the collector run window')
+        selected_video, replayed_count, replay_status = resolve_seed_search(
+            request_document['response'], seed, tracks, matcher)
+        if (selected_video is not None or replay_status != 'unresolved'
+                or replayed_count != expected_count
+                or (require_positive and replayed_count <= 0)):
+            raise ValueError('Ambiguous unresolved search response does not replay the reported result')
+        try:
+            if request_path.read_bytes() != request_bytes:
+                raise ValueError('Ambiguous unresolved search response changed during replay')
+        except OSError:
+            raise ValueError('Ambiguous unresolved search response disappeared during replay') from None
+        return {'path': str(request_path), 'sha256': sha(request_bytes),
+                'query_sha256': sha(query.encode('utf-8')),
+                'observed_at': observed_at, 'raw_result_count': len(request_document['response']),
+                'candidate_video_ids': replayed_count,
+                'resolver_status': replay_status, 'selected_video_id': selected_video,
+                'label': label}
+
+    if candidate_count == 0:
+        if (set(result) != {'persistent_id', 'status', 'candidate_video_ids',
+                            'title_fallback_attempted'}
+                or result.get('title_fallback_attempted') is not False):
+            raise ValueError('Unresolved collector seed has inconsistent search disposition')
+    else:
+        if (tracks is None or not isinstance(seed.get('title'), str)
+                or not isinstance(seed.get('artist'), str)):
+            raise ValueError('Ambiguous unresolved seed lacks current Library search context')
+        fallback_used = result['title_fallback_attempted']
+        expected_result_keys = {'persistent_id', 'status', 'candidate_video_ids',
+                                'title_fallback_attempted'}
+        if (('seed_query_fallback' in seed_manifest
+             and seed_manifest.get('seed_query_fallback') is not False)
+                or set(result) != expected_result_keys or fallback_used is not False):
+            raise ValueError('Ambiguous unresolved search fallback differs from the current seed manifest')
+        search_receipts.append(replay_search_attempt(
+            seed['title'] + ' ' + seed['artist'], candidate_count, 'primary',
+            require_positive=True))
     if (type(collector_summary.get('schema_version')) is not int
             or collector_summary.get('schema_version') != 1
             or collector_summary.get('status') != 'completed'
@@ -952,11 +1077,6 @@ def _unresolved_seed_disposition(seed, selected_hints, *, source_policy,
             or not 0 < collector_summary['http_requests'] <= collector_summary['request_budget']):
         raise ValueError('Unresolved disposition lacks an authenticated current collector summary')
 
-    manifest_path = Path(seed_manifest_path).resolve()
-    summary_path = Path(collector_summary_path).resolve()
-    batch_dir = manifest_path.parent.parent
-    intent_path = batch_dir / 'intent.json'
-    plan_path = batch_dir / 'seed-plan.json'
     if summary_path.parent != manifest_path.parent:
         raise ValueError('Unresolved summary is outside its manifest collector directory')
     try:
@@ -991,6 +1111,8 @@ def _unresolved_seed_disposition(seed, selected_hints, *, source_policy,
             or intent.get('request_budget') > runner_config.get('batch_request_budget', 0)
             or runner_config.get('source_policy') != source_policy
             or runner_config.get('collector_collection_mode') != 'radio-only-v1'
+            or ('seed_query_fallback' in runner_config
+                and runner_config.get('seed_query_fallback') is not False)
             or type(intent.get('runner_config_sha256')) is not str
             or sha(json.dumps(runner_config, ensure_ascii=False,
                               sort_keys=True, separators=(',', ':')).encode('utf-8'))
@@ -1093,12 +1215,12 @@ def _unresolved_seed_disposition(seed, selected_hints, *, source_policy,
             raise ValueError('Unresolved seed unexpectedly has a supplied radio snapshot')
 
     digest = lambda path, data: {'path': str(path.resolve()), 'sha256': sha(data)}
-    return {
+    receipt = {
         'schema_version': 1,
         'producer': 'opengenius-authenticated-search-unresolved-seed-v1',
         'persistent_id': pid,
         'status': 'search_unresolved',
-        'candidate_video_ids': 0,
+        'candidate_video_ids': candidate_count,
         'title_fallback_attempted': False,
         'source_policy': source_policy,
         'collector_summary': digest(summary_path, summary_bytes),
@@ -1110,6 +1232,169 @@ def _unresolved_seed_disposition(seed, selected_hints, *, source_policy,
         'absent_snapshot_paths': [
             {'path': str(path.resolve()), 'exists': False} for path in absent_paths],
     }
+    # Preserve historical zero-candidate v1 receipt bytes exactly. The extra
+    # source field exists only for the new nonzero typed disposition.
+    if candidate_count > 0:
+        receipt['search_request_receipts'] = search_receipts
+    return receipt
+
+
+def _collected_seed_ineligible_disposition(seed, selected_hints, *, source_policy,
+                                            collector_summary, collector_summary_path,
+                                            seed_manifest, seed_manifest_path,
+                                            seed_video_evidence_path, snapshot_paths,
+                                            track_snapshot_path, identity_map_path,
+                                            library_hash, identity_hash):
+    """Replay and type a collected seed whose exact search seed fails strict gates.
+
+    This records no graph. Only the proof verifier's fully replayed
+    ``seed_not_strictly_matched`` result with its authenticated search binding
+    may enter this receipt; malformed or missing source evidence stays fatal.
+    """
+    from radio_snapshot_proof import RadioSnapshotIneligible, _proof_from_inputs, _request_cache_path
+
+    pid = seed.get('persistent_id') if isinstance(seed, dict) else None
+    if source_policy != 'authenticated-watch-radio-only-v1':
+        return None
+    if not isinstance(pid, str) or re.fullmatch(r'[0-9A-F]{16}', pid) is None:
+        raise ValueError('Strict-ineligible seed has a malformed persistent ID')
+    if selected_hints.get(pid) is not None:
+        return None
+    if (seed.get('seed_video_id') is not None
+            or seed.get('seed_video_source') is not None):
+        return None
+    result_rows = [row for row in collector_summary.get('results', [])
+                   if isinstance(row, dict) and row.get('persistent_id') == pid]
+    if len(result_rows) != 1 or result_rows[0].get('status') != 'collected':
+        return None
+
+    manifest_path = Path(seed_manifest_path).resolve()
+    summary_path = Path(collector_summary_path).resolve()
+    batch_dir = manifest_path.parent.parent
+    collector_snapshot = manifest_path.parent / (pid + '.json')
+    proof_path = batch_dir / 'radio-only-source' / (pid + '.proof.json')
+    derived_snapshot = batch_dir / 'radio-only-source' / (pid + '.snapshot.json')
+    for path in snapshot_paths:
+        row = _read_json(path)
+        local = row.get('local_seed') if isinstance(row, dict) else None
+        if isinstance(local, dict) and local.get('persistent_id') == pid:
+            # The ordinary validator below owns any matching proof-backed
+            # snapshot; it will verify the proof and exact sanitized bytes.
+            # Returning no negative disposition also means a forged snapshot
+            # cannot be skipped: the caller must still pass that strict gate.
+            return None
+    if proof_path.exists() or derived_snapshot.exists():
+        raise ValueError('Strict-ineligible seed unexpectedly has a proof or derived snapshot')
+    try:
+        snapshot = _read_json(collector_snapshot)
+    except (OSError, ValueError):
+        raise ValueError('Strict-ineligible seed lacks its original collector snapshot') from None
+    local_seed = snapshot.get('local_seed')
+    if local_seed != seed:
+        raise ValueError('Strict-ineligible seed differs from the collector snapshot seed')
+    radio_requests = [row for row in snapshot.get('request_evidence', [])
+                      if isinstance(row, dict)
+                      and row.get('endpoint') == 'get_watch_playlist'
+                      and isinstance(row.get('arguments'), dict)
+                      and row['arguments'].get('radio') is True]
+    if len(radio_requests) != 1:
+        raise ValueError('Strict-ineligible seed lacks one exact radio request')
+    radio_request = radio_requests[0]
+    raw_radio_cache = _request_cache_path(
+        collector_snapshot, 'get_watch_playlist', radio_request['arguments'])
+    search_requests = [row for row in snapshot.get('request_evidence', [])
+                       if isinstance(row, dict) and row.get('endpoint') == 'search'
+                       and isinstance(row.get('arguments'), dict)]
+    if len(search_requests) != 1:
+        raise ValueError('Strict-ineligible seed lacks exactly one search request')
+    raw_search_cache = _request_cache_path(
+        collector_snapshot, 'search', search_requests[0]['arguments'])
+    source_paths = [
+        ('track_snapshot', Path(track_snapshot_path)),
+        ('identity_map', Path(identity_map_path)),
+        ('collector_snapshot', collector_snapshot),
+        ('collector_summary', summary_path),
+        ('collector_seed_manifest', manifest_path),
+        ('batch_intent', batch_dir / 'intent.json'),
+        ('seed_plan', batch_dir / 'seed-plan.json'),
+        ('seed_video_evidence', Path(seed_video_evidence_path)),
+        ('raw_radio_cache', raw_radio_cache),
+        ('raw_search_cache', raw_search_cache),
+    ]
+    intent_path = batch_dir / 'intent.json'
+    try:
+        intent_bytes_before = intent_path.read_bytes()
+        intent_doc = json.loads(intent_bytes_before)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError('Strict-ineligible batch intent is unreadable') from None
+    intent_sources = intent_doc.get('source_inputs')
+    if not isinstance(intent_sources, list):
+        raise ValueError('Strict-ineligible batch intent lacks source receipt rows')
+    for index, source in enumerate(intent_sources):
+        if (not isinstance(source, dict) or not isinstance(source.get('path'), str)
+                or not isinstance(source.get('sha256'), str)):
+            raise ValueError('Strict-ineligible batch intent has a malformed source receipt')
+        source_paths.append((f'intent_source_{index}', Path(source['path'])))
+    before_hashes = {}
+    try:
+        before_hashes = {label: sha(path.read_bytes()) for label, path in source_paths}
+    except OSError:
+        raise ValueError('Strict-ineligible proof source is unreadable before replay') from None
+    if before_hashes['batch_intent'] != sha(intent_bytes_before):
+        raise ValueError('Strict-ineligible batch intent changed before replay')
+    try:
+        _proof_from_inputs(
+            track_snapshot_path=track_snapshot_path,
+            identity_map_path=identity_map_path,
+            snapshot_path=collector_snapshot,
+            collector_summary_path=summary_path,
+            collector_seed_manifest_path=manifest_path,
+            batch_intent_path=batch_dir / 'intent.json',
+            raw_radio_cache_path=raw_radio_cache,
+            sealed_at_utc=radio_request.get('observed_at'))
+    except RadioSnapshotIneligible as exc:
+        binding = exc.details.get('seed_video_search_binding')
+        if (exc.persistent_id != pid or exc.reason != 'seed_not_strictly_matched'
+                or not isinstance(binding, dict)
+                or binding.get('kind') != 'authenticated-search-resolver-seed-ineligible-v1'
+                or binding.get('persistent_id') != pid
+                or binding.get('strict_unique') is not False):
+            raise ValueError('Collector seed has an unsupported ineligible proof outcome') from None
+        receipts = []
+        for label, path in source_paths:
+            path = path.resolve()
+            try:
+                data = path.read_bytes()
+            except OSError:
+                raise ValueError('Strict-ineligible proof source is unreadable: ' + label) from None
+            digest = sha(data)
+            if digest != before_hashes[label]:
+                raise ValueError('Strict-ineligible proof source changed during replay: ' + label)
+            receipts.append({'name': label, 'path': str(path), 'sha256': digest})
+        search_receipt = next(row for row in receipts if row['name'] == 'raw_search_cache')
+        if (binding.get('raw_search_cache', {}).get('path') != search_receipt['path']
+                or binding.get('raw_search_cache', {}).get('sha256') != search_receipt['sha256']):
+            raise ValueError('Strict-ineligible search receipt differs from its raw response cache')
+        if (sha(Path(identity_map_path).read_bytes()) != identity_hash
+                or json.loads(Path(track_snapshot_path).read_bytes()).get('source_sha256') != library_hash):
+            raise ValueError('Strict-ineligible proof is bound to a different map or Library')
+        return {
+            'schema_version': 1,
+            'producer': 'opengenius-authenticated-search-strict-ineligible-seed-v1',
+            'persistent_id': pid,
+            'status': 'collected_seed_strictly_ineligible',
+            'reason': exc.reason,
+            'details': exc.details,
+            'source_receipts': receipts,
+            'accepted_edges': [],
+        }
+    # If full proof replay succeeds, the missing/invalid hint cannot be
+    # converted into an ineligible disposition.
+    return None
+
+
+def _read_json(path):
+    return json.loads(Path(path).read_bytes())
 
 
 def _batch_number_from_path(batch_dir):
@@ -1250,6 +1535,8 @@ def _merge_radio_growth_with_radio_proof_cache(*, track_snapshot, identity_map_p
             or len(set(manifest_pids)) != len(manifest_pids)):
         raise ValueError('Collector seed manifest has malformed or duplicate PIDs')
     evidence_path = evidence_bytes = evidence = None
+    unresolved_seed_dispositions = []
+    collected_seed_ineligible_dispositions = []
     if seed_video_evidence_path is not None:
         evidence_path = Path(seed_video_evidence_path).resolve()
         evidence_bytes = evidence_path.read_bytes()
@@ -1262,7 +1549,6 @@ def _merge_radio_growth_with_radio_proof_cache(*, track_snapshot, identity_map_p
             tracks, matcher, library_hash, identity_hash)
         collector_path = Path(collector_summary_path).resolve()
         collector = json.loads(collector_path.read_bytes())
-        unresolved_seed_dispositions = []
         for seed in seed_manifest['seeds']:
             batch_dir = seed_manifest_path.parent.parent
             expected_receipt_paths = {
@@ -1286,17 +1572,30 @@ def _merge_radio_growth_with_radio_proof_cache(*, track_snapshot, identity_map_p
                 snapshot_paths=snapshot_paths,
                 library_hash=library_hash, identity_hash=identity_hash,
                 expected_source_paths={'track_snapshot': Path(track_snapshot),
-                                      'identity_map': Path(identity_map_path)})
+                                      'identity_map': Path(identity_map_path)},
+                tracks=tracks, matcher=matcher)
             if disposition is not None:
                 unresolved_seed_dispositions.append(disposition)
+                continue
+            ineligible = _collected_seed_ineligible_disposition(
+                seed, selected_hints, source_policy=source_policy,
+                collector_summary=collector,
+                collector_summary_path=collector_path,
+                seed_manifest=seed_manifest,
+                seed_manifest_path=seed_manifest_path,
+                seed_video_evidence_path=evidence_path,
+                snapshot_paths=snapshot_paths,
+                track_snapshot_path=track_snapshot,
+                identity_map_path=identity_map_path,
+                library_hash=library_hash, identity_hash=identity_hash)
+            if ineligible is not None:
+                collected_seed_ineligible_dispositions.append(ineligible)
                 continue
             _validate_collector_seed_video_binding(
                 seed, selected_hints, snapshot_paths, source_policy,
                 library_hash, identity_hash, expected_receipt_paths)
     elif seed_manifest.get('seed_video_evidence_sha256') is not None:
         raise ValueError('Collector used saved-video evidence but its sidecar was not supplied')
-    else:
-        unresolved_seed_dispositions = []
     graph_doc, report, state, rebase_provenance = _verify_rebase_receipt(
         baseline_graph_export_path, rebase_report_path, baseline_state_path,
         library_hash, identity_hash)
@@ -1500,6 +1799,8 @@ def _merge_radio_growth_with_radio_proof_cache(*, track_snapshot, identity_map_p
             'resulting_state_sha256': next_state['state_sha256'],
             **({'unresolved_seed_dispositions': unresolved_seed_dispositions}
                if unresolved_seed_dispositions else {}),
+            **({'collected_seed_ineligible_dispositions': collected_seed_ineligible_dispositions}
+               if collected_seed_ineligible_dispositions else {}),
         }],
         **({'previous_growth_receipt': {'path': str(Path(previous_growth_dir).resolve()),
                                         'accepted_graphs_sha256': prior_growth_receipt}}
