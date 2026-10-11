@@ -18,7 +18,8 @@ import re
 
 from music_identity_map import IdentityMap, load_library, version_signature
 from probe_ytmusic import observe
-from probe_ytmusic_batch import summary as collector_result_summary
+from probe_ytmusic_batch import (resolve_seed_search,
+                                 summary as collector_result_summary)
 from seed_video_evidence import select_seed_video_evidence
 from emulate_ytmusic_candidates import candidate_graph
 import seed_video_evidence as _seed_video_evidence
@@ -87,6 +88,14 @@ def _verified_source_closure(proof):
         if not isinstance(ref, dict):
             raise ValueError('Radio proof omits a direct source receipt: ' + key)
         add(ref.get('path'), ref.get('sha256'))
+    search_binding = proof.get('seed_video_search_binding')
+    if search_binding is not None:
+        if (not isinstance(search_binding, dict)
+                or search_binding.get('kind') != 'authenticated-search-strict-unique-seed-v1'
+                or not isinstance(search_binding.get('raw_search_cache'), dict)):
+            raise ValueError('Malformed search-derived seed binding receipt')
+        search_cache = search_binding['raw_search_cache']
+        add(search_cache.get('path'), search_cache.get('sha256'))
 
     intent_doc = json.loads(Path(proof['batch_intent']['path']).read_bytes())
     for source in intent_doc.get('source_inputs', []):
@@ -293,6 +302,89 @@ def _hash_file(path):
     return {'path': str(resolved), 'sha256': _sha(data)}
 
 
+def _request_cache_path(collector_snapshot_path, endpoint, arguments):
+    """Locate the content-addressed raw request receipt for one exact call."""
+    encoded = json.dumps([endpoint, arguments], sort_keys=True,
+                         ensure_ascii=False).encode('utf-8')
+    digest = _sha(encoded)
+    path = Path(collector_snapshot_path).resolve().parent / 'requests' / (digest + '.json')
+    if not path.is_file():
+        raise ValueError('Raw search response cache is missing')
+    return path.resolve()
+
+
+def _search_derived_seed_binding(*, snapshot, snapshot_path, local_seed,
+                                 selected_video_id, tracks, matcher):
+    """Validate a seed ID derived from this snapshot's exact live search.
+
+    The ordinary seed-video sidecar remains preferred. This fallback is only
+    for a recorded live search request with its content-addressed response
+    cache present; it requires the existing resolver to choose the radio seed
+    video and exactly one candidate to survive every strict metadata gate.
+    """
+    evidence = [row for row in snapshot.get('request_evidence', [])
+                if isinstance(row, dict) and row.get('endpoint') == 'search']
+    if len(evidence) != 1:
+        raise ValueError('Search-derived seed binding requires exactly one search request')
+    request = evidence[0]
+    arguments = request.get('arguments')
+    expected_arguments = {
+        'query': (local_seed.get('title') or '') + ' ' + (local_seed.get('artist') or ''),
+        'filter': 'songs', 'limit': 5,
+    }
+    if (arguments != expected_arguments or request.get('cache_hit') is not False
+            or not isinstance(request.get('observed_at'), str)
+            or not request.get('observed_at')):
+        raise ValueError('Search-derived seed request is not the exact live seed query')
+    cache_path = _request_cache_path(snapshot_path, 'search', arguments)
+    cache_bytes = cache_path.read_bytes()
+    cache = json.loads(cache_bytes)
+    if (cache.get('endpoint') != 'search' or cache.get('arguments') != arguments
+            or cache.get('observed_at') != request.get('observed_at')
+            or not isinstance(cache.get('response'), list)):
+        raise ValueError('Raw search cache does not bind the exact live seed request')
+
+    resolved_video, candidate_video_count, resolver_status = resolve_seed_search(
+        cache['response'], local_seed, tracks, matcher)
+    if resolved_video != selected_video_id:
+        raise ValueError('Replayed seed search does not resolve to the radio seed video')
+    pid = local_seed.get('persistent_id')
+    strict_by_video = {}
+    selected_video_strict_rows = []
+    for row in cache['response']:
+        video_id = row.get('videoId') if isinstance(row, dict) else None
+        if not isinstance(video_id, str):
+            continue
+        strict = [candidate for candidate in matcher.match(row)
+                  if _strict_candidate(candidate, row.get('title'))]
+        if video_id == selected_video_id:
+            selected_video_strict_rows.append(
+                {candidate.get('persistent_id') for candidate in strict})
+        if strict:
+            strict_by_video.setdefault(video_id, set()).update(
+                candidate.get('persistent_id') for candidate in strict)
+    strict_video_ids = sorted(video for video, pids in strict_by_video.items()
+                              if pid in pids)
+    selected_video_strict = strict_by_video.get(selected_video_id, set())
+    if (strict_video_ids != [selected_video_id]
+            or selected_video_strict != {pid}
+            or not selected_video_strict_rows
+            or any(row_pids != {pid} for row_pids in selected_video_strict_rows)):
+        raise ValueError('Seed search does not have one strict unique video for its local PID')
+    return {
+        'kind': 'authenticated-search-strict-unique-seed-v1',
+        'request': {'endpoint': 'search', 'arguments': arguments,
+                    'observed_at': request['observed_at'], 'cache_hit': False},
+        'raw_search_cache': {'path': str(cache_path), 'sha256': _sha(cache_bytes),
+                             'response_result_count': len(cache['response'])},
+        'resolver': {'video_id': resolved_video,
+                     'candidate_video_count': candidate_video_count,
+                     'status': resolver_status},
+        'strict_unique_video_ids': strict_video_ids,
+        'persistent_id': pid,
+    }
+
+
 def _check_collector_summary(summary, persistent_id, library_hash, snapshot):
     if (not isinstance(summary, dict) or type(summary.get('schema_version')) is not int
             or summary.get('schema_version') != 1
@@ -335,6 +427,22 @@ def _strict_candidate(candidate, remote_title):
             and candidate.get('album_match') is True
             and type(delta) in (int, float) and 0 <= delta <= 3
             and version_signature(local.get('title') or '') == version_signature(remote_title))
+
+
+def _search_bound_seed_graph_matcher(matcher, selected_video_id, persistent_id):
+    """Use the typed strict search binding only to disambiguate its seed row."""
+    class StrictSearchBoundSeedMatcher:
+        tracks = matcher.tracks
+
+        def match(self, remote, include_proposed=False):
+            candidates = matcher.match(remote, include_proposed=include_proposed)
+            if remote.get('video_id') != selected_video_id:
+                return candidates
+            return [candidate for candidate in candidates
+                    if candidate.get('persistent_id') == persistent_id
+                    and _strict_candidate(candidate, remote.get('title'))]
+
+    return StrictSearchBoundSeedMatcher()
 
 
 def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
@@ -462,9 +570,14 @@ def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
         seed_evidence, seed_evidence_path, manifest_seeds, tracks, matcher,
         library_hash, map_hash)
     selected_seed_evidence = validated_seed_evidence.get(pid)
-    if (not isinstance(selected_seed_evidence, dict)
-            or selected_seed_evidence.get('video_id') != selected_video_id):
-        raise ValueError('Radio call video ID is not the exact validated video for its local seed')
+    seed_video_search_binding = None
+    if isinstance(selected_seed_evidence, dict):
+        if selected_seed_evidence.get('video_id') != selected_video_id:
+            raise ValueError('Radio call video ID differs from its validated seed-video sidecar')
+    else:
+        seed_video_search_binding = _search_derived_seed_binding(
+            snapshot=snapshot, snapshot_path=snapshot_file, local_seed=local_seed,
+            selected_video_id=selected_video_id, tracks=tracks, matcher=matcher)
     replayed = observe(raw_rows, 'radio', request['observed_at'], tracks,
                        selected_video_id, candidate_matcher=matcher.match)
     saved_radio = [row for row in snapshot.get('observations', [])
@@ -474,8 +587,18 @@ def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
 
     seed_rows = [row for row in replayed if row.get('is_seed')]
     seed_candidates = matcher.match(seed_rows[0]['track']) if len(seed_rows) == 1 else []
-    if (len(seed_candidates) != 1 or seed_candidates[0].get('persistent_id') != pid
-            or not _strict_candidate(seed_candidates[0], seed_rows[0]['track'].get('title'))):
+    if seed_video_search_binding is not None:
+        strict_seed_candidates = [candidate for candidate in seed_candidates
+                                  if _strict_candidate(
+                                      candidate, seed_rows[0]['track'].get('title'))]
+        valid_seed = (len(strict_seed_candidates) == 1
+                      and strict_seed_candidates[0].get('persistent_id') == pid)
+    else:
+        valid_seed = (len(seed_candidates) == 1
+                      and seed_candidates[0].get('persistent_id') == pid
+                      and _strict_candidate(
+                          seed_candidates[0], seed_rows[0]['track'].get('title')))
+    if not valid_seed:
         seed_title = seed_rows[0]['track'].get('title') if len(seed_rows) == 1 else None
         details = {
             'selected_video_id': selected_video_id,
@@ -548,11 +671,13 @@ def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
                                  for position in row['positions']})
     strict_observations = [row for row in replayed
                            if row.get('is_seed') or row.get('position') in eligible_positions]
+    graph_matcher = (matcher if seed_video_search_binding is None else
+                     _search_bound_seed_graph_matcher(matcher, selected_video_id, pid))
     radio_graph = candidate_graph({
         'library_sha256': library_hash,
         'selected_video_id': selected_video_id,
         'observations': strict_observations,
-    }, matcher, library_hash)
+    }, graph_matcher, library_hash)
     if (radio_graph.get('root_pid') != pid
             or radio_graph.get('ordered_target_pids') != target_pids):
         raise ValueError('Strict radio candidate graph differs from the versioned proof targets')
@@ -564,7 +689,7 @@ def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
     if parsed_seal.tzinfo is None or parsed_seal.utcoffset() is None or parsed_seal.utcoffset().total_seconds() != 0:
         raise ValueError('Raw cache sealing time must be UTC')
 
-    return {
+    proof = {
         'schema_version': 1,
         'producer': PRODUCER,
         'policy': POLICY,
@@ -603,6 +728,9 @@ def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
         'related_endpoint_used_for_eligibility': False,
         'recording_identity_verified': False,
     }
+    if seed_video_search_binding is not None:
+        proof['seed_video_search_binding'] = seed_video_search_binding
+    return proof
 
 
 def create_radio_snapshot_proof(*, track_snapshot_path, identity_map_path,
@@ -698,9 +826,14 @@ def radio_only_snapshot_from_proof(proof_path):
         track_snapshot=Path(proof['track_snapshot']['path']))
     matcher = IdentityMap(json.loads(Path(proof['identity_map']['path']).read_bytes()),
                           tracks, library_hash)
+    graph_matcher = matcher
+    if 'seed_video_search_binding' in proof:
+        graph_matcher = _search_bound_seed_graph_matcher(
+            matcher, proof['selected_seed']['video_id'],
+            proof['selected_seed']['persistent_id'])
     graph = candidate_graph({'library_sha256': library_hash,
                              'selected_video_id': proof['selected_seed']['video_id'],
-                             'observations': observations}, matcher, library_hash)
+                             'observations': observations}, graph_matcher, library_hash)
     if (graph['root_pid'] != proof['selected_seed']['persistent_id']
             or graph['ordered_target_pids'] != proof['outgoing_target_pids']):
         raise ValueError('Sanitized radio-only snapshot does not yield the proved target graph')

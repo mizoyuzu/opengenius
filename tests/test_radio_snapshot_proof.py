@@ -138,6 +138,57 @@ class RadioSnapshotProofTests(unittest.TestCase):
                 raw_radio_cache_path=self.cache_path, output_path=output,
                 sealed_at_utc='2026-10-10T12:10:00+00:00')
 
+    def configure_search_derived_seed(self, search_results=None):
+        """Replace the ordinary seed hint with a raw exact-search source."""
+        snapshot = json.loads(self.snapshot_path.read_text(encoding='utf-8'))
+        search_arguments = {'query': 'Seed Song Seed Artist',
+                            'filter': 'songs', 'limit': 5}
+        search_time = '2026-10-10T11:59:00+00:00'
+        snapshot['request_evidence'].insert(0, {
+            'endpoint': 'search', 'arguments': search_arguments,
+            'observed_at': search_time, 'cache_hit': False,
+        })
+        self.snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False),
+                                      encoding='utf-8')
+        summary = json.loads(self.summary_path.read_text(encoding='utf-8'))
+        summary['results'] = [{**collector_result_summary(snapshot),
+                               'status': 'collected'}]
+        self.summary_path.write_text(json.dumps(summary, ensure_ascii=False),
+                                     encoding='utf-8')
+        evidence = json.loads(self.seed_evidence_path.read_text(encoding='utf-8'))
+        evidence['rows'] = []
+        self.seed_evidence_path.write_text(json.dumps(evidence, ensure_ascii=False),
+                                           encoding='utf-8')
+        manifest = json.loads(self.manifest_path.read_text(encoding='utf-8'))
+        manifest['seed_video_evidence_sha256'] = self.digest(self.seed_evidence_path)
+        self.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False),
+                                      encoding='utf-8')
+        intent = json.loads(self.intent_path.read_text(encoding='utf-8'))
+        intent['seed_video_evidence']['sha256'] = self.digest(self.seed_evidence_path)
+        self.intent_path.write_text(json.dumps(intent, ensure_ascii=False),
+                                    encoding='utf-8')
+        encoded = json.dumps(['search', search_arguments], sort_keys=True,
+                             ensure_ascii=False).encode('utf-8')
+        cache_dir = self.root / 'requests'
+        cache_dir.mkdir(exist_ok=True)
+        self.search_cache_path = cache_dir / (hashlib.sha256(encoded).hexdigest() + '.json')
+        search_track = {
+            'videoId': self.arguments['videoId'], 'title': 'Seed Song',
+            'artists': [{'name': 'Seed Artist', 'id': 'UCseed'}],
+            'album': {'name': 'Seed Album'}, 'duration_seconds': 100,
+            'videoType': 'MUSIC_VIDEO_TYPE_ATV',
+        }
+        alternate_album = {
+            **search_track, 'videoId': 'mnopqrstuvw',
+            'album': {'name': 'Another Album'},
+        }
+        self.search_cache_path.write_text(json.dumps({
+            'endpoint': 'search', 'arguments': search_arguments,
+            'observed_at': search_time,
+            'response': (search_results if search_results is not None
+                         else [search_track, alternate_album]),
+        }, ensure_ascii=False), encoding='utf-8')
+
     def verify_with_fixture_patches(self, proof_path):
         return patch('radio_snapshot_proof.load_library',
                      return_value=(self.tracks, LIBRARY, None)), \
@@ -850,6 +901,234 @@ class RadioSnapshotProofTests(unittest.TestCase):
                       return_value={ROOT: {'video_id': self.arguments['videoId']}}):
             with self.assertRaisesRegex(ValueError, 'auxiliary watch/related'):
                 self.create(self.root / 'radio-only-aux-proof.json')
+
+    def test_search_derived_seed_binding_requires_exact_strict_unique_search(self):
+        self.configure_search_derived_seed()
+        output = self.root / 'search-derived-proof.json'
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence',
+                      return_value={}):
+            proof = create_radio_snapshot_proof(
+                track_snapshot_path=self.track_path,
+                identity_map_path=self.identity_path,
+                snapshot_path=self.snapshot_path,
+                collector_summary_path=self.summary_path,
+                collector_seed_manifest_path=self.manifest_path,
+                batch_intent_path=self.intent_path,
+                raw_radio_cache_path=self.cache_path,
+                output_path=output,
+                sealed_at_utc='2026-10-10T12:10:00+00:00')
+            binding = proof['seed_video_search_binding']
+            self.assertEqual(binding['kind'],
+                             'authenticated-search-strict-unique-seed-v1')
+            self.assertEqual(binding['strict_unique_video_ids'],
+                             [self.arguments['videoId']])
+            self.assertEqual(binding['persistent_id'], ROOT)
+            self.assertEqual(binding['resolver']['candidate_video_count'], 2)
+            self.assertEqual(binding['resolver']['status'],
+                             'unique_album_metadata_preference_unverified')
+            with patch('radio_snapshot_proof.load_library',
+                       return_value=(self.tracks, LIBRARY, None)), \
+                    patch('radio_snapshot_proof.select_seed_video_evidence',
+                          return_value={}):
+                self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+
+    def test_search_derived_seed_binding_rejects_multiple_strict_videos(self):
+        duplicate = {
+            'videoId': 'zyxwvutsrqp', 'title': 'Seed Song',
+            'artists': [{'name': 'Seed Artist', 'id': 'UCseed'}],
+            'album': {'name': 'Seed Album'}, 'duration_seconds': 100,
+            'videoType': 'MUSIC_VIDEO_TYPE_ATV',
+        }
+        self.configure_search_derived_seed(search_results=[
+            {'videoId': self.arguments['videoId'], 'title': 'Seed Song',
+             'artists': [{'name': 'Seed Artist', 'id': 'UCseed'}],
+             'album': {'name': 'Seed Album'}, 'duration_seconds': 100,
+             'videoType': 'MUSIC_VIDEO_TYPE_ATV'}, duplicate])
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence',
+                      return_value={}):
+            with self.assertRaisesRegex(ValueError, 'does not resolve to the radio seed video'):
+                create_radio_snapshot_proof(
+                    track_snapshot_path=self.track_path,
+                    identity_map_path=self.identity_path,
+                    snapshot_path=self.snapshot_path,
+                    collector_summary_path=self.summary_path,
+                    collector_seed_manifest_path=self.manifest_path,
+                    batch_intent_path=self.intent_path,
+                    raw_radio_cache_path=self.cache_path,
+                    output_path=self.root / 'two-strict-videos.json',
+                    sealed_at_utc='2026-10-10T12:10:00+00:00')
+
+    def test_search_derived_seed_binding_rejects_wrong_request_receipts(self):
+        self.configure_search_derived_seed()
+        original_snapshot = json.loads(self.snapshot_path.read_text(encoding='utf-8'))
+        original_cache = json.loads(self.search_cache_path.read_text(encoding='utf-8'))
+        cases = (
+            ('query', lambda row, cache: row['arguments'].__setitem__('query', 'other query')),
+            ('filter', lambda row, cache: row['arguments'].__setitem__('filter', 'videos')),
+            ('limit', lambda row, cache: row['arguments'].__setitem__('limit', 10)),
+            ('cache-hit', lambda row, cache: row.__setitem__('cache_hit', True)),
+            ('timestamp', lambda row, cache: row.__setitem__(
+                'observed_at', '2026-10-10T12:01:00+00:00')),
+            ('different-video', lambda row, cache: cache['response'][0].__setitem__(
+                'videoId', 'ZYXWVUTSRQP')),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                snapshot = copy.deepcopy(original_snapshot)
+                cache = copy.deepcopy(original_cache)
+                search_row = next(row for row in snapshot['request_evidence']
+                                  if row['endpoint'] == 'search')
+                mutate(search_row, cache)
+                self.snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False),
+                                              encoding='utf-8')
+                self.search_cache_path.write_text(json.dumps(cache, ensure_ascii=False),
+                                                  encoding='utf-8')
+                summary = json.loads(self.summary_path.read_text(encoding='utf-8'))
+                summary['results'] = [{**collector_result_summary(snapshot),
+                                       'status': 'collected'}]
+                self.summary_path.write_text(json.dumps(summary, ensure_ascii=False),
+                                             encoding='utf-8')
+                with patch('radio_snapshot_proof.load_library',
+                           return_value=(self.tracks, LIBRARY, None)), \
+                        patch('radio_snapshot_proof.select_seed_video_evidence',
+                              return_value={}):
+                    with self.assertRaises(ValueError):
+                        create_radio_snapshot_proof(
+                            track_snapshot_path=self.track_path,
+                            identity_map_path=self.identity_path,
+                            snapshot_path=self.snapshot_path,
+                            collector_summary_path=self.summary_path,
+                            collector_seed_manifest_path=self.manifest_path,
+                            batch_intent_path=self.intent_path,
+                            raw_radio_cache_path=self.cache_path,
+                            output_path=self.root / ('invalid-search-' + label + '.json'),
+                            sealed_at_utc='2026-10-10T12:10:00+00:00')
+
+    def test_search_derived_seed_binding_rejects_zero_strict_videos(self):
+        wrong_album = {
+            'videoId': self.arguments['videoId'], 'title': 'Seed Song',
+            'artists': [{'name': 'Seed Artist', 'id': 'UCseed'}],
+            'album': {'name': 'Wrong Album'}, 'duration_seconds': 100,
+            'videoType': 'MUSIC_VIDEO_TYPE_ATV',
+        }
+        self.configure_search_derived_seed(search_results=[wrong_album])
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence',
+                      return_value={}):
+            with self.assertRaisesRegex(ValueError, 'one strict unique video'):
+                create_radio_snapshot_proof(
+                    track_snapshot_path=self.track_path,
+                    identity_map_path=self.identity_path,
+                    snapshot_path=self.snapshot_path,
+                    collector_summary_path=self.summary_path,
+                    collector_seed_manifest_path=self.manifest_path,
+                    batch_intent_path=self.intent_path,
+                    raw_radio_cache_path=self.cache_path,
+                    output_path=self.root / 'zero-strict-video.json',
+                    sealed_at_utc='2026-10-10T12:10:00+00:00')
+
+    def test_search_binding_cannot_hide_a_different_strict_radio_seed_pid(self):
+        self.configure_search_derived_seed()
+        other = {'persistent_id': '0000000000000003', 'title': 'Seed Song',
+                 'artist': 'Seed Artist', 'album': 'Seed Album',
+                 'duration_ms': 104000}
+        self.tracks.append(other)
+        self.identity = build_map(self.tracks, LIBRARY)
+        self.identity_path = self.write('radio-ambiguous-identity.json', self.identity)
+        self.map_hash = self.digest(self.identity_path)
+        self.matcher = IdentityMap(self.identity, self.tracks, LIBRARY)
+        # Search is 100s and uniquely supports ROOT (the duplicate track is
+        # four seconds away); the radio seed row is 102s and strictly supports
+        # both PIDs. Search uniqueness cannot mask radio-row ambiguity.
+        self.raw_tracks[0]['length'] = '1:42'
+        self.cache_path = self.write('radio-ambiguous-cache.json', {
+            'endpoint': 'get_watch_playlist', 'arguments': self.arguments,
+            'observed_at': self.observed_at, 'response': {'tracks': self.raw_tracks},
+        })
+        snapshot = self.snapshot()
+        snapshot['request_evidence'].insert(0, {
+            'endpoint': 'search',
+            'arguments': {'query': 'Seed Song Seed Artist',
+                          'filter': 'songs', 'limit': 5},
+            'observed_at': '2026-10-10T11:59:00+00:00', 'cache_hit': False,
+        })
+        snapshot['identity_map_sha256'] = self.map_hash
+        self.snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False),
+                                      encoding='utf-8')
+        summary = json.loads(self.summary_path.read_text(encoding='utf-8'))
+        summary['results'] = [{**collector_result_summary(snapshot),
+                               'status': 'collected'}]
+        self.summary_path.write_text(json.dumps(summary, ensure_ascii=False),
+                                     encoding='utf-8')
+        evidence = json.loads(self.seed_evidence_path.read_text(encoding='utf-8'))
+        evidence.update(identity_map_sha256=self.map_hash, rows=[])
+        self.seed_evidence_path.write_text(json.dumps(evidence, ensure_ascii=False),
+                                           encoding='utf-8')
+        manifest = json.loads(self.manifest_path.read_text(encoding='utf-8'))
+        manifest.update(identity_map_sha256=self.map_hash,
+                        seed_video_evidence_sha256=self.digest(self.seed_evidence_path))
+        self.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False),
+                                      encoding='utf-8')
+        intent = json.loads(self.intent_path.read_text(encoding='utf-8'))
+        intent.update(identity_map_sha256=self.map_hash)
+        intent['runner_config']['identity_map'] = {
+            'path': str(self.identity_path.resolve()), 'sha256': self.map_hash}
+        intent['seed_video_evidence']['sha256'] = self.digest(self.seed_evidence_path)
+        self.intent_path.write_text(json.dumps(intent, ensure_ascii=False),
+                                    encoding='utf-8')
+        output = self.root / 'different-radio-seed-proof.json'
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence',
+                      return_value={}):
+            with self.assertRaisesRegex(RadioSnapshotIneligible,
+                                        'seed_not_strictly_matched'):
+                create_radio_snapshot_proof(
+                    track_snapshot_path=self.track_path,
+                    identity_map_path=self.identity_path,
+                    snapshot_path=self.snapshot_path,
+                    collector_summary_path=self.summary_path,
+                    collector_seed_manifest_path=self.manifest_path,
+                    batch_intent_path=self.intent_path,
+                    raw_radio_cache_path=self.cache_path,
+                    output_path=output,
+                    sealed_at_utc='2026-10-10T12:10:00+00:00')
+
+    def test_search_derived_seed_binding_rejects_raw_search_cache_tamper(self):
+        self.configure_search_derived_seed()
+        output = self.root / 'search-cache-tamper-proof.json'
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence',
+                      return_value={}):
+            create_radio_snapshot_proof(
+                track_snapshot_path=self.track_path,
+                identity_map_path=self.identity_path,
+                snapshot_path=self.snapshot_path,
+                collector_summary_path=self.summary_path,
+                collector_seed_manifest_path=self.manifest_path,
+                batch_intent_path=self.intent_path,
+                raw_radio_cache_path=self.cache_path,
+                output_path=output,
+                sealed_at_utc='2026-10-10T12:10:00+00:00')
+            with patch('radio_snapshot_proof.load_library',
+                       return_value=(self.tracks, LIBRARY, None)), \
+                    patch('radio_snapshot_proof.select_seed_video_evidence',
+                          return_value={}):
+                with radio_snapshot_proof_cache_scope():
+                    self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+                    verify_radio_snapshot_proof(output)
+                    search_cache = json.loads(self.search_cache_path.read_text(encoding='utf-8'))
+                    search_cache['response'][0]['title'] = 'Tampered Search Result'
+                    self.search_cache_path.write_text(
+                        json.dumps(search_cache, ensure_ascii=False), encoding='utf-8')
+                    with self.assertRaisesRegex(ValueError, 'source receipt changed'):
+                        verify_radio_snapshot_proof(output)
 
 
 if __name__ == '__main__':
