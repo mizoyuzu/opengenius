@@ -1,8 +1,10 @@
 """Offline safety checks for saved radio-video seed evidence."""
 import copy
+import builtins
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -20,7 +22,9 @@ from seed_video_evidence import (PRODUCER, build_seed_video_evidence,
                                  strict_cached_search_match,
                                  select_seed_video_evidence,
                                  validate_album_catalog_evidence,
-                                 main as evidence_main)
+                                 main as evidence_main,
+                                 seed_video_selector_cache_scope)
+import seed_video_evidence as seed_evidence_module
 
 
 LIBRARY_HASH = 'a' * 64
@@ -99,6 +103,381 @@ class SeedVideoEvidenceTests(unittest.TestCase):
             self.tracks if tracks is None else tracks,
             self.matcher if matcher is None else matcher,
             LIBRARY_HASH, MAP_HASH)
+
+    def test_selector_index_reuses_full_validation_for_different_pid_subsets(self):
+        self.tracks.append(track('0000000000000002', 'Other Song'))
+        # Keep a two-row complete evidence doc; the second PID simply has no hint.
+        self.matcher = IdentityMap(build_map(self.tracks, LIBRARY_HASH),
+                                   self.tracks, LIBRARY_HASH)
+        expected_one = select_seed_video_evidence(
+            self.document, self.sidecar_path, [self.tracks[0]], self.tracks,
+            self.matcher, LIBRARY_HASH, MAP_HASH)
+        expected_empty = select_seed_video_evidence(
+            self.document, self.sidecar_path, [self.tracks[1]], self.tracks,
+            self.matcher, LIBRARY_HASH, MAP_HASH)
+        with seed_video_selector_cache_scope() as stats:
+            one = select_seed_video_evidence(
+                self.document, self.sidecar_path, [self.tracks[0]], self.tracks,
+                self.matcher, LIBRARY_HASH, MAP_HASH)
+            empty = select_seed_video_evidence(
+                self.document, self.sidecar_path, [self.tracks[1]], self.tracks,
+                self.matcher, LIBRARY_HASH, MAP_HASH)
+            self.assertEqual(one, expected_one)
+            self.assertEqual(empty, expected_empty)
+            self.assertEqual(stats['full_replays'], 1)
+            self.assertEqual(stats['hits'], 1)
+            self.assertGreaterEqual(stats['closure_files'], 2)
+
+    def test_selector_index_preserves_multiple_video_row_results_and_order(self):
+        second = track('0000000000000002', 'Other Song')
+        self.tracks.append(second)
+        second_source = self.root / 'radio-second.json'
+        second_source.write_text(json.dumps(snapshot(
+            video='radio000002', title='Other Song')), encoding='utf-8')
+        self.matcher = IdentityMap(build_map(self.tracks, LIBRARY_HASH),
+                                   self.tracks, LIBRARY_HASH)
+        document = build_seed_video_evidence(
+            [self.source_path, second_source], self.matcher, LIBRARY_HASH, MAP_HASH)
+        self.save_document(document)
+        requests = [[self.tracks[0]], [self.tracks[1], self.tracks[0]]]
+        expected = [select_seed_video_evidence(
+            document, self.sidecar_path, seeds, self.tracks, self.matcher,
+            LIBRARY_HASH, MAP_HASH) for seeds in requests]
+        with seed_video_selector_cache_scope() as stats:
+            actual = [select_seed_video_evidence(
+                document, self.sidecar_path, seeds, self.tracks, self.matcher,
+                LIBRARY_HASH, MAP_HASH) for seeds in requests]
+            self.assertEqual(actual, expected)
+            self.assertEqual(actual[1][self.tracks[0]['persistent_id']]['video_id'], VIDEO)
+            self.assertEqual(actual[1][self.tracks[1]['persistent_id']]['video_id'], 'radio000002')
+            self.assertEqual(stats['full_replays'], 1)
+            self.assertEqual(stats['hits'], 1)
+
+    def test_selector_cache_rehashes_transitive_source_used_by_other_pid_row(self):
+        with seed_video_selector_cache_scope():
+            select_seed_video_evidence(
+                self.document, self.sidecar_path, [self.tracks[0]], self.tracks,
+                self.matcher, LIBRARY_HASH, MAP_HASH)
+            changed = snapshot(title='Changed after first PID selection')
+            self.write_snapshot(changed)
+            with self.assertRaisesRegex(ValueError, 'source changed'):
+                select_seed_video_evidence(
+                    self.document, self.sidecar_path, [], self.tracks,
+                    self.matcher, LIBRARY_HASH, MAP_HASH)
+
+    def test_selector_cache_rehashes_catalog_and_radio_snapshot_transitive_sources(self):
+        tracks, matcher, catalog, catalog_path = self.catalog_fixture()
+        radio = build_seed_video_evidence(
+            [self.source_path], matcher, LIBRARY_HASH, MAP_HASH)
+        combined = combine_seed_video_evidence(
+            radio, self.sidecar_path, catalog, catalog_path,
+            tracks, matcher, LIBRARY_HASH, MAP_HASH)
+        combined_path = self.root / 'combined-cached.json'
+        combined_path.write_text(json.dumps(combined), encoding='utf-8')
+        with seed_video_selector_cache_scope() as stats:
+            first = select_seed_video_evidence(
+                combined, combined_path, tracks, tracks, matcher,
+                LIBRARY_HASH, MAP_HASH)
+            self.assertEqual(first['0000000000000002']['video_id'], CATALOG_VIDEO)
+            self.assertEqual(select_seed_video_evidence(
+                combined, combined_path, [tracks[0]], tracks, matcher,
+                LIBRARY_HASH, MAP_HASH), {PID: first[PID]})
+            self.assertEqual(stats['full_replays'], 1)
+            self.assertEqual(stats['hits'], 1)
+            response_path = Path(catalog['rows'][0]['input_path'])
+            response_path.write_text(json.dumps({'tampered': True}), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'source changed'):
+                select_seed_video_evidence(
+                    combined, combined_path, [tracks[0]], tracks, matcher,
+                    LIBRARY_HASH, MAP_HASH)
+
+    def test_selector_cache_return_is_deep_copied_and_scope_is_not_persistent(self):
+        with seed_video_selector_cache_scope() as stats:
+            first = select_seed_video_evidence(
+                self.document, self.sidecar_path, self.seeds, self.tracks,
+                self.matcher, LIBRARY_HASH, MAP_HASH)
+            first[PID]['video_id'] = 'tampered001'
+            second = select_seed_video_evidence(
+                self.document, self.sidecar_path, self.seeds, self.tracks,
+                self.matcher, LIBRARY_HASH, MAP_HASH)
+            self.assertEqual(second[PID]['video_id'], VIDEO)
+            self.assertEqual(stats['hits'], 1)
+        with seed_video_selector_cache_scope() as fresh_stats:
+            select_seed_video_evidence(
+                self.document, self.sidecar_path, self.seeds, self.tracks,
+                self.matcher, LIBRARY_HASH, MAP_HASH)
+            self.assertEqual(fresh_stats['full_replays'], 1)
+            self.assertEqual(fresh_stats['hits'], 0)
+
+    def test_selector_cache_rechecks_directory_membership_before_hit(self):
+        directory = self.root / 'dependency-dir'
+        directory.mkdir()
+        (directory / 'first.json').write_text('{}', encoding='utf-8')
+        original_uncached = seed_evidence_module._select_seed_video_evidence_uncached
+
+        def scan_then_validate(*args, **kwargs):
+            list(directory.glob('*.json'))
+            return original_uncached(*args, **kwargs)
+
+        with patch.object(seed_evidence_module,
+                          '_select_seed_video_evidence_uncached',
+                          side_effect=scan_then_validate):
+            with seed_video_selector_cache_scope():
+                select_seed_video_evidence(
+                    self.document, self.sidecar_path, self.seeds, self.tracks,
+                    self.matcher, LIBRARY_HASH, MAP_HASH)
+                (directory / 'added.json').write_text('{}', encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'source changed'):
+                    select_seed_video_evidence(
+                        self.document, self.sidecar_path, self.seeds, self.tracks,
+                        self.matcher, LIBRARY_HASH, MAP_HASH)
+
+    def test_selector_cache_rechecks_directory_deletion_before_hit(self):
+        directory = self.root / 'dependency-dir-delete'
+        directory.mkdir()
+        file = directory / 'first.json'
+        file.write_text('{}', encoding='utf-8')
+        original_uncached = seed_evidence_module._select_seed_video_evidence_uncached
+
+        def scan_then_validate(*args, **kwargs):
+            list(directory.glob('*.json'))
+            return original_uncached(*args, **kwargs)
+
+        with patch.object(seed_evidence_module,
+                          '_select_seed_video_evidence_uncached',
+                          side_effect=scan_then_validate):
+            with seed_video_selector_cache_scope():
+                select_seed_video_evidence(
+                    self.document, self.sidecar_path, self.seeds, self.tracks,
+                    self.matcher, LIBRARY_HASH, MAP_HASH)
+                file.unlink()
+                with self.assertRaisesRegex(ValueError, 'source changed'):
+                    select_seed_video_evidence(
+                        self.document, self.sidecar_path, self.seeds, self.tracks,
+                        self.matcher, LIBRARY_HASH, MAP_HASH)
+
+    def test_selector_cache_never_seals_when_source_mutates_during_miss(self):
+        original_uncached = seed_evidence_module._select_seed_video_evidence_uncached
+
+        def validate_then_mutate(*args, **kwargs):
+            result = original_uncached(*args, **kwargs)
+            self.write_snapshot(snapshot(title='Mutated during selector replay'))
+            return result
+
+        original_methods = (Path.read_bytes, Path.read_text, Path.open,
+                            builtins.open, os.scandir, os.listdir)
+        with patch.object(seed_evidence_module,
+                          '_select_seed_video_evidence_uncached',
+                          side_effect=validate_then_mutate):
+            with seed_video_selector_cache_scope():
+                with self.assertRaisesRegex(ValueError, 'changed during full validation'):
+                    select_seed_video_evidence(
+                        self.document, self.sidecar_path, self.seeds, self.tracks,
+                        self.matcher, LIBRARY_HASH, MAP_HASH)
+                self.assertEqual(len(seed_evidence_module._ACTIVE_SELECTOR_INDEX.get()['entries']), 0)
+        self.assertEqual((Path.read_bytes, Path.read_text, Path.open,
+                          builtins.open, os.scandir, os.listdir), original_methods)
+
+    def test_selector_returns_uncached_result_when_typed_verifier_removes_scratch(self):
+        expected = self.select()
+        original_uncached = seed_evidence_module._select_seed_video_evidence_uncached
+        removed_paths = []
+
+        def validate_with_temporary_rebuilt_map(*args, **kwargs):
+            # Model the typed map verifier's temporary rebuild: the selector's
+            # full validation observes/read-hashes the file, then its owner
+            # removes the whole scratch directory before closure sealing.
+            with tempfile.TemporaryDirectory(
+                    prefix='opengenius-title-rebind-', dir=self.root) as raw_dir:
+                temp_dir = Path(raw_dir)
+                rebuilt_map = temp_dir / 'rebuilt-map.json'
+                self.assertTrue(temp_dir.is_dir())
+                rebuilt_map.write_text('{"validated": true}', encoding='utf-8')
+                self.assertEqual(rebuilt_map.read_text(encoding='utf-8'),
+                                 '{"validated": true}')
+                removed_paths.append((temp_dir, rebuilt_map))
+                return original_uncached(*args, **kwargs)
+
+        with patch.object(seed_evidence_module,
+                          '_select_seed_video_evidence_uncached',
+                          side_effect=validate_with_temporary_rebuilt_map):
+            with seed_video_selector_cache_scope() as stats:
+                actual = self.select()
+                self.assertEqual(actual, expected)
+                self.assertEqual(stats['full_replays'], 1)
+                self.assertEqual(stats['uncacheable_replays'], 1)
+                self.assertEqual(stats['hits'], 0)
+                self.assertEqual(len(seed_evidence_module._ACTIVE_SELECTOR_INDEX.get()['entries']), 0)
+                self.assertFalse(removed_paths[-1][0].exists())
+                self.assertFalse(removed_paths[-1][1].exists())
+
+    def test_selector_cache_rejects_repeated_state_listing_and_resolution_changes(self):
+        original_uncached = seed_evidence_module._select_seed_video_evidence_uncached
+
+        def expect_unstable(observe_twice):
+            def validate(*args, **kwargs):
+                observe_twice()
+                return original_uncached(*args, **kwargs)
+
+            with patch.object(seed_evidence_module,
+                              '_select_seed_video_evidence_uncached',
+                              side_effect=validate):
+                with seed_video_selector_cache_scope() as stats:
+                    with self.assertRaisesRegex(ValueError, 'sources changed during full validation'):
+                        self.select()
+                    self.assertEqual(stats['full_replays'], 0)
+                    self.assertEqual(stats['hits'], 0)
+
+        state_path = self.root / 'state-change-during-replay'
+        def observe_state_change():
+            self.assertFalse(state_path.exists())
+            state_path.touch()
+            self.assertTrue(state_path.exists())
+        expect_unstable(observe_state_change)
+
+        listing_dir = self.root / 'listing-change-during-replay'
+        listing_dir.mkdir()
+        def observe_listing_change():
+            self.assertEqual(list(listing_dir.glob('*.json')), [])
+            (listing_dir / 'new.json').write_text('{}', encoding='utf-8')
+            self.assertEqual([path.name for path in listing_dir.glob('*.json')], ['new.json'])
+        expect_unstable(observe_listing_change)
+
+        target_one = self.root / 'resolution-target-one'
+        target_two = self.root / 'resolution-target-two'
+        target_one.write_text('one', encoding='utf-8')
+        target_two.write_text('two', encoding='utf-8')
+        link = self.root / 'resolution-link'
+        try:
+            link.symlink_to(target_one)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlink creation is unavailable')
+        def observe_resolution_change():
+            self.assertEqual(link.resolve(), target_one.resolve())
+            link.unlink()
+            link.symlink_to(target_two)
+            self.assertEqual(link.resolve(), target_two.resolve())
+        expect_unstable(observe_resolution_change)
+
+    def test_selector_cache_context_tracks_in_memory_matcher_and_ignores_foreign_reuse(self):
+        with seed_video_selector_cache_scope() as stats:
+            select_seed_video_evidence(
+                self.document, self.sidecar_path, self.seeds, self.tracks,
+                self.matcher, LIBRARY_HASH, MAP_HASH)
+            changed_tracks = copy.deepcopy(self.tracks)
+            changed_tracks[0]['album'] = 'Changed in memory'
+            changed_matcher = IdentityMap(build_map(changed_tracks, LIBRARY_HASH),
+                                          changed_tracks, LIBRARY_HASH)
+            with self.assertRaisesRegex(ValueError, 'hashes differ'):
+                select_seed_video_evidence(
+                    self.document, self.sidecar_path, self.seeds,
+                    changed_tracks, changed_matcher, LIBRARY_HASH, 'c' * 64)
+            self.assertEqual(stats['hits'], 0)
+
+    def test_selector_cache_context_tracks_mutated_matcher_state(self):
+        with seed_video_selector_cache_scope() as stats:
+            first = select_seed_video_evidence(
+                self.document, self.sidecar_path, self.seeds, self.tracks,
+                self.matcher, LIBRARY_HASH, MAP_HASH)
+            self.matcher.album_title_aliases['unused remote title'] = 'Album'
+            second = select_seed_video_evidence(
+                self.document, self.sidecar_path, self.seeds, self.tracks,
+                self.matcher, LIBRARY_HASH, MAP_HASH)
+            self.assertEqual(first, second)
+            self.assertEqual(stats['misses'], 2)
+            self.assertEqual(stats['hits'], 0)
+
+    def test_selector_cache_rejects_symlink_retarget(self):
+        alias = self.root / 'radio-alias.json'
+        alternate = self.root / 'radio-alternate.json'
+        try:
+            alias.symlink_to(self.source_path)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlink creation is unavailable')
+        alternate.write_bytes(self.source_path.read_bytes())
+        document = copy.deepcopy(self.document)
+        document['rows'][0]['input_path'] = str(alias)
+        self.save_document(document)
+        with seed_video_selector_cache_scope():
+            select_seed_video_evidence(
+                document, self.sidecar_path, self.seeds, self.tracks,
+                self.matcher, LIBRARY_HASH, MAP_HASH)
+            alias.unlink()
+            alias.symlink_to(alternate)
+            with self.assertRaisesRegex(ValueError, 'source changed'):
+                select_seed_video_evidence(
+                    document, self.sidecar_path, self.seeds, self.tracks,
+                    self.matcher, LIBRARY_HASH, MAP_HASH)
+
+    def test_selector_cache_preserves_requested_seed_validation_errors(self):
+        with seed_video_selector_cache_scope():
+            with self.assertRaisesRegex(ValueError, 'no persistent ID'):
+                select_seed_video_evidence(
+                    self.document, self.sidecar_path, [{}], self.tracks,
+                    self.matcher, LIBRARY_HASH, MAP_HASH)
+
+    def test_selector_cache_nested_scope_shares_index_and_restores_on_exception(self):
+        original_read_bytes = Path.read_bytes
+        with seed_video_selector_cache_scope() as outer:
+            select_seed_video_evidence(
+                self.document, self.sidecar_path, self.seeds, self.tracks,
+                self.matcher, LIBRARY_HASH, MAP_HASH)
+            with seed_video_selector_cache_scope() as nested:
+                self.assertIs(nested, outer)
+                select_seed_video_evidence(
+                    self.document, self.sidecar_path, self.seeds, self.tracks,
+                    self.matcher, LIBRARY_HASH, MAP_HASH)
+            with self.assertRaisesRegex(RuntimeError, 'nested failure'):
+                with seed_video_selector_cache_scope():
+                    raise RuntimeError('nested failure')
+            self.assertIsNotNone(seed_evidence_module._ACTIVE_SELECTOR_INDEX.get())
+            select_seed_video_evidence(
+                self.document, self.sidecar_path, self.seeds, self.tracks,
+                self.matcher, LIBRARY_HASH, MAP_HASH)
+            self.assertEqual(outer['nested_scopes'], 2)
+            self.assertEqual(outer['hits'], 2)
+        self.assertIs(Path.read_bytes, original_read_bytes)
+
+    def test_unrecognized_open_makes_successful_validation_noncacheable(self):
+        original_uncached = seed_evidence_module._select_seed_video_evidence_uncached
+
+        def validate_with_extra_open(*args, **kwargs):
+            with open(self.source_path, 'rb') as handle:
+                handle.read()
+            return original_uncached(*args, **kwargs)
+
+        with patch.object(seed_evidence_module,
+                          '_select_seed_video_evidence_uncached',
+                          side_effect=validate_with_extra_open):
+            with seed_video_selector_cache_scope() as stats:
+                first = select_seed_video_evidence(
+                    self.document, self.sidecar_path, self.seeds, self.tracks,
+                    self.matcher, LIBRARY_HASH, MAP_HASH)
+                second = select_seed_video_evidence(
+                    self.document, self.sidecar_path, self.seeds, self.tracks,
+                    self.matcher, LIBRARY_HASH, MAP_HASH)
+                self.assertEqual(first, second)
+                self.assertEqual(stats['full_replays'], 2)
+                self.assertEqual(stats['uncacheable_replays'], 2)
+                self.assertEqual(stats['hits'], 0)
+
+    def test_listing_trace_preserves_path_glob_keyword_options(self):
+        original_uncached = seed_evidence_module._select_seed_video_evidence_uncached
+
+        def validate_with_optioned_listings(*args, **kwargs):
+            list(self.root.glob('*.json', case_sensitive=False))
+            list(self.root.rglob('*.json', recurse_symlinks=False))
+            return original_uncached(*args, **kwargs)
+
+        with patch.object(seed_evidence_module,
+                          '_select_seed_video_evidence_uncached',
+                          side_effect=validate_with_optioned_listings):
+            with seed_video_selector_cache_scope() as stats:
+                first = self.select()
+                second = self.select()
+                self.assertEqual(first, second)
+                self.assertEqual(stats['full_replays'], 1)
+                self.assertEqual(stats['hits'], 1)
 
     def _cached_result(self, *, title='Song', artists=None, album='Album'):
         return [{'videoId': VIDEO, 'title': title,

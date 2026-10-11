@@ -591,6 +591,9 @@ def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
                      if isinstance(row, dict)]
     if len(manifest_pids) != len(manifest['seeds']) or len(set(manifest_pids)) != len(manifest_pids):
         raise ValueError('A previous collector seed manifest has duplicate or malformed PIDs')
+    source_policy = run.get('source_policy')
+    if source_policy not in (None, 'authenticated-watch-radio-only-v1'):
+        raise ValueError('A previous run uses an unsupported recommendation source policy')
     evidence_info = seed_info.get('seed_video_evidence')
     if evidence_info is not None:
         if (not isinstance(evidence_info, dict) or not isinstance(evidence_info.get('path'), str)
@@ -605,11 +608,61 @@ def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
             json.loads(evidence_bytes), evidence_path,
             [{'persistent_id': pid} for pid in manifest_pids], tracks, matcher,
             library_hash, identity_hash)
+        unresolved_dispositions = []
+        batch_dir = manifest_path.parent.parent
+        intent_config = None
         for seed in manifest['seeds']:
             hint = hints.get(seed['persistent_id'])
-            if (hint is None or hint.get('video_id') != seed.get('seed_video_id')
-                    or hint.get('source') != seed.get('seed_video_source')):
+            disposition = None
+            if ('unresolved_seed_dispositions' in run
+                    and source_policy == 'authenticated-watch-radio-only-v1'):
+                disposition = _unresolved_seed_disposition(
+                    seed, hints, source_policy=source_policy,
+                    collector_summary=collector,
+                    collector_summary_path=summary_path,
+                    seed_manifest=manifest,
+                    seed_manifest_path=manifest_path,
+                    seed_video_evidence_path=evidence_path,
+                    snapshot_paths=[Path(row['path']) for row in snapshot_inputs
+                                    if isinstance(row, dict) and isinstance(row.get('path'), str)],
+                    library_hash=library_hash, identity_hash=identity_hash)
+            if disposition is not None:
+                unresolved_dispositions.append(disposition)
+                continue
+            expected_receipt_paths = {}
+            if (source_policy == 'authenticated-watch-radio-only-v1'
+                    and hint is None):
+                if intent_config is None:
+                    intent_doc = json.loads((batch_dir / 'intent.json').read_bytes())
+                    intent_config = intent_doc.get('runner_config', {})
+                track_ref = intent_config.get('track_snapshot', {})
+                map_ref = intent_config.get('identity_map', {})
+                if (not isinstance(track_ref, dict) or not isinstance(track_ref.get('path'), str)
+                        or not isinstance(map_ref, dict) or not isinstance(map_ref.get('path'), str)):
+                    raise ValueError('Previous radio-only run intent lacks track/map paths')
+                expected_receipt_paths = {
+                    'track_snapshot': Path(track_ref['path']),
+                    'identity_map': Path(map_ref['path']),
+                    'collector_snapshot': manifest_path.parent /
+                        (seed['persistent_id'] + '.json'),
+                    'collector_summary': summary_path,
+                    'collector_seed_manifest': manifest_path,
+                    'batch_intent': batch_dir / 'intent.json',
+                    'seed_plan': batch_dir / 'seed-plan.json',
+                    'seed_video_evidence': evidence_path,
+                }
+            try:
+                _validate_collector_seed_video_binding(
+                    seed, hints,
+                    [Path(row['path']) for row in snapshot_inputs
+                     if isinstance(row, dict) and isinstance(row.get('path'), str)],
+                    source_policy, library_hash, identity_hash,
+                    expected_receipt_paths)
+            except ValueError:
                 raise ValueError('A previous seed differs from its strict saved-video evidence')
+        if ('unresolved_seed_dispositions' in run
+                and run.get('unresolved_seed_dispositions') != unresolved_dispositions):
+            raise ValueError('Previous unresolved seed dispositions differ from current receipts')
     elif manifest.get('seed_video_evidence_sha256') is not None:
         raise ValueError('Previous strict seed-video sidecar receipt is missing')
     collected = {row.get('persistent_id') for row in collector.get('results', [])
@@ -623,7 +676,6 @@ def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
         if sha(path.read_bytes()) != source['sha256']:
             raise ValueError('A previous collector snapshot changed')
         paths.append(path)
-    source_policy = run.get('source_policy')
     if source_policy not in (None, 'authenticated-watch-radio-only-v1'):
         raise ValueError('A previous run uses an unsupported recommendation source policy')
     if source_policy is None:
@@ -668,6 +720,8 @@ def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
     if evidence_info is not None:
         normalized_run['seed_manifest']['seed_video_evidence'] = {
             'path': str(evidence_path), 'sha256': evidence_info['sha256']}
+    if 'unresolved_seed_dispositions' in run:
+        normalized_run['unresolved_seed_dispositions'] = unresolved_dispositions
     if run.get('resulting_state_sha256'):
         normalized_run['resulting_state_sha256'] = run['resulting_state_sha256']
     return incoming_roots, normalized_run
@@ -855,6 +909,216 @@ def _validate_collector_seed_video_binding(seed, selected_hints, snapshot_paths,
     return hint
 
 
+def _unresolved_seed_disposition(seed, selected_hints, *, source_policy,
+                                 collector_summary, collector_summary_path,
+                                 seed_manifest, seed_manifest_path,
+                                 seed_video_evidence_path, snapshot_paths,
+                                 library_hash, identity_hash,
+                                 expected_source_paths=None):
+    """Return a typed receipt for a genuinely unresolved, uncollected seed.
+
+    This is deliberately narrower than a missing hint. Only an authenticated
+    summary result marked search_unresolved, tied to the exact current intent,
+    seed plan, manifest, evidence sidecar, and source policy can be represented
+    as a zero-graph disposition. Collected/malformed/missing-source cases still
+    fall through to the ordinary strict hint/proof requirement and fail.
+    """
+    pid = seed.get('persistent_id') if isinstance(seed, dict) else None
+    if (not isinstance(pid, str) or source_policy != 'authenticated-watch-radio-only-v1'
+            or selected_hints.get(pid) is not None):
+        return None
+    results = collector_summary.get('results')
+    rows = [row for row in results if isinstance(row, dict)] if isinstance(results, list) else []
+    result_rows = [row for row in rows if row.get('persistent_id') == pid]
+    if not result_rows or result_rows[0].get('status') != 'search_unresolved':
+        return None
+    if len(result_rows) != 1:
+        raise ValueError('Unresolved collector seed has duplicate summary results')
+    if (set(result_rows[0]) != {'persistent_id', 'status', 'candidate_video_ids',
+                               'title_fallback_attempted'}
+            or seed.get('seed_video_id') is not None or seed.get('seed_video_source') is not None
+            or type(result_rows[0].get('candidate_video_ids')) is not int
+            or result_rows[0]['candidate_video_ids'] != 0
+            or result_rows[0].get('title_fallback_attempted') is not False):
+        raise ValueError('Unresolved collector seed has inconsistent search disposition')
+    if (type(collector_summary.get('schema_version')) is not int
+            or collector_summary.get('schema_version') != 1
+            or collector_summary.get('status') != 'completed'
+            or collector_summary.get('account_authentication_verified') is not True
+            or collector_summary.get('library_sha256') != library_hash
+            or collector_summary.get('collector_collection_mode') != 'radio-only-v1'
+            or type(collector_summary.get('request_budget')) is not int
+            or type(collector_summary.get('http_requests')) is not int
+            or not 0 < collector_summary['http_requests'] <= collector_summary['request_budget']):
+        raise ValueError('Unresolved disposition lacks an authenticated current collector summary')
+
+    manifest_path = Path(seed_manifest_path).resolve()
+    summary_path = Path(collector_summary_path).resolve()
+    batch_dir = manifest_path.parent.parent
+    intent_path = batch_dir / 'intent.json'
+    plan_path = batch_dir / 'seed-plan.json'
+    if summary_path.parent != manifest_path.parent:
+        raise ValueError('Unresolved summary is outside its manifest collector directory')
+    try:
+        summary_bytes = summary_path.read_bytes()
+        manifest_bytes = manifest_path.read_bytes()
+        intent_bytes = intent_path.read_bytes()
+        plan_bytes = plan_path.read_bytes()
+        evidence_path = Path(seed_video_evidence_path).resolve()
+        evidence_bytes = evidence_path.read_bytes()
+    except (OSError, TypeError):
+        raise ValueError('Unresolved seed is missing a current intent, plan, or evidence source') from None
+    if (json.loads(summary_bytes) != collector_summary
+            or json.loads(manifest_bytes) != seed_manifest):
+        raise ValueError('Unresolved summary/manifest bytes differ from the validated documents')
+    intent = json.loads(intent_bytes)
+    plan = json.loads(plan_bytes)
+    manifest_seeds = seed_manifest.get('seeds')
+    if not isinstance(manifest_seeds, list):
+        raise ValueError('Unresolved seed manifest is malformed')
+    manifest_pids = [row.get('persistent_id') for row in manifest_seeds
+                     if isinstance(row, dict)]
+    runner_config = intent.get('runner_config')
+    if not isinstance(runner_config, dict):
+        raise ValueError('Unresolved seed intent lacks its runner configuration')
+    if (len(manifest_pids) != len(manifest_seeds)
+            or len(set(manifest_pids)) != len(manifest_pids)
+            or intent.get('source_policy') != source_policy
+            or intent.get('library_sha256') != library_hash
+            or intent.get('identity_map_sha256') != identity_hash
+            or intent.get('seed_pids') != manifest_pids
+            or intent.get('request_budget') != collector_summary['request_budget']
+            or intent.get('request_budget') > runner_config.get('batch_request_budget', 0)
+            or runner_config.get('source_policy') != source_policy
+            or runner_config.get('collector_collection_mode') != 'radio-only-v1'
+            or type(intent.get('runner_config_sha256')) is not str
+            or sha(json.dumps(runner_config, ensure_ascii=False,
+                              sort_keys=True, separators=(',', ':')).encode('utf-8'))
+               != intent.get('runner_config_sha256')):
+        raise ValueError('Unresolved seed intent does not bind the current collector batch')
+    expected_source_inputs = []
+    for name in ('track_snapshot', 'identity_map', 'baseline_state',
+                 'baseline_graph_export', 'rebase_report',
+                 'external_seed_video_evidence', 'prior_attempt_ledger'):
+        ref = runner_config.get(name)
+        if ref is None and name in ('external_seed_video_evidence', 'prior_attempt_ledger'):
+            continue
+        if (not isinstance(ref, dict) or not isinstance(ref.get('path'), str)
+                or not isinstance(ref.get('sha256'), str)):
+            raise ValueError('Unresolved intent has malformed configured source: ' + name)
+        source_path = Path(ref['path']).resolve()
+        try:
+            source_bytes = source_path.read_bytes()
+        except OSError:
+            raise ValueError('Unresolved intent source is unreadable: ' + name) from None
+        if sha(source_bytes) != ref['sha256']:
+            raise ValueError('Unresolved intent source hash is invalid: ' + name)
+        expected_source_inputs.append({'path': str(source_path), 'sha256': ref['sha256']})
+    if intent.get('source_inputs') != expected_source_inputs:
+        raise ValueError('Unresolved intent source receipt list differs from its configuration')
+    summary_pids = [row.get('persistent_id') for row in rows]
+    if summary_pids != manifest_pids:
+        raise ValueError('Unresolved summary results differ from the exact manifest seed order')
+    plan_receipt = intent.get('seed_plan')
+    evidence_receipt = intent.get('seed_video_evidence')
+    if (not isinstance(plan_receipt, dict)
+            or Path(plan_receipt.get('path', '')).resolve() != plan_path.resolve()
+            or plan_receipt.get('sha256') != sha(plan_bytes)
+            or seed_manifest.get('seed_plan_sha256') != plan_receipt.get('sha256')
+            or not isinstance(evidence_receipt, dict)
+            or Path(evidence_receipt.get('path', '')).resolve() != evidence_path
+            or evidence_receipt.get('sha256') != sha(evidence_bytes)
+            or seed_manifest.get('seed_video_evidence_sha256') != evidence_receipt.get('sha256')
+            or plan.get('source_library_sha256') != library_hash
+            or [row.get('persistent_id') for row in plan.get('seeds', [])] != manifest_pids):
+        raise ValueError('Unresolved seed plan/evidence receipts differ from intent and manifest')
+    radio_receipt = intent.get('current_radio_evidence')
+    if (not isinstance(radio_receipt, dict)
+            or not isinstance(radio_receipt.get('path'), str)
+            or not isinstance(radio_receipt.get('sha256'), str)):
+        raise ValueError('Unresolved intent lacks current-radio evidence receipt')
+    radio_path = Path(radio_receipt['path']).resolve()
+    try:
+        radio_bytes = radio_path.read_bytes()
+    except OSError:
+        raise ValueError('Unresolved current-radio evidence is unreadable') from None
+    if sha(radio_bytes) != radio_receipt['sha256']:
+        raise ValueError('Unresolved current-radio evidence receipt changed')
+    sidecar = json.loads(evidence_bytes)
+    sidecar_radio = sidecar.get('current_radio_source')
+    if (radio_path != (batch_dir / 'current-radio-evidence.json').resolve()
+            or not isinstance(sidecar_radio, dict)
+            or not isinstance(sidecar_radio.get('path'), str)
+            or not isinstance(sidecar_radio.get('sha256'), str)
+            or Path(sidecar_radio['path']).resolve() != radio_path
+            or sidecar_radio.get('sha256') != radio_receipt['sha256']):
+        raise ValueError('Unresolved radio evidence differs from the seed selector sidecar source')
+    configured_sources = runner_config
+    for name in ('track_snapshot', 'identity_map'):
+        expected = (expected_source_paths or {}).get(name)
+        ref = configured_sources.get(name)
+        if (not isinstance(ref, dict) or not isinstance(ref.get('path'), str)
+                or not isinstance(ref.get('sha256'), str)):
+            raise ValueError('Unresolved intent lacks configured source receipt: ' + name)
+        path = Path(ref['path']).resolve()
+        if (expected is not None and path != Path(expected).resolve()):
+            raise ValueError('Unresolved intent source path differs from this merge: ' + name)
+        if not path.is_file() or sha(path.read_bytes()) != ref['sha256']:
+            raise ValueError('Unresolved intent source hash is invalid: ' + name)
+        if name == 'identity_map' and ref['sha256'] != identity_hash:
+            raise ValueError('Unresolved intent uses a different identity map')
+        if name == 'track_snapshot':
+            snapshot_doc = json.loads(path.read_bytes())
+            if snapshot_doc.get('source_sha256') != library_hash:
+                raise ValueError('Unresolved intent uses a different track snapshot')
+
+    if intent.get('batch') != _batch_number_from_path(batch_dir):
+        raise ValueError('Unresolved intent batch number differs from its directory')
+
+    collector_dir = manifest_path.parent
+    radio_dir = batch_dir / 'radio-only-source'
+    absent_paths = [collector_dir / (pid + '.json'),
+                    radio_dir / (pid + '.snapshot.json'),
+                    radio_dir / (pid + '.proof.json')]
+    for path in absent_paths:
+        if path.exists():
+            raise ValueError('Unresolved seed unexpectedly has a snapshot or proof source')
+    for snapshot_path in snapshot_paths:
+        try:
+            snapshot = json.loads(Path(snapshot_path).read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError('Current radio snapshot is unreadable') from None
+        if (isinstance(snapshot.get('local_seed'), dict)
+                and snapshot['local_seed'].get('persistent_id') == pid):
+            raise ValueError('Unresolved seed unexpectedly has a supplied radio snapshot')
+
+    digest = lambda path, data: {'path': str(path.resolve()), 'sha256': sha(data)}
+    return {
+        'schema_version': 1,
+        'producer': 'opengenius-authenticated-search-unresolved-seed-v1',
+        'persistent_id': pid,
+        'status': 'search_unresolved',
+        'candidate_video_ids': 0,
+        'title_fallback_attempted': False,
+        'source_policy': source_policy,
+        'collector_summary': digest(summary_path, summary_bytes),
+        'batch_intent': digest(intent_path, intent_bytes),
+        'seed_manifest': digest(manifest_path, manifest_bytes),
+        'seed_plan': digest(plan_path, plan_bytes),
+        'seed_video_evidence': digest(evidence_path, evidence_bytes),
+        'current_radio_evidence': digest(radio_path, radio_bytes),
+        'absent_snapshot_paths': [
+            {'path': str(path.resolve()), 'exists': False} for path in absent_paths],
+    }
+
+
+def _batch_number_from_path(batch_dir):
+    match = re.fullmatch(r'batch-(\d{4})', Path(batch_dir).name)
+    if not match:
+        raise ValueError('Unresolved seed intent is outside a numbered batch directory')
+    return int(match.group(1))
+
+
 def _replay_previous_growth(previous_dir, baseline_state, baseline_roots,
                             baseline_provenance, matcher, library_hash, identity_hash):
     previous_dir = Path(previous_dir).resolve()
@@ -996,6 +1260,9 @@ def _merge_radio_growth_with_radio_proof_cache(*, track_snapshot, identity_map_p
             evidence, evidence_path,
             [{'persistent_id': pid} for pid in manifest_pids],
             tracks, matcher, library_hash, identity_hash)
+        collector_path = Path(collector_summary_path).resolve()
+        collector = json.loads(collector_path.read_bytes())
+        unresolved_seed_dispositions = []
         for seed in seed_manifest['seeds']:
             batch_dir = seed_manifest_path.parent.parent
             expected_receipt_paths = {
@@ -1009,11 +1276,27 @@ def _merge_radio_growth_with_radio_proof_cache(*, track_snapshot, identity_map_p
                 'seed_plan': batch_dir / 'seed-plan.json',
                 'seed_video_evidence': evidence_path,
             }
+            disposition = _unresolved_seed_disposition(
+                seed, selected_hints, source_policy=source_policy,
+                collector_summary=collector,
+                collector_summary_path=collector_path,
+                seed_manifest=seed_manifest,
+                seed_manifest_path=seed_manifest_path,
+                seed_video_evidence_path=evidence_path,
+                snapshot_paths=snapshot_paths,
+                library_hash=library_hash, identity_hash=identity_hash,
+                expected_source_paths={'track_snapshot': Path(track_snapshot),
+                                      'identity_map': Path(identity_map_path)})
+            if disposition is not None:
+                unresolved_seed_dispositions.append(disposition)
+                continue
             _validate_collector_seed_video_binding(
                 seed, selected_hints, snapshot_paths, source_policy,
                 library_hash, identity_hash, expected_receipt_paths)
     elif seed_manifest.get('seed_video_evidence_sha256') is not None:
         raise ValueError('Collector used saved-video evidence but its sidecar was not supplied')
+    else:
+        unresolved_seed_dispositions = []
     graph_doc, report, state, rebase_provenance = _verify_rebase_receipt(
         baseline_graph_export_path, rebase_report_path, baseline_state_path,
         library_hash, identity_hash)
@@ -1215,6 +1498,8 @@ def _merge_radio_growth_with_radio_proof_cache(*, track_snapshot, identity_map_p
                             'ordered_target_pids': row['ordered_target_pids']}
                            for row in new_roots],
             'resulting_state_sha256': next_state['state_sha256'],
+            **({'unresolved_seed_dispositions': unresolved_seed_dispositions}
+               if unresolved_seed_dispositions else {}),
         }],
         **({'previous_growth_receipt': {'path': str(Path(previous_growth_dir).resolve()),
                                         'accepted_graphs_sha256': prior_growth_receipt}}
@@ -1277,7 +1562,8 @@ def _merge_radio_growth_with_radio_proof_cache(*, track_snapshot, identity_map_p
 
 def merge_radio_growth(*args, **kwargs):
     from radio_snapshot_proof import radio_snapshot_proof_cache_scope
-    with radio_snapshot_proof_cache_scope():
+    from seed_video_evidence import seed_video_selector_cache_scope
+    with radio_snapshot_proof_cache_scope(), seed_video_selector_cache_scope():
         return _merge_radio_growth_with_radio_proof_cache(*args, **kwargs)
 
 

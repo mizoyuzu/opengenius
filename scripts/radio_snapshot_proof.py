@@ -15,6 +15,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import time
 
 from music_identity_map import IdentityMap, load_library, version_signature
 from probe_ytmusic import observe
@@ -34,12 +35,43 @@ _SHA_RE = re.compile(r'[a-f0-9]{64}\Z')
 
 @contextmanager
 def radio_snapshot_proof_cache_scope():
-    """Opt into a bounded cache for one synchronous validation invocation."""
+    """Opt into a bounded cache for one synchronous validation invocation.
+
+    Nested callers share the outer invocation's cache; only its owner resets
+    the ContextVar. The yielded counters are observational diagnostics only.
+    """
+    active = _ACTIVE_VERIFICATION_CACHE.get()
+    if active is not None:
+        active.stats['nested_scope_count'] += 1
+        try:
+            yield active.stats
+        finally:
+            active.stats['nested_scope_count'] -= 1
+        return
     cache = OrderedDict()
+    cache.stats = {
+        'nested_scope_count': 0,
+        'verify_calls': 0,
+        'cache_hits': 0,
+        'cache_misses': 0,
+        'cache_evictions': 0,
+        'full_source_replay_seconds': 0.0,
+        'directory_manifest_seconds': 0.0,
+        'directory_manifest_scans': 0,
+        'cache_hit_rehash_seconds': 0.0,
+        'closure_seal_seconds': 0.0,
+        'closure_entries_sealed': 0,
+        'verified_results': 0,
+        'verified_outgoing_target_count_total': 0,
+        'verified_outgoing_edge_count_total': 0,
+        'scope_wall_seconds': 0.0,
+    }
     token = _ACTIVE_VERIFICATION_CACHE.set(cache)
+    started = time.perf_counter()
     try:
-        yield
+        yield cache.stats
     finally:
+        cache.stats['scope_wall_seconds'] += time.perf_counter() - started
         _ACTIVE_VERIFICATION_CACHE.reset(token)
 
 
@@ -764,17 +796,32 @@ def verify_radio_snapshot_proof(proof_path):
     cache_key = (str(proof_file), _sha(proof_bytes),
                  (proof.get('identity_map') or {}).get('sha256'),
                  proof.get('library_sha256'))
+    if cache is not None:
+        cache.stats['verify_calls'] += 1
     if cache is not None and cache_key in cache:
         cached = cache[cache_key]
+        started = time.perf_counter()
         _rehash_cached_closure(cached['source_closure'])
+        cache.stats['cache_hit_rehash_seconds'] += time.perf_counter() - started
+        cache.stats['cache_hits'] += 1
+        cache.stats['verified_results'] += 1
+        cache.stats['verified_outgoing_target_count_total'] += cached['result']['outgoing_target_count']
+        cache.stats['verified_outgoing_edge_count_total'] += cached['result']['outgoing_edge_count']
         cache.move_to_end(cache_key)
         return deepcopy(cached['result'])
+    if cache is not None:
+        cache.stats['cache_misses'] += 1
     if (type(proof.get('schema_version')) is not int or proof.get('schema_version') != 1
             or proof.get('producer') != PRODUCER
             or proof.get('policy') != POLICY):
         raise ValueError('Unsupported authenticated radio proof schema or policy')
+    started = time.perf_counter()
     directory_state_before = (_replay_scanned_directory_state(proof)
                               if cache is not None else None)
+    if cache is not None:
+        cache.stats['directory_manifest_seconds'] += time.perf_counter() - started
+        cache.stats['directory_manifest_scans'] += 1
+    started = time.perf_counter()
     recomputed = _proof_from_inputs(
         track_snapshot_path=proof.get('track_snapshot', {}).get('path'),
         identity_map_path=proof.get('identity_map', {}).get('path'),
@@ -784,10 +831,16 @@ def verify_radio_snapshot_proof(proof_path):
         batch_intent_path=proof.get('batch_intent', {}).get('path'),
         raw_radio_cache_path=proof.get('raw_radio_cache', {}).get('path'),
         sealed_at_utc=proof.get('sealed_at_utc'))
+    if cache is not None:
+        cache.stats['full_source_replay_seconds'] += time.perf_counter() - started
     if proof != recomputed:
         raise ValueError('Radio-only proof differs from full raw response and identity-map replay')
+    started = time.perf_counter()
     directory_state_after = (_replay_scanned_directory_state(proof)
                              if cache is not None else None)
+    if cache is not None:
+        cache.stats['directory_manifest_seconds'] += time.perf_counter() - started
+        cache.stats['directory_manifest_scans'] += 1
     if directory_state_before != directory_state_after:
         raise ValueError('A cached-search source directory changed during radio proof replay')
     result = {'verified': True, 'proof_path': str(proof_file), 'proof_sha256': _sha(proof_bytes),
@@ -798,7 +851,13 @@ def verify_radio_snapshot_proof(proof_path):
               'collector_snapshot_sha256': proof['collector_snapshot']['sha256'],
               'collector_summary_sha256': proof['collector_summary']['sha256']}
     if cache is not None:
+        cache.stats['verified_results'] += 1
+        cache.stats['verified_outgoing_target_count_total'] += result['outgoing_target_count']
+        cache.stats['verified_outgoing_edge_count_total'] += result['outgoing_edge_count']
+        started = time.perf_counter()
         source_closure = _verified_source_closure(proof)
+        cache.stats['closure_seal_seconds'] += time.perf_counter() - started
+        cache.stats['closure_entries_sealed'] += len(source_closure)
         closure_directory_state = tuple(sorted(
             (path[len('@directory:'):], digest)
             for path, digest in source_closure
@@ -810,6 +869,7 @@ def verify_radio_snapshot_proof(proof_path):
         cache.move_to_end(cache_key)
         if len(cache) > _CACHE_LIMIT:
             cache.popitem(last=False)
+            cache.stats['cache_evictions'] += 1
     return result
 
 

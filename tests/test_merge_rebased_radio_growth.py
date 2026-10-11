@@ -306,6 +306,39 @@ class RebasedRadioGrowthTests(unittest.TestCase):
                 merger._validate_run_receipt(
                     run, self.tracks, self.matcher, LIBRARY_HASH, self.identity_hash)
 
+    def test_legacy_evidence_run_replays_without_modern_batch_intent(self):
+        run, snapshot_input, root_pid, targets = self.run_receipt(PID2, [PID3], 'legacy-intentless')
+        batch_collector = self.root / 'legacy-campaign' / 'batch-0001' / 'collector'
+        batch_collector.mkdir(parents=True)
+        manifest_path = batch_collector / 'seeds.json'
+        evidence_path = batch_collector.parent / 'seed-video-evidence.json'
+        evidence = {'schema_version': 1, 'rows': []}
+        self.write_json(evidence_path, evidence)
+        manifest = json.loads(Path(run['seed_manifest']['path']).read_bytes())
+        manifest['seed_video_evidence_sha256'] = hashlib.sha256(
+            evidence_path.read_bytes()).hexdigest()
+        manifest['seeds'][0].update(seed_video_id='saved-video', seed_video_source='saved-source')
+        self.write_json(manifest_path, manifest)
+        run['seed_manifest'] = {
+            'path': str(manifest_path.resolve()),
+            'sha256': hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            'seed_video_evidence': {
+                'path': str(evidence_path.resolve()),
+                'sha256': hashlib.sha256(evidence_path.read_bytes()).hexdigest()},
+        }
+        graph = {'root_pid': root_pid, 'ordered_target_pids': targets,
+                 'observations': [{}], 'input': snapshot_input}
+        with patch.object(merger, 'select_seed_video_evidence', return_value={
+                PID2: {'video_id': 'saved-video', 'source': 'saved-source'}}), \
+             patch.object(merger, 'collect_graphs', return_value=(
+                 [graph], [], [snapshot_input])), \
+             patch.object(merger, 'merge_graphs', return_value=[{
+                 'root_pid': PID2, 'ordered_target_pids': [PID3]}]):
+            roots, normalized = merger._validate_run_receipt(
+                run, self.tracks, self.matcher, LIBRARY_HASH, self.identity_hash)
+        self.assertEqual(roots, [{'root_pid': PID2, 'ordered_target_pids': [PID3]}])
+        self.assertNotIn('source_policy', normalized)
+
     def test_ambiguous_collected_snapshot_is_receipted_but_not_added_as_graph(self):
         run, snapshot_input, root_pid, targets = self.run_receipt(PID2, [PID3], 'ambiguous')
         graph = {'root_pid': root_pid, 'ordered_target_pids': targets,

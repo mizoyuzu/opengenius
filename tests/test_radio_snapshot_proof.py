@@ -1,5 +1,6 @@
 """Authenticated radio-only source proof rejects unsupported relations and tampering."""
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -22,6 +23,11 @@ from radio_snapshot_proof import (create_radio_snapshot_proof,
                                   verify_radio_snapshot_proof)
 import radio_snapshot_proof as radio_proof
 from radio_source_integration import prepare_radio_only_snapshots
+import expand_genuine_roots as genuine_runner
+from seed_video_evidence import (build_seed_video_evidence,
+                                 select_seed_video_evidence)
+import seed_video_evidence as seed_evidence_module
+import merge_rebased_radio_growth as radio_growth_merge
 
 
 LIBRARY = 'a' * 64
@@ -278,6 +284,167 @@ class RadioSnapshotProofTests(unittest.TestCase):
         self.assertEqual(replay.call_count, 1)
         self.assertTrue(second['verified'])
         self.assertEqual(second['persistent_id'], ROOT)
+
+    def test_nested_scopes_share_memo_rehash_tampering_and_restore_outer_context(self):
+        output = self.root / 'nested-proof-cache.json'
+        self.create(output)
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        with load_patch, selector_patch, patch(
+                'radio_snapshot_proof._proof_from_inputs',
+                wraps=__import__('radio_snapshot_proof')._proof_from_inputs) as replay:
+            with radio_snapshot_proof_cache_scope() as outer_stats:
+                self.assertIsNotNone(radio_proof._ACTIVE_VERIFICATION_CACHE.get())
+                self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+                with radio_snapshot_proof_cache_scope() as nested_stats:
+                    self.assertIs(outer_stats, nested_stats)
+                    self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+                    self.assertEqual(nested_stats['cache_hits'], 1)
+                self.cache_path.write_text('{"tampered":true}', encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'cached radio-proof source receipt changed'):
+                    with radio_snapshot_proof_cache_scope():
+                        verify_radio_snapshot_proof(output)
+                self.assertIsNotNone(radio_proof._ACTIVE_VERIFICATION_CACHE.get())
+        self.assertEqual(replay.call_count, 1)
+        self.assertEqual(outer_stats['cache_misses'], 1)
+        self.assertEqual(outer_stats['cache_hits'], 1)
+        self.assertIsNone(radio_proof._ACTIVE_VERIFICATION_CACHE.get())
+
+    def test_top_level_proof_scopes_are_independent_and_exception_safe(self):
+        output = self.root / 'independent-proof-scopes.json'
+        self.create(output)
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        with load_patch, selector_patch, patch(
+                'radio_snapshot_proof._proof_from_inputs',
+                wraps=__import__('radio_snapshot_proof')._proof_from_inputs) as replay:
+            for _ in range(2):
+                with radio_snapshot_proof_cache_scope() as stats:
+                    self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+                    self.assertEqual(stats['cache_misses'], 1)
+                    self.assertEqual(stats['cache_hits'], 0)
+            with self.assertRaisesRegex(RuntimeError, 'test cleanup'):
+                with radio_snapshot_proof_cache_scope():
+                    raise RuntimeError('test cleanup')
+            self.assertIsNone(radio_proof._ACTIVE_VERIFICATION_CACHE.get())
+        self.assertEqual(replay.call_count, 2)
+
+    def test_merge_wrapper_reuses_selector_index_across_distinct_proofs(self):
+        evidence = build_seed_video_evidence(
+            [self.snapshot_path], self.matcher, LIBRARY, self.map_hash)
+        self.seed_evidence_path.write_text(json.dumps(evidence, ensure_ascii=False),
+                                           encoding='utf-8')
+        manifest = json.loads(self.manifest_path.read_text(encoding='utf-8'))
+        manifest['seed_video_evidence_sha256'] = self.digest(self.seed_evidence_path)
+        self.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False),
+                                      encoding='utf-8')
+        intent = json.loads(self.intent_path.read_text(encoding='utf-8'))
+        intent['seed_video_evidence']['sha256'] = self.digest(self.seed_evidence_path)
+        self.intent_path.write_text(json.dumps(intent, ensure_ascii=False),
+                                    encoding='utf-8')
+
+        proof_paths = [self.root / 'merge-wrapper-proof-one.json',
+                       self.root / 'merge-wrapper-proof-two.json']
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)):
+            for path, sealed_at in zip(
+                    proof_paths, ('2026-10-10T12:10:00+00:00',
+                                  '2026-10-10T12:11:00+00:00')):
+                create_radio_snapshot_proof(
+                    track_snapshot_path=self.track_path,
+                    identity_map_path=self.identity_path,
+                    snapshot_path=self.snapshot_path,
+                    collector_summary_path=self.summary_path,
+                    collector_seed_manifest_path=self.manifest_path,
+                    batch_intent_path=self.intent_path,
+                    raw_radio_cache_path=self.cache_path,
+                    output_path=path, sealed_at_utc=sealed_at)
+
+        original_scope = seed_evidence_module.seed_video_selector_cache_scope
+        captured_stats = []
+
+        @contextmanager
+        def tracked_scope():
+            with original_scope() as stats:
+                captured_stats.append(stats)
+                yield stats
+
+        def validate_two_proofs(*args, **kwargs):
+            return [verify_radio_snapshot_proof(path)['verified']
+                    for path in proof_paths]
+
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch.object(seed_evidence_module,
+                             'seed_video_selector_cache_scope', tracked_scope), \
+                patch.object(radio_growth_merge,
+                             '_merge_radio_growth_with_radio_proof_cache',
+                             side_effect=validate_two_proofs):
+            self.assertEqual(radio_growth_merge.merge_radio_growth(), [True, True])
+        self.assertEqual(len(captured_stats), 1)
+        self.assertEqual(captured_stats[0]['full_replays'], 1)
+        self.assertEqual(captured_stats[0]['hits'], 1)
+        self.assertIsNone(seed_evidence_module._ACTIVE_SELECTOR_INDEX.get())
+        self.assertIsNone(radio_proof._ACTIVE_VERIFICATION_CACHE.get())
+
+    def test_runner_rejects_diagnostics_nested_in_campaign_output_before_loading(self):
+        output = self.root / 'campaign-output'
+        diagnostics_path = output / 'diagnostics.json'
+        args = type('RunnerArgs', (), {
+            'output': output,
+            'proof_cache_diagnostics': diagnostics_path,
+        })()
+        with patch('expand_genuine_roots.load_library') as load:
+            with self.assertRaisesRegex(genuine_runner.RecoveryUnsafe, 'outside campaign output'):
+                genuine_runner._run_with_radio_proof_cache(args)
+        load.assert_not_called()
+        self.assertFalse(output.exists())
+
+    def test_runner_optional_diagnostics_capture_nested_verification_without_paths(self):
+        output = self.root / 'runner-diagnostics-proof.json'
+        proof = self.create(output)
+        diagnostics_path = self.root / 'proof-cache-diagnostics.json'
+        selector_document = build_seed_video_evidence(
+            [self.snapshot_path], self.matcher, LIBRARY, self.map_hash)
+        selector_document_path = self.write('selector-hints.json', selector_document)
+        args = type('RunnerArgs', (), {
+            'proof_cache_diagnostics': diagnostics_path,
+            'source_policy': 'authenticated-watch-radio-only-v1',
+        })()
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+
+        def nested_runner(_args):
+            with radio_snapshot_proof_cache_scope():
+                self.assertEqual(verify_radio_snapshot_proof(output)['persistent_id'], ROOT)
+                with radio_snapshot_proof_cache_scope():
+                    self.assertEqual(verify_radio_snapshot_proof(output)['persistent_id'], ROOT)
+            self.assertEqual(genuine_runner.select_seed_video_evidence(
+                selector_document, selector_document_path, [], self.tracks,
+                self.matcher, LIBRARY, self.map_hash), {})
+            self.assertEqual(genuine_runner.select_seed_video_evidence(
+                selector_document, selector_document_path,
+                [{'persistent_id': ROOT}], self.tracks,
+                self.matcher, LIBRARY, self.map_hash)[ROOT]['video_id'],
+                self.arguments['videoId'])
+            return {'status': 'paused_at_checkpoint'}
+
+        with load_patch, selector_patch, patch(
+                'expand_genuine_roots._run_with_radio_proof_cache',
+                side_effect=nested_runner):
+            result = genuine_runner.run(args)
+        document = json.loads(diagnostics_path.read_text(encoding='utf-8'))
+        self.assertEqual(result['status'], 'paused_at_checkpoint')
+        self.assertEqual(document['producer'], 'opengenius-radio-proof-cache-metrics-v1')
+        self.assertEqual(document['source_policy'], 'authenticated-watch-radio-only-v1')
+        self.assertEqual(document['metrics']['verify_calls'], 2)
+        self.assertEqual(document['metrics']['cache_misses'], 1)
+        self.assertEqual(document['metrics']['cache_hits'], 1)
+        self.assertEqual(document['metrics']['verified_results'], 2)
+        self.assertEqual(document['metrics']['verified_outgoing_target_count_total'],
+                         2 * len(proof['outgoing_target_pids']))
+        self.assertEqual(document['selector_metrics']['full_replays'], 1)
+        self.assertEqual(document['selector_metrics']['hits'], 1)
+        self.assertEqual(document['selector_metrics']['calls'], 2)
+        self.assertNotIn(str(self.root), diagnostics_path.read_text(encoding='utf-8'))
+        self.assertNotIn('auth_path', diagnostics_path.read_text(encoding='utf-8').lower())
 
     def _assert_cached_source_change_rejects(self, source_name, *, remove=False,
                                              add_transitive_source=False):

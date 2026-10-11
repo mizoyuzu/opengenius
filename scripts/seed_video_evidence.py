@@ -4,10 +4,19 @@ The sidecar supports seed selection only. It records no recommendation edges
 and never upgrades a metadata candidate to a verified recording identity.
 """
 import argparse
+import builtins
+from collections import OrderedDict
+from contextlib import contextmanager
+from contextvars import ContextVar
+import copy
 import hashlib
+import io
+import inspect
 import json
+import os
 from pathlib import Path
 import re
+import threading
 
 from evaluate_ytmusic_batch import validate_observations
 from music_identity_map import IdentityMap, load_library, normalize, version_signature
@@ -28,6 +37,21 @@ ALBUM_ID_RE = re.compile(r'MPRE[A-Za-z0-9_-]+\Z')
 CATALOG_SAFE_KEYS = {'videoId', 'title', 'artists', 'name', 'id', 'album', 'length',
                      'duration_seconds', 'videoType', 'related', 'tracks', 'contents'}
 _TYPED_TRANSITION_PROOF_CACHE = {}
+
+# Private-prototype selector cache. It is deliberately separate from the
+# typed-transition cache: this memo stores a full selector result only inside
+# an explicit synchronous invocation and revalidates its observed filesystem
+# dependency closure on every hit.
+_ACTIVE_SELECTOR_INDEX = ContextVar('seed_video_selector_index', default=None)
+_ACTIVE_SELECTOR_TRACE = ContextVar('seed_video_selector_trace', default=None)
+_SELECTOR_IO_LOCK = threading.RLock()
+_SELECTOR_CACHE_LIMIT = 4
+_PATH_METHODS_ORIGINAL = {}
+_IO_METHODS_ORIGINAL = {}
+_KNOWN_PATH_READ_DEPTH = ContextVar('known_selector_path_read_depth', default=0)
+_KNOWN_PATH_LIST_DEPTH = ContextVar('known_selector_path_list_depth', default=0)
+_KNOWN_PATH_STATE_DEPTH = ContextVar('known_selector_path_state_depth', default=0)
+_KNOWN_PATH_RESOLVE_DEPTH = ContextVar('known_selector_path_resolve_depth', default=0)
 
 
 def _typed_transition_verification_matches(recorded, verified):
@@ -50,6 +74,432 @@ def _typed_transition_verification_matches(recorded, verified):
 
 def _sha(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def _canonical_sha(value):
+    return _sha(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                           separators=(',', ':')).encode('utf-8'))
+
+
+def _selector_context_digest(document, evidence_path, tracks, matcher,
+                             library_hash, identity_map_sha256):
+    """Return an exact cache context, or None when it cannot be serialized."""
+    if type(matcher) is not IdentityMap:
+        return None
+    try:
+        matcher_context = {
+            'type': type(matcher).__qualname__,
+            'artist_names': matcher.artist_names,
+            'credit_sets': sorted((list(key), sorted(value))
+                                  for key, value in matcher.credit_sets.items()),
+            'album_title_aliases': matcher.album_title_aliases,
+            'artist_credit_aliases': sorted(
+                (list(key), value)
+                for key, value in matcher.artist_credit_aliases.items()),
+            'titles': matcher.titles,
+            'proposed_titles': matcher.proposed_titles,
+            'matcher_tracks': matcher.tracks,
+            'active_title_indices': {key: sorted(value)
+                                     for key, value in matcher._active_title_indices.items()},
+            'preview_title_indices': {key: sorted(value)
+                                     for key, value in matcher._preview_title_indices.items()},
+        }
+        # Reading the top-level document receipt here makes the serialized
+        # in-memory document and the source file independently part of context.
+        document_path = Path(evidence_path).resolve()
+        document_file_sha = _sha(document_path.read_bytes())
+        return (
+            str(document_path), document_file_sha,
+            _canonical_sha(document), _canonical_sha(tracks),
+            _canonical_sha(matcher_context), library_hash, identity_map_sha256,
+        )
+    except Exception:
+        return None
+
+
+def _install_selector_io_trace():
+    """Temporarily trace filesystem dependencies of a full selector replay."""
+    if _PATH_METHODS_ORIGINAL:
+        return
+    names = ('read_bytes', 'read_text', 'exists', 'is_file', 'is_dir', 'is_symlink',
+             'glob', 'rglob', 'iterdir', 'resolve', 'open')
+    for name in names:
+        _PATH_METHODS_ORIGINAL[name] = getattr(Path, name)
+    _IO_METHODS_ORIGINAL.update({
+        'builtins.open': builtins.open,
+        'io.open': __import__('io').open,
+        'os.scandir': os.scandir,
+        'os.listdir': os.listdir,
+        'os.stat': os.stat,
+        'os.lstat': os.lstat,
+        'os.open': os.open,
+        'os.read': os.read,
+        'os.fstat': os.fstat,
+        'os.path.exists': os.path.exists,
+        'os.path.lexists': os.path.lexists,
+        'os.path.isfile': os.path.isfile,
+        'os.path.isdir': os.path.isdir,
+        'os.path.realpath': os.path.realpath,
+    })
+
+    def record_file(path, digest):
+        trace = _ACTIVE_SELECTOR_TRACE.get()
+        if trace is None:
+            return
+        resolved_path = _PATH_METHODS_ORIGINAL['resolve'](path)
+        resolved = str(resolved_path)
+        record_observation(trace, 'resolutions', str(path), resolved)
+        old = trace['files'].setdefault(resolved, digest)
+        if old != digest:
+            trace['unstable'] = True
+
+    def record_observation(trace, collection, key, value):
+        old = trace[collection].setdefault(key, value)
+        if old != value:
+            trace['unstable'] = True
+
+    def resolved_before_after(path, operation):
+        trace = _ACTIVE_SELECTOR_TRACE.get()
+        before = _PATH_METHODS_ORIGINAL['resolve'](path)
+        if trace is not None:
+            record_observation(trace, 'resolutions', str(path), str(before))
+        result = operation()
+        after = _PATH_METHODS_ORIGINAL['resolve'](path)
+        if trace is not None:
+            record_observation(trace, 'resolutions', str(path), str(after))
+            if before != after:
+                trace['unstable'] = True
+        return result
+
+    def read_bytes(path):
+        if _ACTIVE_SELECTOR_TRACE.get() is None:
+            return _PATH_METHODS_ORIGINAL['read_bytes'](path)
+        token = _KNOWN_PATH_READ_DEPTH.set(_KNOWN_PATH_READ_DEPTH.get() + 1)
+        try:
+            data = resolved_before_after(
+                path, lambda: _PATH_METHODS_ORIGINAL['read_bytes'](path))
+        finally:
+            _KNOWN_PATH_READ_DEPTH.reset(token)
+        record_file(path, _sha(data))
+        return data
+
+    def read_text(path, *args, **kwargs):
+        if _ACTIVE_SELECTOR_TRACE.get() is None:
+            return _PATH_METHODS_ORIGINAL['read_text'](path, *args, **kwargs)
+        token = _KNOWN_PATH_READ_DEPTH.set(_KNOWN_PATH_READ_DEPTH.get() + 1)
+        try:
+            resolved_before = _PATH_METHODS_ORIGINAL['resolve'](path)
+            trace = _ACTIVE_SELECTOR_TRACE.get()
+            if trace is not None:
+                record_observation(trace, 'resolutions', str(path), str(resolved_before))
+            before = _PATH_METHODS_ORIGINAL['read_bytes'](path)
+            result = _PATH_METHODS_ORIGINAL['read_text'](path, *args, **kwargs)
+            after = _PATH_METHODS_ORIGINAL['read_bytes'](path)
+            resolved_after = _PATH_METHODS_ORIGINAL['resolve'](path)
+        finally:
+            _KNOWN_PATH_READ_DEPTH.reset(token)
+        if before != after or resolved_before != resolved_after:
+            trace = _ACTIVE_SELECTOR_TRACE.get()
+            if trace is not None:
+                trace['unstable'] = True
+        if trace is not None:
+            record_observation(trace, 'resolutions', str(path), str(resolved_after))
+        encoding = kwargs.get('encoding', args[0] if len(args) > 0 else None)
+        errors = kwargs.get('errors', args[1] if len(args) > 1 else None)
+        newline = kwargs.get('newline', args[2] if len(args) > 2 else None)
+        try:
+            consumed_equivalent = io.TextIOWrapper(
+                io.BytesIO(before), encoding=encoding, errors=errors,
+                newline=newline).read()
+            if consumed_equivalent != result:
+                trace = _ACTIVE_SELECTOR_TRACE.get()
+                if trace is not None:
+                    trace['unstable'] = True
+        except (LookupError, UnicodeError, ValueError):
+            trace = _ACTIVE_SELECTOR_TRACE.get()
+            if trace is not None:
+                trace['unstable'] = True
+        record_file(path, _sha(after))
+        return result
+
+    def record_path_state(path, method, result, resolved):
+        trace = _ACTIVE_SELECTOR_TRACE.get()
+        if trace is None:
+            return
+        record_observation(trace, 'resolutions', str(path), str(resolved))
+        record_observation(trace, 'states', (str(resolved), method), bool(result))
+
+    def wrap_state(name):
+        original = _PATH_METHODS_ORIGINAL[name]
+        def checked(path, *args, **kwargs):
+            before = _PATH_METHODS_ORIGINAL['resolve'](path)
+            trace = _ACTIVE_SELECTOR_TRACE.get()
+            if trace is not None:
+                record_observation(trace, 'resolutions', str(path), str(before))
+            token = _KNOWN_PATH_STATE_DEPTH.set(_KNOWN_PATH_STATE_DEPTH.get() + 1)
+            try:
+                result = original(path, *args, **kwargs)
+            finally:
+                _KNOWN_PATH_STATE_DEPTH.reset(token)
+            after = _PATH_METHODS_ORIGINAL['resolve'](path)
+            if trace is not None and before != after:
+                trace['unstable'] = True
+            record_path_state(path, name, result, before)
+            if trace is not None:
+                record_observation(trace, 'resolutions', str(path), str(after))
+            return result
+        return checked
+
+    def resolve(path, *args, **kwargs):
+        token = _KNOWN_PATH_RESOLVE_DEPTH.set(_KNOWN_PATH_RESOLVE_DEPTH.get() + 1)
+        try:
+            result = _PATH_METHODS_ORIGINAL['resolve'](path, *args, **kwargs)
+        finally:
+            _KNOWN_PATH_RESOLVE_DEPTH.reset(token)
+        trace = _ACTIVE_SELECTOR_TRACE.get()
+        if trace is not None:
+            record_observation(trace, 'resolutions', str(path), str(result))
+        return result
+
+    def wrap_listing(name):
+        original = _PATH_METHODS_ORIGINAL[name]
+        signature = inspect.signature(original)
+
+        def listed(path, *args, **kwargs):
+            bound = signature.bind(path, *args, **kwargs)
+            bound.apply_defaults()
+            pattern = bound.arguments.get('pattern')
+            options = tuple(sorted(
+                (key, value) for key, value in bound.arguments.items()
+                if key not in ('self', 'pattern')))
+            trace = _ACTIVE_SELECTOR_TRACE.get()
+            if trace is None:
+                return original(path, *args, **kwargs)
+            try:
+                hash(options)
+            except TypeError:
+                trace['unknown_io'] = True
+                trace.setdefault('unknown_sources', []).append(
+                    ('listing_options', name, str(path)))
+                options = None
+            before = _PATH_METHODS_ORIGINAL['resolve'](path)
+            record_observation(trace, 'resolutions', str(path), str(before))
+            token = _KNOWN_PATH_LIST_DEPTH.set(_KNOWN_PATH_LIST_DEPTH.get() + 1)
+            try:
+                values = list(original(path, *args, **kwargs))
+            finally:
+                _KNOWN_PATH_LIST_DEPTH.reset(token)
+            after = _PATH_METHODS_ORIGINAL['resolve'](path)
+            if before != after:
+                trace['unstable'] = True
+            record_observation(trace, 'resolutions', str(path), str(after))
+            if options is not None:
+                key = (str(before), name,
+                       pattern, options)
+                record_observation(
+                    trace, 'listings', key,
+                    tuple(sorted(str(_PATH_METHODS_ORIGINAL['resolve'](item))
+                                 for item in values)))
+            return iter(values)
+        return listed
+
+    def path_open(path, mode='r', *args, **kwargs):
+        trace = _ACTIVE_SELECTOR_TRACE.get()
+        if (trace is not None and any(flag in mode for flag in ('r', '+'))
+                and _KNOWN_PATH_READ_DEPTH.get() == 0):
+            trace['unknown_io'] = True
+            trace.setdefault('unknown_sources', []).append(('Path.open', str(path), mode, _KNOWN_PATH_READ_DEPTH.get()))
+        return _PATH_METHODS_ORIGINAL['open'](path, mode, *args, **kwargs)
+
+    def wrap_external_open(original):
+        def opened(file, *args, **kwargs):
+            mode = (args[0] if args else kwargs.get('mode', 'r'))
+            trace = _ACTIVE_SELECTOR_TRACE.get()
+            if (trace is not None and isinstance(mode, str)
+                    and any(flag in mode for flag in ('r', '+'))
+                    and _KNOWN_PATH_READ_DEPTH.get() == 0):
+                trace['unknown_io'] = True
+                trace.setdefault('unknown_sources', []).append(('open', str(file), mode, _KNOWN_PATH_READ_DEPTH.get()))
+            return original(file, *args, **kwargs)
+        return opened
+
+    def scandir(path):
+        if (_ACTIVE_SELECTOR_TRACE.get() is not None
+                and _KNOWN_PATH_LIST_DEPTH.get() == 0):
+            _ACTIVE_SELECTOR_TRACE.get()['unknown_io'] = True
+            _ACTIVE_SELECTOR_TRACE.get().setdefault('unknown_sources', []).append(('scandir', str(path)))
+        return _IO_METHODS_ORIGINAL['os.scandir'](path)
+
+    def listdir(path='.'):
+        if (_ACTIVE_SELECTOR_TRACE.get() is not None
+                and _KNOWN_PATH_LIST_DEPTH.get() == 0):
+            _ACTIVE_SELECTOR_TRACE.get()['unknown_io'] = True
+            _ACTIVE_SELECTOR_TRACE.get().setdefault('unknown_sources', []).append(('listdir', str(path)))
+        return _IO_METHODS_ORIGINAL['os.listdir'](path)
+
+    def wrap_os_state(name):
+        original = _IO_METHODS_ORIGINAL[name]
+        def checked(path):
+            try:
+                before = _PATH_METHODS_ORIGINAL['resolve'](Path(path))
+            except (OSError, TypeError, ValueError):
+                before = None
+            trace = _ACTIVE_SELECTOR_TRACE.get()
+            if trace is not None and before is not None:
+                record_observation(trace, 'resolutions', str(path), str(before))
+            token = _KNOWN_PATH_STATE_DEPTH.set(_KNOWN_PATH_STATE_DEPTH.get() + 1)
+            try:
+                result = original(path)
+            finally:
+                _KNOWN_PATH_STATE_DEPTH.reset(token)
+            if trace is not None:
+                try:
+                    after = _PATH_METHODS_ORIGINAL['resolve'](Path(path))
+                except (OSError, TypeError, ValueError):
+                    trace['unknown_io'] = True
+                else:
+                    if before != after:
+                        trace['unstable'] = True
+                    if before is not None:
+                        record_observation(trace, 'resolutions', str(path), str(after))
+                    record_observation(
+                        trace, 'states', (str(before), name.rsplit('.', 1)[1]),
+                        bool(result))
+            return result
+        return checked
+
+    def realpath(path, *args, **kwargs):
+        token = _KNOWN_PATH_RESOLVE_DEPTH.set(_KNOWN_PATH_RESOLVE_DEPTH.get() + 1)
+        try:
+            result = _IO_METHODS_ORIGINAL['os.path.realpath'](path, *args, **kwargs)
+        finally:
+            _KNOWN_PATH_RESOLVE_DEPTH.reset(token)
+        trace = _ACTIVE_SELECTOR_TRACE.get()
+        if trace is not None:
+            record_observation(trace, 'resolutions', str(path), str(result))
+        return result
+
+    def wrap_unknown_os_call(name):
+        original = _IO_METHODS_ORIGINAL[name]
+        def called(*args, **kwargs):
+            trace = _ACTIVE_SELECTOR_TRACE.get()
+            if trace is not None:
+                known = (_KNOWN_PATH_READ_DEPTH.get() > 0
+                         or _KNOWN_PATH_STATE_DEPTH.get() > 0
+                         or _KNOWN_PATH_RESOLVE_DEPTH.get() > 0)
+                if not known:
+                    trace['unknown_io'] = True
+                    trace.setdefault('unknown_sources', []).append((name,))
+            return original(*args, **kwargs)
+        return called
+
+    Path.read_bytes = read_bytes
+    Path.read_text = read_text
+    for name in ('exists', 'is_file', 'is_dir', 'is_symlink'):
+        setattr(Path, name, wrap_state(name))
+    for name in ('glob', 'rglob'):
+        setattr(Path, name, wrap_listing(name))
+    Path.iterdir = wrap_listing('iterdir')
+    Path.resolve = resolve
+    Path.open = path_open
+    builtins.open = wrap_external_open(_IO_METHODS_ORIGINAL['builtins.open'])
+    __import__('io').open = wrap_external_open(_IO_METHODS_ORIGINAL['io.open'])
+    os.scandir = scandir
+    os.listdir = listdir
+    for name in ('os.path.exists', 'os.path.lexists', 'os.path.isfile', 'os.path.isdir'):
+        setattr(os.path, name.rsplit('.', 1)[1], wrap_os_state(name))
+    os.path.realpath = realpath
+    for name in ('os.stat', 'os.lstat', 'os.open', 'os.read', 'os.fstat'):
+        setattr(os, name.rsplit('.', 1)[1], wrap_unknown_os_call(name))
+
+
+def _restore_selector_io_trace():
+    if not _PATH_METHODS_ORIGINAL:
+        return
+    for name, original in _PATH_METHODS_ORIGINAL.items():
+        setattr(Path, name, original)
+    _PATH_METHODS_ORIGINAL.clear()
+    builtins.open = _IO_METHODS_ORIGINAL['builtins.open']
+    __import__('io').open = _IO_METHODS_ORIGINAL['io.open']
+    os.scandir = _IO_METHODS_ORIGINAL['os.scandir']
+    os.listdir = _IO_METHODS_ORIGINAL['os.listdir']
+    for name in ('os.path.exists', 'os.path.lexists', 'os.path.isfile', 'os.path.isdir',
+                 'os.path.realpath'):
+        setattr(os.path, name.rsplit('.', 1)[1], _IO_METHODS_ORIGINAL[name])
+    for name in ('os.stat', 'os.lstat', 'os.open', 'os.read', 'os.fstat'):
+        setattr(os, name.rsplit('.', 1)[1], _IO_METHODS_ORIGINAL[name])
+    _IO_METHODS_ORIGINAL.clear()
+
+
+def _verify_selector_closure(closure):
+    """Rehash every observed file and recheck all state/listing predicates."""
+    originals = _PATH_METHODS_ORIGINAL
+    read_bytes = originals['read_bytes'] if originals else Path.read_bytes
+    token = _ACTIVE_SELECTOR_TRACE.set(None)
+    try:
+        for path, expected in closure['files'].items():
+            try:
+                if _sha(read_bytes(Path(path))) != expected:
+                    return False
+            except OSError:
+                return False
+        for (path, method), expected in closure['states'].items():
+            try:
+                if method in ('exists', 'lexists', 'isfile', 'isdir'):
+                    current = getattr(os.path, method)(path)
+                else:
+                    current = getattr(Path(path), method)()
+                if bool(current) != expected:
+                    return False
+            except OSError:
+                return False
+        for (path, method, pattern, options), expected in closure['listings'].items():
+            try:
+                directory = Path(path)
+                if method == 'iterdir':
+                    values = list(directory.iterdir())
+                else:
+                    values = list(getattr(directory, method)(
+                        pattern, **dict(options)))
+                current = tuple(sorted(str(item.resolve()) for item in values))
+                if current != expected:
+                    return False
+            except OSError:
+                return False
+        for path, expected in closure['resolutions'].items():
+            try:
+                if str(Path(path).resolve()) != expected:
+                    return False
+            except OSError:
+                return False
+        return True
+    finally:
+        _ACTIVE_SELECTOR_TRACE.reset(token)
+
+
+def _selector_closure(trace):
+    return {key: dict(value) if isinstance(value, dict) else value
+            for key, value in trace.items() if key != 'unstable'}
+
+
+@contextmanager
+def seed_video_selector_cache_scope():
+    """Bound selector-index reuse to one synchronous invocation."""
+    active = _ACTIVE_SELECTOR_INDEX.get()
+    if active is not None:
+        active['stats']['nested_scopes'] += 1
+        yield active['stats']
+        return
+    state = {'entries': OrderedDict(), 'building': False,
+             'stats': {'calls': 0, 'hits': 0, 'misses': 0, 'evictions': 0,
+                       'full_replays': 0, 'closure_files': 0,
+                       'closure_directories': 0, 'nested_scopes': 0,
+                       'uncacheable_replays': 0}}
+    token = _ACTIVE_SELECTOR_INDEX.set(state)
+    try:
+        yield state['stats']
+    finally:
+        _ACTIVE_SELECTOR_INDEX.reset(token)
 
 
 def verify_typed_map_transition(transition, old_map_hash, new_map_hash,
@@ -1156,8 +1606,8 @@ def _select_combined_rebound_seed_video_evidence(document, evidence_path, seeds,
     return {pid: selected[pid] for pid in requested if pid in selected}
 
 
-def select_seed_video_evidence(document, evidence_path, seeds, tracks, matcher,
-                               library_hash, identity_map_sha256):
+def _select_seed_video_evidence_uncached(document, evidence_path, seeds, tracks, matcher,
+                                         library_hash, identity_map_sha256):
     """Validate an evidence sidecar and return exact requested seed hints."""
     if isinstance(document, dict) and document.get('producer') == REBOUND_PRODUCER:
         return _select_rebound_seed_video_evidence(
@@ -1266,6 +1716,90 @@ def select_seed_video_evidence(document, evidence_path, seeds, tracks, matcher,
         }
         seen_videos.add(video_id)
     return {pid: selected[pid] for pid in requested if pid in selected}
+
+
+def select_seed_video_evidence(document, evidence_path, seeds, tracks, matcher,
+                               library_hash, identity_map_sha256):
+    """Validate once per invocation context, then filter cached all-PID hints.
+
+    With no explicit scope, behavior is the original uncached selector. A cache
+    miss still performs the complete validator over every evidence row. Cache
+    hits rehash the entire observed filesystem closure before returning.
+    """
+    cache = _ACTIVE_SELECTOR_INDEX.get()
+    if cache is None or cache['building']:
+        return _select_seed_video_evidence_uncached(
+            document, evidence_path, seeds, tracks, matcher, library_hash,
+            identity_map_sha256)
+    cache['stats']['calls'] += 1
+    requested = {seed.get('persistent_id') for seed in seeds}
+    if None in requested:
+        raise ValueError('Requested seed has no persistent ID')
+    context = _selector_context_digest(document, evidence_path, tracks, matcher,
+                                       library_hash, identity_map_sha256)
+    if context is None:
+        return _select_seed_video_evidence_uncached(
+            document, evidence_path, seeds, tracks, matcher, library_hash,
+            identity_map_sha256)
+    cached = cache['entries'].get(context)
+    if cached is not None:
+        if not _verify_selector_closure(cached['closure']):
+            cache['entries'].pop(context, None)
+            raise ValueError('A cached seed-video evidence source changed')
+        cache['entries'].move_to_end(context)
+        cache['stats']['hits'] += 1
+        return {pid: copy.deepcopy(cached['selected'][pid])
+                for pid in requested if pid in cached['selected']}
+
+    cache['stats']['misses'] += 1
+    trace = {'files': {}, 'states': {}, 'listings': {}, 'resolutions': {},
+             'unstable': False, 'unknown_io': False, 'unknown_sources': []}
+    cache['building'] = True
+    with _SELECTOR_IO_LOCK:
+        trace_token = _ACTIVE_SELECTOR_TRACE.set(trace)
+        try:
+            _install_selector_io_trace()
+            # The top-level document is an input even when the caller already
+            # supplied its decoded in-memory value.
+            Path(evidence_path).read_bytes()
+            all_seeds = [{'persistent_id': row.get('persistent_id')}
+                         for row in tracks]
+            all_selected = _select_seed_video_evidence_uncached(
+                document, evidence_path, all_seeds, tracks, matcher,
+                library_hash, identity_map_sha256)
+            after_context = _selector_context_digest(
+                document, evidence_path, tracks, matcher,
+                library_hash, identity_map_sha256)
+            closure = _selector_closure(trace)
+            if trace['unstable'] or after_context != context:
+                raise ValueError('Seed-video evidence sources changed during full validation')
+            # A completed full replay remains authoritative for this call when
+            # it encounters unclassified filesystem plumbing (for example,
+            # temporary verifier scratch files). Such a replay cannot be
+            # memoized because its dependency closure is incomplete, so do not
+            # try to seal/reuse that closure. The next call must replay fully.
+            if (not trace['unknown_io']
+                    and not _verify_selector_closure(closure)):
+                raise ValueError('Seed-video evidence sources changed during full validation')
+        finally:
+            _ACTIVE_SELECTOR_TRACE.reset(trace_token)
+            _restore_selector_io_trace()
+            cache['building'] = False
+    cache['stats']['full_replays'] += 1
+    cache['stats']['closure_files'] += len(closure['files'])
+    cache['stats']['closure_directories'] += len(closure['listings'])
+    if trace['unknown_io']:
+        cache['stats']['uncacheable_replays'] += 1
+        return {pid: copy.deepcopy(all_selected[pid])
+                for pid in requested if pid in all_selected}
+    cache['entries'][context] = {'selected': copy.deepcopy(all_selected),
+                                 'closure': closure}
+    cache['entries'].move_to_end(context)
+    while len(cache['entries']) > _SELECTOR_CACHE_LIMIT:
+        cache['entries'].popitem(last=False)
+        cache['stats']['evictions'] += 1
+    return {pid: copy.deepcopy(all_selected[pid])
+            for pid in requested if pid in all_selected}
 
 
 def main():

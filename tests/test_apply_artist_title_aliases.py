@@ -5,9 +5,12 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from apply_artist_title_aliases import apply_reviewed_title_aliases
+from apply_artist_title_aliases import (apply_reviewed_title_aliases,
+                                        verify_title_alias_transition)
+import apply_artist_title_aliases as title_alias_module
 from music_identity_map import build_map, load_library, normalize, IdentityMap
 
 
@@ -143,6 +146,24 @@ class ApplyArtistTitleAliasTests(unittest.TestCase):
         self.assertEqual(match[0]['artist_credit_match'], 'complete')
         self.assertFalse(result['recording_identity_verified'])
         self.assertEqual(result['recording_edges_added'], 0)
+
+    def test_typed_transition_rebuilds_map_in_memory_without_scratch_files(self):
+        applied = apply_reviewed_title_aliases(
+            track_snapshot=self.snapshot, identity_map_path=self.map_path,
+            proposals_path=self.proposals, review_decisions_path=self.review,
+            output_path=self.out, receipt_path=self.receipt)
+        with patch.object(title_alias_module.tempfile, 'TemporaryDirectory',
+                          side_effect=AssertionError('unexpected verifier scratch IO')):
+            verified = verify_title_alias_transition(
+                track_snapshot=self.snapshot,
+                input_identity_map_path=self.map_path,
+                output_identity_map_path=self.out,
+                proposals_path=self.proposals,
+                review_decisions_path=self.review,
+                receipt_path=self.receipt)
+        self.assertEqual(verified['output_identity_map_sha256'],
+                         applied['output_identity_map_sha256'])
+        self.assertEqual(verified['activated_title_alias_count'], 1)
 
     def test_rejects_ambiguous_forced_pid_even_when_one_title_proposal_exists(self):
         # Duplicate title/credit/duration rows make the forced Japanese-title

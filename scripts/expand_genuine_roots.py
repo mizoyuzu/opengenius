@@ -1276,6 +1276,23 @@ def _invoke(command):
 
 def _run_with_radio_proof_cache(args):
     output = args.output.resolve()
+    diagnostics_path = getattr(args, 'proof_cache_diagnostics', None)
+    if diagnostics_path is not None:
+        diagnostics_path = diagnostics_path.resolve()
+        if (diagnostics_path.exists() or diagnostics_path == output
+                or diagnostics_path.is_relative_to(output)
+                or output.is_relative_to(diagnostics_path)):
+            raise RecoveryUnsafe('Proof-cache diagnostics must be new and outside campaign output')
+        for name in ('track_snapshot', 'identity_map', 'baseline_state',
+                     'baseline_graph_export', 'rebase_report', 'seed_video_evidence',
+                     'prior_attempt_ledger', 'auth'):
+            source = getattr(args, name, None)
+            if source is None:
+                continue
+            source = source.resolve()
+            if (diagnostics_path == source or diagnostics_path.is_relative_to(source)
+                    or source.is_relative_to(diagnostics_path)):
+                raise RecoveryUnsafe('Proof-cache diagnostics overlap a source input')
     tracks, library_hash, _ = load_library(track_snapshot=args.track_snapshot)
     map_bytes = args.identity_map.read_bytes()
     identity_hash = _sha(map_bytes)
@@ -1581,8 +1598,22 @@ def _run_with_radio_proof_cache(args):
 
 def run(*args, **kwargs):
     from radio_snapshot_proof import radio_snapshot_proof_cache_scope
-    with radio_snapshot_proof_cache_scope():
-        return _run_with_radio_proof_cache(*args, **kwargs)
+    from seed_video_evidence import seed_video_selector_cache_scope
+    options = args[0] if args else kwargs.get('args')
+    with radio_snapshot_proof_cache_scope() as metrics, \
+            seed_video_selector_cache_scope() as selector_metrics:
+        result = _run_with_radio_proof_cache(*args, **kwargs)
+    diagnostics_path = getattr(options, 'proof_cache_diagnostics', None)
+    if diagnostics_path is not None:
+        diagnostics = {
+            'schema_version': 1,
+            'producer': 'opengenius-radio-proof-cache-metrics-v1',
+            'source_policy': getattr(options, 'source_policy', None),
+            'metrics': dict(metrics),
+            'selector_metrics': dict(selector_metrics),
+        }
+        _write_new(diagnostics_path.resolve(), diagnostics)
+    return result
 
 
 def main():
@@ -1605,6 +1636,8 @@ def main():
     parser.add_argument('--prior-attempt-ledger', type=Path,
                         help='Hash-verified prior-stage request and attempted-PID ledger')
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--proof-cache-diagnostics', type=Path,
+                        help='Optional new sidecar for source-path-free scoped radio proof cache counters and timings')
     parser.add_argument('--auth', type=Path, default=Path('../browser.json'))
     parser.add_argument('--target-outgoing-roots', type=int, default=300)
     parser.add_argument('--global-request-budget', type=int, default=3000)

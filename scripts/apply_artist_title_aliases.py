@@ -48,13 +48,14 @@ def _duration_seconds(track):
 
 def apply_reviewed_title_aliases(*, track_snapshot, identity_map_path,
                                  proposals_path, review_decisions_path,
-                                 output_path, receipt_path):
+                                 output_path, receipt_path, _write_outputs=True):
     snapshot_path = Path(track_snapshot).resolve()
     map_path, map_bytes, identity_map = _load(identity_map_path)
     proposal_path, proposal_bytes, proposals = _load(proposals_path)
     review_path, review_bytes, review = _load(review_decisions_path)
     output_path, receipt_path = Path(output_path).resolve(), Path(receipt_path).resolve()
-    if output_path.exists() or receipt_path.exists() or output_path == receipt_path:
+    if ((_write_outputs and (output_path.exists() or receipt_path.exists()))
+            or output_path == receipt_path):
         raise FileExistsError('Title map output and receipt must be new, distinct paths')
     if output_path in (snapshot_path, map_path, proposal_path, review_path) or receipt_path in (
             snapshot_path, map_path, proposal_path, review_path):
@@ -198,12 +199,13 @@ def apply_reviewed_title_aliases(*, track_snapshot, identity_map_path,
                 next(index for index, track in enumerate(tracks) if track['persistent_id'] == pid)}:
             raise ValueError('Activated title alias is not uniquely bound to its reviewed PID')
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open('x', encoding='utf-8') as handle:
-        json.dump(result, handle, ensure_ascii=False, indent=2)
-        handle.write('\n')
-    output_hash = _sha(output_path.read_bytes())
+    output_bytes = (json.dumps(result, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
+    output_hash = _sha(output_bytes)
+    if _write_outputs:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open('xb') as handle:
+            handle.write(output_bytes)
     receipt = {'schema_version': 1, 'operation': 'apply_reviewed_exact_title_spelling_aliases',
                'library_sha256': library_hash, 'input_identity_map_path': str(map_path),
                'input_identity_map_sha256': map_hash, 'output_identity_map_path': str(output_path),
@@ -217,9 +219,10 @@ def apply_reviewed_title_aliases(*, track_snapshot, identity_map_path,
                'verified_cached_example_count': resolved_examples,
                'local_title_alias_collisions': 0,
                'recording_identity_verified': False, 'recording_edges_added': 0}
-    with receipt_path.open('x', encoding='utf-8') as handle:
-        json.dump(receipt, handle, ensure_ascii=False, indent=2)
-        handle.write('\n')
+    if _write_outputs:
+        with receipt_path.open('x', encoding='utf-8') as handle:
+            json.dump(receipt, handle, ensure_ascii=False, indent=2)
+            handle.write('\n')
     return receipt
 
 
@@ -231,23 +234,20 @@ def verify_title_alias_transition(*, track_snapshot, input_identity_map_path,
     receipt_file = Path(receipt_path).resolve()
     final_bytes = output_path.read_bytes()
     saved_receipt = json.loads(receipt_file.read_bytes())
-    with tempfile.TemporaryDirectory(prefix='opengenius-title-rebind-') as temporary:
-        temporary = Path(temporary)
-        rebuilt_map = temporary / 'rebuilt-map.json'
-        rebuilt_receipt = temporary / 'rebuilt-receipt.json'
-        receipt = apply_reviewed_title_aliases(
-            track_snapshot=track_snapshot,
-            identity_map_path=input_identity_map_path,
-            proposals_path=proposals_path,
-            review_decisions_path=review_decisions_path,
-            output_path=rebuilt_map, receipt_path=rebuilt_receipt)
-        if _sha(final_bytes) != receipt['output_identity_map_sha256']:
-            raise ValueError('Final identity map is not reproduced by its reviewed title decision')
-        # Output location is incidental; all other receipt fields are required to match.
-        saved_receipt.pop('output_identity_map_path', None)
-        receipt.pop('output_identity_map_path', None)
-        if saved_receipt != receipt:
-            raise ValueError('Saved title application receipt differs from recomputed review')
+    receipt = apply_reviewed_title_aliases(
+        track_snapshot=track_snapshot,
+        identity_map_path=input_identity_map_path,
+        proposals_path=proposals_path,
+        review_decisions_path=review_decisions_path,
+        output_path=output_path, receipt_path=receipt_file,
+        _write_outputs=False)
+    if _sha(final_bytes) != receipt['output_identity_map_sha256']:
+        raise ValueError('Final identity map is not reproduced by its reviewed title decision')
+    # Output location is incidental; all other receipt fields are required to match.
+    saved_receipt.pop('output_identity_map_path', None)
+    receipt.pop('output_identity_map_path', None)
+    if saved_receipt != receipt:
+        raise ValueError('Saved title application receipt differs from recomputed review')
     return saved_receipt
 
 
