@@ -115,6 +115,7 @@ def collect_graphs(paths, matcher, library_hash, source_policy=None,
                 if hashlib.sha256(proof_bytes).hexdigest() != radio_receipt['sha256']:
                     raise InvalidObservation('authenticated_radio_source_proof_changed')
                 proof_result = verify_radio_snapshot_proof(proof_path)
+                proof_doc = json.loads(proof_bytes)
                 expected_snapshot = radio_only_snapshot_from_proof(proof_path)
                 if snapshot != expected_snapshot:
                     raise InvalidObservation('sanitized_radio_snapshot_differs_from_its_proof')
@@ -126,7 +127,19 @@ def collect_graphs(paths, matcher, library_hash, source_policy=None,
                     raise InvalidObservation('authenticated_radio_proof_has_foreign_identity_or_empty_graph')
                 entry['radio_only_source_proof'] = dict(radio_receipt)
             validate_observations(snapshot, library_hash)
-            graph = candidate_graph(snapshot, matcher, library_hash)
+            graph_matcher = matcher
+            if (radio_receipt is not None
+                    and isinstance(proof_doc.get('seed_video_search_binding'), dict)):
+                # The verified proof may establish a unique strict seed from
+                # authenticated search evidence even when ordinary metadata
+                # rematching of the radio seed row has additional loose PIDs.
+                # Reuse that binding only for the proved seed video; target
+                # rows continue through the ordinary strict consumer gates.
+                from radio_snapshot_proof import _search_bound_seed_graph_matcher
+                graph_matcher = _search_bound_seed_graph_matcher(
+                    matcher, snapshot.get('selected_video_id'),
+                    proof_result['persistent_id'])
+            graph = candidate_graph(snapshot, graph_matcher, library_hash)
             graph['input'] = entry.copy()
             graphs.append(graph)
         except InvalidObservation as error:

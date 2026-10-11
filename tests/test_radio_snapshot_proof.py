@@ -688,6 +688,78 @@ class RadioSnapshotProofTests(unittest.TestCase):
                     source_policy='authenticated-watch-radio-only-v1',
                     identity_map_sha256=self.map_hash)
 
+    def test_search_derived_root_binding_reaches_consumer_only_through_proof(self):
+        self.configure_search_derived_seed()
+        # A loose second metadata candidate shares the seed title/credit/time,
+        # but fails the exact album gate. The authenticated search and radio
+        # proof uniquely establish ROOT; ordinary rematching alone is ambiguous.
+        other = {'persistent_id': '0000000000000003', 'title': 'Seed Song',
+                 'artist': 'Seed Artist', 'album': 'Different Album',
+                 'duration_ms': 100000}
+        self.tracks.append(other)
+        self.identity = build_map(self.tracks, LIBRARY)
+        self.identity_path = self.write('search-bound-identity.json', self.identity)
+        self.map_hash = self.digest(self.identity_path)
+        self.matcher = IdentityMap(self.identity, self.tracks, LIBRARY)
+
+        snapshot = json.loads(self.snapshot_path.read_text(encoding='utf-8'))
+        snapshot['identity_map_sha256'] = self.map_hash
+        snapshot['observations'] = observe(
+            self.raw_tracks, 'radio', self.observed_at, self.tracks,
+            self.arguments['videoId'], candidate_matcher=self.matcher.match)
+        self.snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False), encoding='utf-8')
+        summary = json.loads(self.summary_path.read_text(encoding='utf-8'))
+        summary['results'] = [{**collector_result_summary(snapshot), 'status': 'collected'}]
+        self.summary_path.write_text(json.dumps(summary, ensure_ascii=False), encoding='utf-8')
+        evidence = json.loads(self.seed_evidence_path.read_text(encoding='utf-8'))
+        evidence['identity_map_sha256'] = self.map_hash
+        self.seed_evidence_path.write_text(json.dumps(evidence, ensure_ascii=False), encoding='utf-8')
+        manifest = json.loads(self.manifest_path.read_text(encoding='utf-8'))
+        manifest['identity_map_sha256'] = self.map_hash
+        manifest['seed_video_evidence_sha256'] = self.digest(self.seed_evidence_path)
+        self.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding='utf-8')
+        intent = json.loads(self.intent_path.read_text(encoding='utf-8'))
+        intent['identity_map_sha256'] = self.map_hash
+        intent['runner_config']['identity_map'] = {
+            'path': str(self.identity_path.resolve()), 'sha256': self.map_hash}
+        intent['seed_video_evidence']['sha256'] = self.digest(self.seed_evidence_path)
+        self.intent_path.write_text(json.dumps(intent, ensure_ascii=False), encoding='utf-8')
+
+        proof_path = self.root / 'search-bound-proof.json'
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            proof = create_radio_snapshot_proof(
+                track_snapshot_path=self.track_path, identity_map_path=self.identity_path,
+                snapshot_path=self.snapshot_path, collector_summary_path=self.summary_path,
+                collector_seed_manifest_path=self.manifest_path,
+                batch_intent_path=self.intent_path, raw_radio_cache_path=self.cache_path,
+                output_path=proof_path, sealed_at_utc='2026-10-10T12:10:00+00:00')
+            sanitized = radio_only_snapshot_from_proof(proof_path)
+        snapshot_path = self.write('search-bound-radio-only.json', sanitized)
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            graphs, skipped, _ = collect_graphs(
+                [snapshot_path], self.matcher, LIBRARY,
+                source_policy='authenticated-watch-radio-only-v1',
+                identity_map_sha256=self.map_hash)
+        self.assertEqual(skipped, [])
+        self.assertEqual([graph['root_pid'] for graph in graphs], [ROOT])
+        self.assertEqual(graphs[0]['ordered_target_pids'], proof['outgoing_target_pids'])
+
+        unproved = copy.deepcopy(sanitized)
+        unproved.pop('radio_only_source_proof')
+        forged_path = self.write('search-bound-unproved.json', unproved)
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            with self.assertRaisesRegex(ValueError, 'No valid recommendation snapshots'):
+                collect_graphs(
+                    [forged_path], self.matcher, LIBRARY,
+                    source_policy='authenticated-watch-radio-only-v1',
+                    identity_map_sha256=self.map_hash)
+
     def test_new_consumer_policy_rejects_an_ordinary_authenticated_envelope(self):
         path = self.write('ordinary-snapshot.json', self.snapshot())
         with self.assertRaisesRegex(ValueError, 'No valid recommendation snapshots'):
