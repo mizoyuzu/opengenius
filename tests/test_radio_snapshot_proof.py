@@ -14,6 +14,7 @@ from music_identity_map import IdentityMap, build_map
 from probe_ytmusic import observe
 from probe_ytmusic_batch import summary as collector_result_summary
 from evaluate_ytmusic_batch import collect_graphs
+import merge_rebased_radio_growth as radio_growth_merge
 from radio_snapshot_proof import (create_radio_snapshot_proof,
                                   RadioSnapshotIneligible,
                                   radio_only_snapshot_from_proof,
@@ -747,6 +748,69 @@ class RadioSnapshotProofTests(unittest.TestCase):
         self.assertEqual(skipped, [])
         self.assertEqual([graph['root_pid'] for graph in graphs], [ROOT])
         self.assertEqual(graphs[0]['ordered_target_pids'], proof['outgoing_target_pids'])
+
+        seed = json.loads(self.manifest_path.read_text(encoding='utf-8'))['seeds'][0]
+        expected_sources = {
+            'track_snapshot': self.track_path,
+            'identity_map': self.identity_path,
+            'collector_snapshot': self.snapshot_path,
+            'collector_summary': self.summary_path,
+            'collector_seed_manifest': self.manifest_path,
+            'batch_intent': self.intent_path,
+            'seed_plan': self.seed_plan_path,
+            'seed_video_evidence': self.seed_evidence_path,
+        }
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            proved_hint = radio_growth_merge._verified_search_derived_seed_hint(
+                seed, [snapshot_path], LIBRARY, self.map_hash, expected_sources)
+            self.assertEqual(proved_hint, {
+                'video_id': self.arguments['videoId'],
+                'source': 'authenticated_search_seed_proof'})
+            self.assertEqual(
+                radio_growth_merge._validate_collector_seed_video_binding(
+                    seed, {}, [snapshot_path],
+                    'authenticated-watch-radio-only-v1', LIBRARY, self.map_hash,
+                    expected_sources),
+                proved_hint)
+            copied_summary = self.write(
+                'search-bound-foreign-summary.json',
+                json.loads(self.summary_path.read_text(encoding='utf-8')))
+            with self.assertRaisesRegex(ValueError, 'current collector source'):
+                radio_growth_merge._verified_search_derived_seed_hint(
+                    seed, [snapshot_path], LIBRARY, self.map_hash,
+                    {**expected_sources, 'collector_summary': copied_summary})
+            with self.assertRaisesRegex(ValueError, 'strict saved-video evidence'):
+                radio_growth_merge._validate_collector_seed_video_binding(
+                    seed, {}, [snapshot_path], None, LIBRARY, self.map_hash,
+                    expected_sources)
+            self.assertIsNone(radio_growth_merge._verified_search_derived_seed_hint(
+                {**seed, 'seed_video_id': 'wrongvideo1'},
+                [snapshot_path], LIBRARY, self.map_hash, expected_sources))
+            with self.assertRaisesRegex(ValueError, 'strict saved-video evidence'):
+                radio_growth_merge._validate_collector_seed_video_binding(
+                    {**seed, 'seed_video_id': 'wrongvideo1'}, {}, [snapshot_path],
+                    'authenticated-watch-radio-only-v1', LIBRARY, self.map_hash,
+                    expected_sources)
+            self.assertIsNone(radio_growth_merge._verified_search_derived_seed_hint(
+                {**seed, 'persistent_id': TARGET},
+                [snapshot_path], LIBRARY, self.map_hash, expected_sources))
+            with self.assertRaisesRegex(ValueError, 'multiple search-derived'):
+                radio_growth_merge._verified_search_derived_seed_hint(
+                    seed, [snapshot_path, snapshot_path], LIBRARY, self.map_hash,
+                    expected_sources)
+            changed_snapshot = copy.deepcopy(sanitized)
+            changed_snapshot['selected_video_id'] = 'wrongvideo1'
+            changed_path = self.write('search-bound-wrong-video.json', changed_snapshot)
+            with self.assertRaisesRegex(ValueError, 'does not bind'):
+                radio_growth_merge._verified_search_derived_seed_hint(
+                    seed, [changed_path], LIBRARY, self.map_hash, expected_sources)
+            unproved = copy.deepcopy(sanitized)
+            unproved.pop('radio_only_source_proof')
+            unproved_path = self.write('search-bound-no-proof.json', unproved)
+            self.assertIsNone(radio_growth_merge._verified_search_derived_seed_hint(
+                seed, [unproved_path], LIBRARY, self.map_hash, expected_sources))
 
         unproved = copy.deepcopy(sanitized)
         unproved.pop('radio_only_source_proof')

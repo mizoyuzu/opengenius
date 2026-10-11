@@ -737,6 +737,124 @@ def _require_legacy_source_policy(paths):
             raise ValueError('A legacy growth merge snapshot fails its related-required source policy')
 
 
+def _verified_search_derived_seed_hint(seed, snapshot_paths, library_hash,
+                                       identity_hash, expected_receipt_paths):
+    """Resolve one selector-missing seed only through its exact typed proof.
+
+    Search-derived fallback is intentionally narrower than ordinary saved
+    hints: a proof must bind the manifest PID to one authenticated search
+    result and the same selected radio video, and the sanitized snapshot must
+    be exactly reproducible from that proof. The normal graph consumer still
+    validates the proof and all outgoing targets independently.
+    """
+    pid = seed.get('persistent_id') if isinstance(seed, dict) else None
+    if (not isinstance(pid, str) or seed.get('seed_video_id') is not None
+            or seed.get('seed_video_source') is not None):
+        return None
+    required_sources = {'track_snapshot', 'identity_map', 'collector_snapshot',
+                        'collector_summary', 'collector_seed_manifest',
+                        'batch_intent', 'seed_plan', 'seed_video_evidence'}
+    if (not isinstance(expected_receipt_paths, dict)
+            or set(expected_receipt_paths) != required_sources):
+        raise ValueError('Search-derived seed requires complete current collector source receipts')
+    expected_receipts = {}
+    for name, value in expected_receipt_paths.items():
+        path = Path(value).resolve()
+        try:
+            data = path.read_bytes()
+        except OSError:
+            raise ValueError('Current collector source is unreadable: ' + name) from None
+        expected_receipts[name] = {'path': str(path), 'sha256': sha(data)}
+    matches = []
+    for path in snapshot_paths:
+        snapshot_path = Path(path).resolve()
+        try:
+            snapshot_bytes = snapshot_path.read_bytes()
+            snapshot = json.loads(snapshot_bytes)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        local_seed = snapshot.get('local_seed')
+        if not isinstance(local_seed, dict) or local_seed.get('persistent_id') != pid:
+            continue
+        receipt = snapshot.get('radio_only_source_proof')
+        if (not isinstance(receipt, dict) or set(receipt) != {'path', 'sha256'}
+                or not isinstance(receipt.get('path'), str)
+                or not isinstance(receipt.get('sha256'), str)
+                or not re.fullmatch(r'[a-f0-9]{64}', receipt['sha256'])):
+            continue
+        from radio_snapshot_proof import (radio_only_snapshot_from_proof,
+                                          verify_radio_snapshot_proof)
+        proof_path = Path(receipt['path']).resolve()
+        try:
+            proof_bytes = proof_path.read_bytes()
+        except OSError:
+            raise ValueError('Search-derived seed proof is unreadable') from None
+        if sha(proof_bytes) != receipt['sha256']:
+            raise ValueError('Search-derived seed proof receipt changed')
+        try:
+            proof = json.loads(proof_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError('Search-derived seed proof is malformed') from None
+        for name, expected in expected_receipts.items():
+            receipt_source = proof.get(name)
+            if (not isinstance(receipt_source, dict)
+                    or not isinstance(receipt_source.get('path'), str)
+                    or receipt_source.get('sha256') != expected['sha256']
+                    or Path(receipt_source['path']).resolve() != Path(expected['path'])):
+                raise ValueError('Search-derived proof differs from current collector source: ' + name)
+        verified = verify_radio_snapshot_proof(proof_path)
+        selected = proof.get('selected_seed')
+        binding = proof.get('seed_video_search_binding')
+        video_id = selected.get('video_id') if isinstance(selected, dict) else None
+        if (verified.get('verified') is not True
+                or verified.get('persistent_id') != pid
+                or proof.get('library_sha256') != library_hash
+                or proof.get('identity_map', {}).get('sha256') != identity_hash
+                or not isinstance(selected, dict)
+                or selected.get('persistent_id') != pid
+                or local_seed.get('persistent_id') != pid
+                or snapshot.get('selected_video_id') != video_id
+                or not isinstance(binding, dict)
+                or binding.get('kind') != 'authenticated-search-strict-unique-seed-v1'
+                or binding.get('persistent_id') != pid
+                or binding.get('resolver', {}).get('video_id') != video_id
+                or binding.get('strict_unique_video_ids') != [video_id]):
+            raise ValueError('Search-derived seed proof does not bind the manifest PID and radio video')
+        expected_snapshot = radio_only_snapshot_from_proof(proof_path)
+        if snapshot != expected_snapshot:
+            raise ValueError('Search-derived sanitized snapshot differs from its proof')
+        matches.append(video_id)
+    if len(matches) > 1:
+        raise ValueError('Manifest seed has multiple search-derived proof snapshots')
+    return ({'video_id': matches[0], 'source': 'authenticated_search_seed_proof'}
+            if matches else None)
+
+
+def _validate_collector_seed_video_binding(seed, selected_hints, snapshot_paths,
+                                           source_policy, library_hash,
+                                           identity_hash,
+                                           expected_receipt_paths=None):
+    """Require the normal selector hint, or its narrowly typed search proof."""
+    hint = selected_hints.get(seed.get('persistent_id'))
+    used_search_proof = False
+    if hint is None and source_policy == 'authenticated-watch-radio-only-v1':
+        hint = _verified_search_derived_seed_hint(
+            seed, snapshot_paths, library_hash, identity_hash,
+            expected_receipt_paths or {})
+        used_search_proof = hint is not None
+    if hint is None:
+        raise ValueError('Collector seed differs from the strict saved-video evidence')
+    if used_search_proof:
+        if (source_policy != 'authenticated-watch-radio-only-v1'
+                or seed.get('seed_video_id') is not None
+                or seed.get('seed_video_source') is not None):
+            raise ValueError('Collector seed differs from the strict saved-video evidence')
+    elif (hint.get('video_id') != seed.get('seed_video_id')
+          or hint.get('source') != seed.get('seed_video_source')):
+        raise ValueError('Collector seed differs from the strict saved-video evidence')
+    return hint
+
+
 def _replay_previous_growth(previous_dir, baseline_state, baseline_roots,
                             baseline_provenance, matcher, library_hash, identity_hash):
     previous_dir = Path(previous_dir).resolve()
@@ -879,10 +997,21 @@ def _merge_radio_growth_with_radio_proof_cache(*, track_snapshot, identity_map_p
             [{'persistent_id': pid} for pid in manifest_pids],
             tracks, matcher, library_hash, identity_hash)
         for seed in seed_manifest['seeds']:
-            hint = selected_hints.get(seed.get('persistent_id'))
-            if (hint is None or hint.get('video_id') != seed.get('seed_video_id')
-                    or hint.get('source') != seed.get('seed_video_source')):
-                raise ValueError('Collector seed differs from the strict saved-video evidence')
+            batch_dir = seed_manifest_path.parent.parent
+            expected_receipt_paths = {
+                'track_snapshot': Path(track_snapshot),
+                'identity_map': Path(identity_map_path),
+                'collector_snapshot': seed_manifest_path.parent /
+                    (seed['persistent_id'] + '.json'),
+                'collector_summary': Path(collector_summary_path),
+                'collector_seed_manifest': seed_manifest_path,
+                'batch_intent': batch_dir / 'intent.json',
+                'seed_plan': batch_dir / 'seed-plan.json',
+                'seed_video_evidence': evidence_path,
+            }
+            _validate_collector_seed_video_binding(
+                seed, selected_hints, snapshot_paths, source_policy,
+                library_hash, identity_hash, expected_receipt_paths)
     elif seed_manifest.get('seed_video_evidence_sha256') is not None:
         raise ValueError('Collector used saved-video evidence but its sidecar was not supplied')
     graph_doc, report, state, rebase_provenance = _verify_rebase_receipt(
