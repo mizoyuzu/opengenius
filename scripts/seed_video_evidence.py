@@ -45,7 +45,10 @@ _TYPED_TRANSITION_PROOF_CACHE = {}
 _ACTIVE_SELECTOR_INDEX = ContextVar('seed_video_selector_index', default=None)
 _ACTIVE_SELECTOR_TRACE = ContextVar('seed_video_selector_trace', default=None)
 _SELECTOR_IO_LOCK = threading.RLock()
-_SELECTOR_CACHE_LIMIT = 4
+# One campaign can replay up to 140 twenty-seed batches plus the historical
+# ancestry. This remains bounded while avoiding deterministic LRU churn across
+# those distinct immutable sidecars.
+_SELECTOR_CACHE_LIMIT = 256
 _PATH_METHODS_ORIGINAL = {}
 _IO_METHODS_ORIGINAL = {}
 _KNOWN_PATH_READ_DEPTH = ContextVar('known_selector_path_read_depth', default=0)

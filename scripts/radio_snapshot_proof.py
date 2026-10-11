@@ -29,7 +29,10 @@ import seed_video_evidence as _seed_video_evidence
 PRODUCER = 'opengenius-authenticated-radio-snapshot-proof-v1'
 POLICY = 'authenticated-watch-radio-only-v1'
 _ACTIVE_VERIFICATION_CACHE = ContextVar('radio_snapshot_proof_verification_cache', default=None)
-_CACHE_LIMIT = 256
+# A 1000-root campaign can verify hundreds of source receipts in one
+# chronological replay. Keep enough results for that replay while bounding
+# retained closure memory (representative serialized entry: about 194 KiB).
+_CACHE_LIMIT = 1024
 _SHA_RE = re.compile(r'[a-f0-9]{64}\Z')
 
 

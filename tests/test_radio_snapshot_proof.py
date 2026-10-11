@@ -439,6 +439,111 @@ class RadioSnapshotProofTests(unittest.TestCase):
             cache = radio_proof._ACTIVE_VERIFICATION_CACHE.get()
             self.assertFalse(any(key[0] == str(output.resolve()) for key in cache))
 
+    def test_chronological_proof_history_fits_capacity_and_scopes_reset(self):
+        count = 260
+        self.assertGreaterEqual(radio_proof._CACHE_LIMIT, count)
+        proofs = []
+        marker_sha = self.digest(self.cache_path)
+        for index in range(count):
+            path = self.root / f"capacity-proof-{index:03d}.json"
+            proof = {
+                'schema_version': 1, 'producer': radio_proof.PRODUCER,
+                'policy': radio_proof.POLICY, 'selected_seed': {'persistent_id': ROOT},
+                'outgoing_target_pids': [TARGET], 'outgoing_recommendation_edges': [],
+                'raw_radio_cache': {'path': str(self.cache_path.resolve()),
+                                    'sha256': marker_sha},
+                'collector_snapshot': {'path': str(self.snapshot_path.resolve()),
+                                       'sha256': self.digest(self.snapshot_path)},
+                'collector_summary': {'path': str(self.summary_path.resolve()),
+                                      'sha256': self.digest(self.summary_path)},
+                'track_snapshot': {'path': str(path.resolve()), 'sha256': 'a' * 64},
+                'identity_map': {'path': str(self.identity_path.resolve()),
+                                 'sha256': self.map_hash},
+                'collector_seed_manifest': {'path': str(self.manifest_path.resolve()),
+                                            'sha256': self.digest(self.manifest_path)},
+                'batch_intent': {'path': str(self.intent_path.resolve()),
+                                 'sha256': self.digest(self.intent_path)},
+                'seed_plan': {'path': str(self.seed_plan_path.resolve()),
+                              'sha256': self.digest(self.seed_plan_path)},
+                'seed_video_evidence': {'path': str(self.seed_evidence_path.resolve()),
+                                        'sha256': self.digest(self.seed_evidence_path)},
+                'library_sha256': LIBRARY,
+            }
+            path.write_text(json.dumps(proof, ensure_ascii=False), encoding='utf-8')
+            proofs.append(path)
+
+        def replay_from_proof(**kwargs):
+            return json.loads(Path(kwargs['track_snapshot_path']).read_bytes())
+
+        with patch('radio_snapshot_proof._proof_from_inputs', side_effect=replay_from_proof) as replay, \
+                patch('radio_snapshot_proof._replay_scanned_directory_state', return_value=()), \
+                patch('radio_snapshot_proof._verified_source_closure', return_value=((
+                    str(self.cache_path.resolve()), marker_sha),)):
+            with radio_snapshot_proof_cache_scope() as stats:
+                for path in proofs:
+                    self.assertTrue(verify_radio_snapshot_proof(path)['verified'])
+                self.assertEqual(stats['cache_misses'], count)
+                self.assertEqual(stats['cache_evictions'], 0)
+                for path in proofs:
+                    self.assertTrue(verify_radio_snapshot_proof(path)['verified'])
+                self.assertEqual(stats['cache_hits'], count)
+                self.assertEqual(stats['cache_evictions'], 0)
+            self.assertEqual(replay.call_count, count)
+            with radio_snapshot_proof_cache_scope() as fresh_stats:
+                verify_radio_snapshot_proof(proofs[0])
+                self.assertEqual(fresh_stats['cache_misses'], 1)
+                self.assertEqual(fresh_stats['cache_hits'], 0)
+            self.assertEqual(replay.call_count, count + 1)
+
+    def test_proof_cache_still_evicts_at_explicit_temporary_small_bound(self):
+        proofs = []
+        marker_sha = self.digest(self.cache_path)
+        for index in range(3):
+            path = self.root / f"eviction-proof-{index}.json"
+            proof = {
+                'schema_version': 1, 'producer': radio_proof.PRODUCER,
+                'policy': radio_proof.POLICY, 'selected_seed': {'persistent_id': ROOT},
+                'outgoing_target_pids': [TARGET], 'outgoing_recommendation_edges': [],
+                'raw_radio_cache': {'path': str(self.cache_path.resolve()), 'sha256': marker_sha},
+                'collector_snapshot': {'path': str(self.snapshot_path.resolve()),
+                                       'sha256': self.digest(self.snapshot_path)},
+                'collector_summary': {'path': str(self.summary_path.resolve()),
+                                      'sha256': self.digest(self.summary_path)},
+                'track_snapshot': {'path': str(path.resolve()), 'sha256': 'a' * 64},
+                'identity_map': {'path': str(self.identity_path.resolve()), 'sha256': self.map_hash},
+                'collector_seed_manifest': {'path': str(self.manifest_path.resolve()),
+                                            'sha256': self.digest(self.manifest_path)},
+                'batch_intent': {'path': str(self.intent_path.resolve()),
+                                 'sha256': self.digest(self.intent_path)},
+                'seed_plan': {'path': str(self.seed_plan_path.resolve()),
+                              'sha256': self.digest(self.seed_plan_path)},
+                'seed_video_evidence': {'path': str(self.seed_evidence_path.resolve()),
+                                        'sha256': self.digest(self.seed_evidence_path)},
+                'library_sha256': LIBRARY,
+            }
+            path.write_text(json.dumps(proof), encoding='utf-8')
+            proofs.append(path)
+
+        def replay_from_proof(**kwargs):
+            return json.loads(Path(kwargs['track_snapshot_path']).read_bytes())
+
+        with patch.object(radio_proof, '_CACHE_LIMIT', 2), \
+                patch('radio_snapshot_proof._proof_from_inputs', side_effect=replay_from_proof) as replay, \
+                patch('radio_snapshot_proof._replay_scanned_directory_state', return_value=()), \
+                patch('radio_snapshot_proof._verified_source_closure', return_value=((
+                    str(self.cache_path.resolve()), marker_sha),)):
+            with radio_snapshot_proof_cache_scope() as stats:
+                for path in proofs:
+                    verify_radio_snapshot_proof(path)
+                self.assertEqual(stats['cache_evictions'], 1)
+                for path in proofs[1:]:
+                    verify_radio_snapshot_proof(path)
+                self.assertEqual(stats['cache_hits'], 2)
+                verify_radio_snapshot_proof(proofs[0])
+                self.assertEqual(stats['cache_misses'], 4)
+                self.assertEqual(stats['cache_evictions'], 2)
+            self.assertEqual(replay.call_count, 4)
+
     def test_nested_scopes_share_memo_rehash_tampering_and_restore_outer_context(self):
         output = self.root / 'nested-proof-cache.json'
         self.create(output)

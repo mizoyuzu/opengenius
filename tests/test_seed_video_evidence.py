@@ -153,6 +153,43 @@ class SeedVideoEvidenceTests(unittest.TestCase):
             self.assertEqual(stats['full_replays'], 1)
             self.assertEqual(stats['hits'], 1)
 
+    def test_chronological_selector_contexts_fit_campaign_bound(self):
+        count = 160  # 140 maximum 20-seed batches plus immutable ancestry.
+        self.assertGreaterEqual(seed_evidence_module._SELECTOR_CACHE_LIMIT, count)
+        payload = self.sidecar_path.read_bytes()
+        contexts = []
+        for index in range(count):
+            path = self.root / f"evidence-context-{index:03d}.json"
+            path.write_bytes(payload)
+            contexts.append(path)
+        expected = self.select()
+        original = seed_evidence_module._select_seed_video_evidence_uncached
+        with patch.object(seed_evidence_module,
+                          '_select_seed_video_evidence_uncached',
+                          wraps=original) as replay:
+            with seed_video_selector_cache_scope() as stats:
+                for path in contexts:
+                    result = select_seed_video_evidence(
+                        self.document, path, self.seeds, self.tracks, self.matcher,
+                        LIBRARY_HASH, MAP_HASH)
+                    self.assertEqual(result, expected)
+                self.assertEqual(stats['misses'], count)
+                self.assertEqual(stats['evictions'], 0)
+                for path in contexts:
+                    result = select_seed_video_evidence(
+                        self.document, path, self.seeds, self.tracks, self.matcher,
+                        LIBRARY_HASH, MAP_HASH)
+                    self.assertEqual(result, expected)
+                self.assertEqual(stats['hits'], count)
+                self.assertEqual(stats['evictions'], 0)
+            self.assertEqual(replay.call_count, count)
+        with seed_video_selector_cache_scope() as fresh_stats:
+            select_seed_video_evidence(
+                self.document, contexts[0], self.seeds, self.tracks, self.matcher,
+                LIBRARY_HASH, MAP_HASH)
+            self.assertEqual(fresh_stats['misses'], 1)
+            self.assertEqual(fresh_stats['hits'], 0)
+
     def test_selector_cache_rehashes_transitive_source_used_by_other_pid_row(self):
         with seed_video_selector_cache_scope():
             select_seed_video_evidence(
