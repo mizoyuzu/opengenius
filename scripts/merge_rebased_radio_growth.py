@@ -1266,20 +1266,35 @@ def _collected_seed_ineligible_disposition(seed, selected_hints, *, source_polic
         return None
     if not isinstance(pid, str) or re.fullmatch(r'[0-9A-F]{16}', pid) is None:
         raise ValueError('Strict-ineligible seed has a malformed persistent ID')
-    if selected_hints.get(pid) is not None:
-        return None
-    if (seed.get('seed_video_id') is not None
-            or seed.get('seed_video_source') is not None):
-        return None
-    result_rows = [row for row in collector_summary.get('results', [])
-                   if isinstance(row, dict) and row.get('persistent_id') == pid]
-    if len(result_rows) != 1 or result_rows[0].get('status') != 'collected':
-        return None
-
     manifest_path = Path(seed_manifest_path).resolve()
     summary_path = Path(collector_summary_path).resolve()
     batch_dir = manifest_path.parent.parent
     collector_snapshot = manifest_path.parent / (pid + '.json')
+    try:
+        snapshot = _read_json(collector_snapshot)
+    except (OSError, ValueError):
+        raise ValueError('Strict-ineligible seed lacks its original collector snapshot') from None
+    radio_requests = [row for row in snapshot.get('request_evidence', [])
+                      if isinstance(row, dict)
+                      and row.get('endpoint') == 'get_watch_playlist'
+                      and isinstance(row.get('arguments'), dict)
+                      and row.get('arguments', {}).get('radio') is True]
+    radio_cache_hit = (len(radio_requests) == 1
+                       and radio_requests[0].get('cache_hit') is True)
+    if not radio_cache_hit and selected_hints.get(pid) is not None:
+        return None
+    if (not radio_cache_hit
+            and (seed.get('seed_video_id') is not None
+                 or seed.get('seed_video_source') is not None)):
+        return None
+    result_rows = [row for row in collector_summary.get('results', [])
+                   if isinstance(row, dict) and row.get('persistent_id') == pid]
+    if radio_cache_hit and (len(result_rows) != 1
+                            or result_rows[0].get('status') != 'collected'):
+        raise ValueError('Cached radio disposition lacks one authenticated collected result')
+    if len(result_rows) != 1 or result_rows[0].get('status') != 'collected':
+        return None
+
     proof_path = batch_dir / 'radio-only-source' / (pid + '.proof.json')
     derived_snapshot = batch_dir / 'radio-only-source' / (pid + '.snapshot.json')
     for path in snapshot_paths:
@@ -1293,10 +1308,6 @@ def _collected_seed_ineligible_disposition(seed, selected_hints, *, source_polic
             return None
     if proof_path.exists() or derived_snapshot.exists():
         raise ValueError('Strict-ineligible seed unexpectedly has a proof or derived snapshot')
-    try:
-        snapshot = _read_json(collector_snapshot)
-    except (OSError, ValueError):
-        raise ValueError('Strict-ineligible seed lacks its original collector snapshot') from None
     local_seed = snapshot.get('local_seed')
     if local_seed != seed:
         raise ValueError('Strict-ineligible seed differs from the collector snapshot seed')
@@ -1308,6 +1319,7 @@ def _collected_seed_ineligible_disposition(seed, selected_hints, *, source_polic
     if len(radio_requests) != 1:
         raise ValueError('Strict-ineligible seed lacks one exact radio request')
     radio_request = radio_requests[0]
+    radio_cache_hit = radio_request.get('cache_hit') is True
     raw_radio_cache = _request_cache_path(
         collector_snapshot, 'get_watch_playlist', radio_request['arguments'])
     search_requests = [row for row in snapshot.get('request_evidence', [])
@@ -1359,7 +1371,8 @@ def _collected_seed_ineligible_disposition(seed, selected_hints, *, source_polic
             collector_seed_manifest_path=manifest_path,
             batch_intent_path=batch_dir / 'intent.json',
             raw_radio_cache_path=raw_radio_cache,
-            sealed_at_utc=radio_request.get('observed_at'))
+            sealed_at_utc=radio_request.get('observed_at'),
+            allow_cache_hit_disposition=radio_cache_hit)
     except RadioSnapshotIneligible as exc:
         binding = exc.details.get('seed_video_search_binding')
         seed_gate_failed = (
@@ -1380,7 +1393,17 @@ def _collected_seed_ineligible_disposition(seed, selected_hints, *, source_polic
             and exc.details.get('strict_unique_target_video_count') == 0
             and exc.details.get('outgoing_target_pids') == []
             and exc.details.get('accepted_edges') == [])
-        if (exc.persistent_id != pid or not (seed_gate_failed or no_targets)):
+        cached_not_live = (
+            radio_cache_hit is True
+            and exc.reason == 'radio_cache_hit_not_live'
+            and exc.details.get('cache_hit') is True
+            and exc.details.get('selected_video_id') == snapshot.get('selected_video_id')
+            and exc.details.get('accepted_edges') == []
+            and exc.details.get('strict_gate_reason') in {
+                'seed_not_strictly_matched', 'search_seed_binding_not_strict',
+                'no_strict_unique_outgoing_targets', 'strict_candidate_graph_replayed'})
+        if (exc.persistent_id != pid
+                or not (seed_gate_failed or no_targets or cached_not_live)):
             raise ValueError('Collector seed has an unsupported ineligible proof outcome') from None
         receipts = []
         for label, path in source_paths:
@@ -1394,18 +1417,24 @@ def _collected_seed_ineligible_disposition(seed, selected_hints, *, source_polic
                 raise ValueError('Strict-ineligible proof source changed during replay: ' + label)
             receipts.append({'name': label, 'path': str(path), 'sha256': digest})
         search_receipt = next(row for row in receipts if row['name'] == 'raw_search_cache')
-        if (binding.get('raw_search_cache', {}).get('path') != search_receipt['path']
-                or binding.get('raw_search_cache', {}).get('sha256') != search_receipt['sha256']):
+        if (binding is not None
+                and (binding.get('raw_search_cache', {}).get('path') != search_receipt['path']
+                     or binding.get('raw_search_cache', {}).get('sha256')
+                     != search_receipt['sha256'])):
             raise ValueError('Strict-ineligible search receipt differs from its raw response cache')
         if (sha(Path(identity_map_path).read_bytes()) != identity_hash
                 or json.loads(Path(track_snapshot_path).read_bytes()).get('source_sha256') != library_hash):
             raise ValueError('Strict-ineligible proof is bound to a different map or Library')
+        status = ('collected_seed_radio_cache_hit_not_live' if cached_not_live else
+                  'collected_seed_strictly_ineligible' if seed_gate_failed else
+                  'collected_seed_no_strict_outgoing_targets')
         return {
             'schema_version': 1,
-            'producer': 'opengenius-authenticated-search-strict-ineligible-seed-v1',
+            'producer': ('opengenius-authenticated-radio-cache-hit-zero-edge-v1'
+                         if cached_not_live else
+                         'opengenius-authenticated-search-strict-ineligible-seed-v1'),
             'persistent_id': pid,
-            'status': ('collected_seed_strictly_ineligible' if seed_gate_failed
-                       else 'collected_seed_no_strict_outgoing_targets'),
+            'status': status,
             'reason': exc.reason,
             'details': exc.details,
             'source_receipts': receipts,

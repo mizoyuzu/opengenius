@@ -75,10 +75,32 @@ def prepare_radio_only_snapshots(*, track_snapshot_path, identity_map_path,
         proof_path = output_dir / (pid + '.proof.json')
         sanitized_path = output_dir / (pid + '.snapshot.json')
         cache_path = _radio_cache_path(original, original_path.parent)
+        radio_requests = [row for row in original.get('request_evidence', [])
+                          if isinstance(row, dict)
+                          and row.get('endpoint') == 'get_watch_playlist'
+                          and isinstance(row.get('arguments'), dict)
+                          and row.get('arguments', {}).get('radio') is True]
+        cache_hit = (len(radio_requests) == 1
+                     and radio_requests[0].get('cache_hit') is True)
         try:
             if proof_path.exists():
                 proof = _read(proof_path)
             else:
+                if cache_hit:
+                    # A cached radio response can never become a positive
+                    # proof. Replay it only to produce the typed zero-edge
+                    # disposition after all original source checks pass.
+                    _proof_from_inputs(
+                        track_snapshot_path=track_snapshot_path,
+                        identity_map_path=identity_map_path,
+                        snapshot_path=original_path,
+                        collector_summary_path=summary_path,
+                        collector_seed_manifest_path=manifest_path,
+                        batch_intent_path=intent_path,
+                        raw_radio_cache_path=cache_path,
+                        sealed_at_utc=radio_requests[0].get('observed_at'),
+                        allow_cache_hit_disposition=True)
+                    raise ValueError('Cached radio replay unexpectedly returned a proof')
                 if not create_missing:
                     if sanitized_path.exists():
                         raise ValueError(
@@ -108,14 +130,17 @@ def prepare_radio_only_snapshots(*, track_snapshot_path, identity_map_path,
                     output_path=proof_path,
                     sealed_at_utc=sealed_at_utc)
         except RadioSnapshotIneligible as error:
-            ineligible.append({'persistent_id': pid,
-                               'collector_snapshot': {
-                                   'path': str(original_path),
-                                   'sha256': _sha(original_path.read_bytes())},
-                               'raw_radio_cache': {
-                                   'path': str(cache_path),
-                                   'sha256': _sha(cache_path.read_bytes())},
-                               'reason': error.reason})
+            row = {'persistent_id': pid,
+                   'collector_snapshot': {
+                       'path': str(original_path),
+                       'sha256': _sha(original_path.read_bytes())},
+                   'raw_radio_cache': {
+                       'path': str(cache_path),
+                       'sha256': _sha(cache_path.read_bytes())},
+                   'reason': error.reason}
+            if error.reason == 'radio_cache_hit_not_live':
+                row['details'] = error.details
+            ineligible.append(row)
             continue
         validation = verify_radio_snapshot_proof(proof_path)
         if (validation.get('verified') is not True

@@ -412,7 +412,8 @@ def _request_cache_path(collector_snapshot_path, endpoint, arguments):
 
 
 def _search_derived_seed_binding(*, snapshot, snapshot_path, local_seed,
-                                 selected_video_id, tracks, matcher):
+                                 selected_video_id, tracks, matcher,
+                                 allow_cached_search=False):
     """Validate a seed ID derived from this snapshot's exact live search.
 
     The ordinary seed-video sidecar remains preferred. This fallback is only
@@ -430,10 +431,13 @@ def _search_derived_seed_binding(*, snapshot, snapshot_path, local_seed,
         'query': (local_seed.get('title') or '') + ' ' + (local_seed.get('artist') or ''),
         'filter': 'songs', 'limit': 5,
     }
-    if (arguments != expected_arguments or request.get('cache_hit') is not False
+    search_cache_hit = request.get('cache_hit')
+    if (arguments != expected_arguments
+            or (search_cache_hit is not False
+                and not (allow_cached_search is True and search_cache_hit is True))
             or not isinstance(request.get('observed_at'), str)
             or not request.get('observed_at')):
-        raise ValueError('Search-derived seed request is not the exact live seed query')
+        raise ValueError('Search-derived seed request is not the exact seed query')
     cache_path = _request_cache_path(snapshot_path, 'search', arguments)
     cache_bytes = cache_path.read_bytes()
     cache = json.loads(cache_bytes)
@@ -472,7 +476,8 @@ def _search_derived_seed_binding(*, snapshot, snapshot_path, local_seed,
         'kind': ('authenticated-search-strict-unique-seed-v1' if strict_unique
                  else 'authenticated-search-resolver-seed-ineligible-v1'),
         'request': {'endpoint': 'search', 'arguments': arguments,
-                    'observed_at': request['observed_at'], 'cache_hit': False},
+                    'observed_at': request['observed_at'],
+                    'cache_hit': search_cache_hit},
         'raw_search_cache': {'path': str(cache_path), 'sha256': _sha(cache_bytes),
                              'response_result_count': len(cache['response'])},
         'resolver': {'video_id': resolved_video,
@@ -556,7 +561,8 @@ def _search_bound_seed_graph_matcher(matcher, selected_video_id, persistent_id):
 
 def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
                        collector_summary_path, collector_seed_manifest_path,
-                       batch_intent_path, raw_radio_cache_path, sealed_at_utc):
+                       batch_intent_path, raw_radio_cache_path, sealed_at_utc,
+                       allow_cache_hit_disposition=False):
     track_path, track_bytes, _ = _read(track_snapshot_path)
     map_path, map_bytes, map_doc = _read(identity_map_path)
     snapshot_file, snapshot_bytes, snapshot = _read(snapshot_path)
@@ -652,12 +658,16 @@ def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
             raise ValueError('Radio-only collector snapshot contains auxiliary watch/related requests')
     request = evidence[0]
     arguments = request['arguments']
+    cache_hit = request.get('cache_hit')
     if (arguments.get('videoId') != selected_video_id
             or arguments.get('limit') != 100
             or set(arguments) != {'videoId', 'radio', 'limit'}
-            or request.get('cache_hit') is not False
+            or (cache_hit is not False
+                and not (allow_cache_hit_disposition is True and cache_hit is True))
             or not isinstance(request.get('observed_at'), str)):
         raise ValueError('Radio request is not an exact live seed-bound limit-100 call')
+    if allow_cache_hit_disposition is True and cache_hit is not True:
+        raise ValueError('Cache-hit disposition requires an explicitly cached radio request')
     request_rows = [row for row in snapshot.get('requests', [])
                     if isinstance(row, dict) and row.get('endpoint') == 'watch_radio']
     if (len(request_rows) != 1
@@ -680,13 +690,21 @@ def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
         library_hash, map_hash)
     selected_seed_evidence = validated_seed_evidence.get(pid)
     seed_video_search_binding = None
+    cached_search_binding = None
     if isinstance(selected_seed_evidence, dict):
         if selected_seed_evidence.get('video_id') != selected_video_id:
             raise ValueError('Radio call video ID differs from its validated seed-video sidecar')
+        if allow_cache_hit_disposition is True:
+            cached_search_binding = _search_derived_seed_binding(
+                snapshot=snapshot, snapshot_path=snapshot_file, local_seed=local_seed,
+                selected_video_id=selected_video_id, tracks=tracks, matcher=matcher,
+                allow_cached_search=True)
     else:
         seed_video_search_binding = _search_derived_seed_binding(
             snapshot=snapshot, snapshot_path=snapshot_file, local_seed=local_seed,
-            selected_video_id=selected_video_id, tracks=tracks, matcher=matcher)
+            selected_video_id=selected_video_id, tracks=tracks, matcher=matcher,
+            allow_cached_search=allow_cache_hit_disposition)
+        cached_search_binding = seed_video_search_binding
     replayed = observe(raw_rows, 'radio', request['observed_at'], tracks,
                        selected_video_id, candidate_matcher=matcher.match)
     saved_radio = [row for row in snapshot.get('observations', [])
@@ -728,10 +746,29 @@ def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
         }
         if seed_video_search_binding is not None:
             details['seed_video_search_binding'] = seed_video_search_binding
+        if allow_cache_hit_disposition is True:
+            raise RadioSnapshotIneligible(
+                pid, 'radio_cache_hit_not_live', {
+                    'selected_video_id': selected_video_id,
+                    'cache_hit': True,
+                    'strict_gate_reason': 'seed_not_strictly_matched',
+                    'seed_candidate_dispositions': details,
+                    'seed_video_search_binding': cached_search_binding,
+                    'accepted_edges': [],
+                })
         raise RadioSnapshotIneligible(pid, 'seed_not_strictly_matched', details)
     if (seed_video_search_binding is not None
             and seed_video_search_binding.get('kind') !=
             'authenticated-search-strict-unique-seed-v1'):
+        if allow_cache_hit_disposition is True:
+            raise RadioSnapshotIneligible(pid, 'radio_cache_hit_not_live', {
+                'selected_video_id': selected_video_id,
+                'cache_hit': True,
+                'strict_gate_reason': 'search_seed_binding_not_strict',
+                'seed_video_search_binding': (seed_video_search_binding
+                                              or cached_search_binding),
+                'accepted_edges': [],
+            })
         raise ValueError('Search-derived seed does not have one strict unique video in its source')
 
     observations_by_video = {}
@@ -784,6 +821,15 @@ def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
         # Keep the historic no-search exception payload unchanged. The extra
         # receipt is only for the typed search-derived zero-edge disposition.
         if seed_video_search_binding is None:
+            if allow_cache_hit_disposition is True:
+                raise RadioSnapshotIneligible(pid, 'radio_cache_hit_not_live', {
+                    'selected_video_id': selected_video_id,
+                    'cache_hit': True,
+                    'strict_gate_reason': 'no_strict_unique_outgoing_targets',
+                    'strict_unique_target_video_count': 0,
+                    'outgoing_target_pids': [],
+                    'accepted_edges': [],
+                })
             raise RadioSnapshotIneligible(pid)
         details = {
             'selected_video_id': selected_video_id,
@@ -793,6 +839,17 @@ def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
         }
         if seed_video_search_binding is not None:
             details['seed_video_search_binding'] = seed_video_search_binding
+        if allow_cache_hit_disposition is True:
+            raise RadioSnapshotIneligible(pid, 'radio_cache_hit_not_live', {
+                'selected_video_id': selected_video_id,
+                'cache_hit': True,
+                'strict_gate_reason': 'no_strict_unique_outgoing_targets',
+                'strict_unique_target_video_count': 0,
+                'outgoing_target_pids': [],
+                'accepted_edges': [],
+                'seed_video_search_binding': (details.get('seed_video_search_binding')
+                                              or cached_search_binding),
+            })
         raise RadioSnapshotIneligible(
             pid, 'no_strict_unique_outgoing_targets', details)
     eligible_positions = sorted({position for row in target_by_video.values()
@@ -858,6 +915,27 @@ def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
     }
     if seed_video_search_binding is not None:
         proof['seed_video_search_binding'] = seed_video_search_binding
+    if allow_cache_hit_disposition is True:
+        cached_search = (proof.get('seed_video_search_binding')
+                         or cached_search_binding)
+        cached_gate_reason = (
+            'search_seed_binding_not_strict'
+            if isinstance(cached_search, dict)
+            and cached_search.get('kind')
+                != 'authenticated-search-strict-unique-seed-v1'
+            else 'strict_candidate_graph_replayed')
+        raise RadioSnapshotIneligible(pid, 'radio_cache_hit_not_live', {
+            'selected_video_id': selected_video_id,
+            'cache_hit': True,
+            'strict_gate_reason': cached_gate_reason,
+            'strict_unique_target_video_count': len(target_by_video),
+            'outgoing_target_pids': list(target_pids),
+            'accepted_edges': [],
+            'raw_radio_cache': proof['raw_radio_cache'],
+            'radio_observation_count': len(replayed),
+            'seed_video_search_binding': (proof.get('seed_video_search_binding')
+                                          or cached_search_binding),
+        })
     return proof
 
 
