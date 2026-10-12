@@ -112,9 +112,27 @@ def _verify_rebase_receipt(graph_path, report_path, state_path,
             proof_inputs = _verify_identity_map_rebinding(
                 graph_doc, report, state, library_hash, identity_hash,
                 Path(state_path).resolve())
+        elif report.get('producer') == 'opengenius-typed-identity-map-alias-chain-growth-rebinding-v1':
+            from rebind_radio_growth_alias_chain import verify_alias_chain_growth_rebinding_report
+            proof_inputs = verify_alias_chain_growth_rebinding_report(
+                graph_doc=graph_doc, report=report, state=state,
+                library_hash=library_hash, identity_hash=identity_hash,
+                state_path=Path(state_path).resolve())
         elif report.get('producer') == 'opengenius-typed-album-alias-growth-rebinding-v1':
             from rebind_radio_growth_identity import verify_album_alias_growth_rebinding_report
             proof_inputs = verify_album_alias_growth_rebinding_report(
+                graph_doc=graph_doc, report=report, state=state,
+                library_hash=library_hash, identity_hash=identity_hash,
+                state_path=Path(state_path).resolve())
+        elif report.get('producer') == 'opengenius-typed-album-alias-chain-growth-rebinding-v1':
+            from rebind_radio_growth_alias_chain import verify_album_alias_chain_growth_rebinding_report
+            proof_inputs = verify_album_alias_chain_growth_rebinding_report(
+                graph_doc=graph_doc, report=report, state=state,
+                library_hash=library_hash, identity_hash=identity_hash,
+                state_path=Path(state_path).resolve())
+        elif report.get('producer') == 'opengenius-typed-album-alias-append-chain-growth-rebinding-v1':
+            from rebind_radio_growth_album_append_chain import verify_album_alias_append_chain_growth_rebinding_report
+            proof_inputs = verify_album_alias_append_chain_growth_rebinding_report(
                 graph_doc=graph_doc, report=report, state=state,
                 library_hash=library_hash, identity_hash=identity_hash,
                 state_path=Path(state_path).resolve())

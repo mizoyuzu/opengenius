@@ -42,7 +42,7 @@ class AliasChainConsumerContractTests(unittest.TestCase):
         }
 
     def _verify_fixture(self, graph, report, state=None, state_path=None,
-                        stub_alias_chain=False):
+                        stub_alias_chain=False, saved_parent=None):
         state = self.state if state is None else state
         state_path = (self.candidate / 'state.json') if state_path is None else state_path
         def replay(*_args, **_kwargs):
@@ -54,7 +54,7 @@ class AliasChainConsumerContractTests(unittest.TestCase):
                     self.baseline_graph, self.baseline_report, self.baseline_state,
                     self.provenance)),
             patch.object(alias_chain, '_load_saved_parent_growth',
-                         return_value=self.parent),
+                         return_value=self.parent if saved_parent is None else saved_parent),
             patch.object(alias_chain, '_replay_previous_growth', side_effect=replay),
         ]
         if stub_alias_chain:
@@ -75,8 +75,18 @@ class AliasChainConsumerContractTests(unittest.TestCase):
                     source_patches[3].stop()
 
     def test_real_candidate_fixture_preserves_exact_691_root_rows_and_complete_receipts(self):
-        proof_receipts = self._verify_fixture(self.graph, self.report)
-        self.assertEqual(self.graph['accepted_roots'], self.parent['roots'])
+        # This historical child predates policy propagation. Its actual parent
+        # is now radio-policy typed, so accepting the untagged child would let
+        # it erase source provenance. Keep a separate mocked legacy-parent view
+        # below to retain the exact row/receipt regression for the old format.
+        with self.assertRaisesRegex(ValueError, 'does not inherit exact parent policy'):
+            self._verify_fixture(self.graph, self.report)
+
+        legacy_parent = deepcopy(self.parent)
+        legacy_parent['graph'].pop('source_policy', None)
+        proof_receipts = self._verify_fixture(
+            self.graph, self.report, saved_parent=legacy_parent)
+        self.assertEqual(self.graph['accepted_roots'], legacy_parent['roots'])
         self.assertEqual(len(self.graph['accepted_roots']), 691)
         self.assertEqual(sum(bool(row['ordered_target_pids'])
                              for row in self.graph['accepted_roots']), 413)
@@ -86,7 +96,8 @@ class AliasChainConsumerContractTests(unittest.TestCase):
         reordered['accepted_roots'][0], reordered['accepted_roots'][1] = (
             reordered['accepted_roots'][1], reordered['accepted_roots'][0])
         with self.assertRaisesRegex(ValueError, 'root rows/order/counts'):
-            self._verify_fixture(reordered, self.report, stub_alias_chain=True)
+            self._verify_fixture(reordered, self.report, stub_alias_chain=True,
+                                 saved_parent=legacy_parent)
 
         omitted = deepcopy(self.report)
         omitted['identity_map_rebinding']['proof_input_receipts'].pop()
@@ -104,7 +115,7 @@ class AliasChainConsumerContractTests(unittest.TestCase):
                 report_path.read_bytes()).hexdigest()
             with self.assertRaisesRegex(ValueError, 'omits or changes required source receipts'):
                 self._verify_fixture(altered_graph, omitted, self.state, state_path,
-                                     stub_alias_chain=True)
+                                     stub_alias_chain=True, saved_parent=legacy_parent)
 
 
 if __name__ == '__main__':

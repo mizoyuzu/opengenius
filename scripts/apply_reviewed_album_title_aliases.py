@@ -13,6 +13,12 @@ import tempfile
 from music_identity_map import IdentityMap, load_library, normalize, version_signature
 
 
+# In production, this is the repository root because this module lives under
+# scripts/. Private validation copies may override the module constant in
+# memory, while keeping relative receipt paths anchored to the real workspace.
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+
+
 def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -28,6 +34,40 @@ def _resolve(path):
     if value.is_absolute():
         return value.resolve()
     return (Path(__file__).resolve().parents[1] / value).resolve()
+
+
+def _canonical_workspace_path(value, *, workspace_root=None):
+    """Resolve relative receipts under the workspace; preserve absolute inputs."""
+    if not isinstance(value, (str, Path)) or not str(value):
+        raise ValueError('Reviewed source path must be a non-empty path string')
+    root = Path(workspace_root or WORKSPACE_ROOT).resolve(strict=True)
+    path = Path(value)
+    if path.is_absolute():
+        # Absolute source references are part of the reviewed packet contract,
+        # including trusted /tmp evidence bundles. Canonicalize and require the
+        # supplied file to be that same canonical file; the digest is checked
+        # separately by _reviewed_file_receipt_matches.
+        return path.resolve(strict=True)
+    resolved = (root / path).resolve(strict=True)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError('Reviewed source path escapes the workspace root') from exc
+    return resolved
+
+
+def _reviewed_file_receipt_matches(receipt, actual_path, actual_sha256, *, workspace_root=None):
+    """Match both canonical path and content digest; never accept hash-only aliases."""
+    if (not isinstance(receipt, dict)
+            or set(receipt) != {'path', 'sha256'}
+            or receipt.get('sha256') != actual_sha256):
+        return False
+    try:
+        reviewed = _canonical_workspace_path(receipt.get('path'), workspace_root=workspace_root)
+        actual = _canonical_workspace_path(actual_path, workspace_root=workspace_root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return reviewed == actual
 
 
 def _candidate_pid_set(matcher, remote, expected_alias):
@@ -83,16 +123,16 @@ def apply_reviewed_album_title_alias(*, track_snapshot, identity_map_path,
             or not isinstance(remote_alias, str) or not remote_alias
             or not isinstance(canonical_album, str) or not canonical_album):
         raise ValueError('Proposal is not the exact metadata-only album alias review')
-    if (proposal_doc.get('source_evidence') != {'path': str(Path(source_evidence_path)),
-                                                'sha256': source_hash}
-            or proposal_doc.get('cache_audit') != {'path': str(Path(candidate_audit_path)),
-                                                   'sha256': audit_hash}
+    if (not _reviewed_file_receipt_matches(proposal_doc.get('source_evidence'), source_path,
+                                           source_hash)
+            or not _reviewed_file_receipt_matches(proposal_doc.get('cache_audit'), audit_path,
+                                                  audit_hash)
             or source.get('proposed_exact_remote_album_alias') != remote_alias
             or source.get('local_album') != canonical_album
             or source.get('recording_identity_verified') is not False
             or source.get('album_edition_identity_verified') is not False
-            or audit.get('source_evidence') != {'path': str(Path(source_evidence_path)),
-                                                'sha256': source_hash}):
+            or not _reviewed_file_receipt_matches(audit.get('source_evidence'), source_path,
+                                                  source_hash)):
         raise ValueError('Source evidence or cache audit does not match the proposal')
     if (audit.get('library', {}).get('track_snapshot_sha256') != snapshot_hash
             or audit.get('library', {}).get('identity_map_sha256') != map_hash

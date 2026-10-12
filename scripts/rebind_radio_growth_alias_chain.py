@@ -120,6 +120,19 @@ def _canonical_receipt_rows(rows):
     return canonical
 
 
+
+def _validate_state_graph_relation_projection(graph_roots, state_roots, label):
+    """Require exact graph-root coverage plus state-only empty assignments."""
+    graph = _relation_map(graph_roots, label + ' graph')
+    state = _relation_map(state_roots, label + ' state')
+    if set(graph) - set(state):
+        raise ValueError(label + ' graph root is missing from complete state')
+    if any(state[pid] != edges for pid, edges in graph.items()):
+        raise ValueError(label + ' graph/state ordered relations differ')
+    if any(edges for pid, edges in state.items() if pid not in graph):
+        raise ValueError(label + ' state-only PID has outgoing edges')
+    return graph, state
+
 def _growth_source_receipts(growth_dir, normalized_runs):
     growth_dir = Path(growth_dir).resolve()
     receipts = [_receipt(growth_dir / 'accepted-graphs.json')]
@@ -184,6 +197,7 @@ def _load_saved_parent_growth(growth_dir, library_hash, identity_hash):
     state_roots = _state_graph_rows(source_state)
     graph_relations = _relation_map(roots, 'Frozen parent graph')
     state_relations = _relation_map(state_roots, 'Frozen parent state')
+    _validate_state_graph_relation_projection(roots, state_roots, 'Frozen parent')
     graph_nonempty = {pid: edges for pid, edges in graph_relations.items() if edges}
     state_nonempty = {pid: edges for pid, edges in state_relations.items() if edges}
     evaluation_relations = _relation_map(evaluation.get('relation_rows'), 'Frozen parent evaluation')
@@ -405,6 +419,9 @@ def rebind_growth_alias_chain(*, track_snapshot, input_identity_map,
     roots = source_graph['accepted_roots']
     normalized_runs = parent['runs']
     accepted_hash = parent['accepted_graphs_sha256']
+    inherited_source_policy = source_graph.get('source_policy')
+    if inherited_source_policy not in (None, 'authenticated-watch-radio-only-v1'):
+        raise ValueError('Parent growth has an unsupported source policy')
     old_state = source_state
 
     # State carries every assigned PID, including 56 with no accepted graph root.
@@ -495,6 +512,8 @@ def rebind_growth_alias_chain(*, track_snapshot, input_identity_map,
         'authenticated_observation_inputs': authenticated_receipts,
         'authenticated_observation_input_count': len(authenticated_receipts),
         'accepted_input_manifest_sha256': base_provenance['accepted_input_manifest_sha256'],
+        **({'source_policy': inherited_source_policy}
+           if inherited_source_policy is not None else {}),
     }
     relation_audit = deepcopy(baseline_audit)
     relation_audit['output_directed_edge_count'] = sum(
@@ -512,9 +531,11 @@ def rebind_growth_alias_chain(*, track_snapshot, input_identity_map,
         'raw_input_provenance': relation_audit['raw_input_provenance'],
         'accepted_root_count': sum(bool(row['ordered_target_pids']) for row in roots),
         'directed_edge_count': sum(len(row['ordered_target_pids']) for row in roots),
+        **({'source_policy': inherited_source_policy}
+           if inherited_source_policy is not None else {}),
     }
     write_json(report_path, report)
-    write_json(graph_path, {
+    output_graph = {
         'schema_version': 1,
         'producer': GRAPH_PRODUCER,
         'source_state_path': str(state_path.resolve()),
@@ -522,7 +543,10 @@ def rebind_growth_alias_chain(*, track_snapshot, input_identity_map,
         'source_identity_map_rebinding_report_sha256': sha(report_path.read_bytes()),
         'accepted_roots': roots,
         'identity_status': 'unverified_metadata_candidate',
-    })
+    }
+    if inherited_source_policy is not None:
+        output_graph['source_policy'] = inherited_source_policy
+    write_json(graph_path, output_graph)
     return {'output_dir': str(output_dir), 'report_path': str(report_path),
             'graph_path': str(graph_path), 'state_path': str(state_path),
             'identity_map_sha256': new_hash,
@@ -538,6 +562,15 @@ def verify_alias_chain_growth_rebinding_report(*, graph_doc, report, state,
                                                state_path):
     """Reproduce a chain rebind's receipts, old growth replay, and invariants."""
     binding = report.get('identity_map_rebinding')
+    has_policy = 'source_policy' in report
+    policy = report.get('source_policy')
+    if (has_policy != ('source_policy' in graph_doc)
+            or not isinstance(binding, dict)
+            or has_policy != ('source_policy' in binding)
+            or policy not in (None, 'authenticated-watch-radio-only-v1')
+            or (has_policy and (graph_doc.get('source_policy') != policy
+                                or binding.get('source_policy') != policy))):
+        raise ValueError('Alias-chain report/graph source policy is missing or inconsistent')
     if (report.get('producer') != CHAIN_PRODUCER or not isinstance(binding, dict)
             or binding.get('schema_version') != 1
             or binding.get('new_identity_map', {}).get('sha256') != identity_hash
@@ -643,11 +676,26 @@ def verify_alias_chain_growth_rebinding_report(*, graph_doc, report, state,
             or old_state.get('state_sha256') != binding.get('old_state_sha256')
             or old_state.get('state_sha256') != saved_parent['state_sha256']):
         raise ValueError('Alias-chain parent growth does not replay under its old map')
+    inherited_source_policy = saved_parent['graph'].get('source_policy')
+    if (inherited_source_policy not in (None, 'authenticated-watch-radio-only-v1')
+            or has_policy != (inherited_source_policy is not None)
+            or (has_policy and policy != inherited_source_policy)):
+        raise ValueError('Alias-chain source policy does not inherit exact parent policy')
     roots = saved_parent['roots']
-    state_roots = _state_graph_rows(old_state)
-    expected = _rebind_state_map_hash(old_state, identity_hash)
-    if state != expected or report.get('next_state_sha256') != state.get('state_sha256'):
-        raise ValueError('Alias-chain state changed data beyond its source map hash')
+    # Preserve the complete, receipt-bound saved parent state. The independent
+    # replay above verifies its state seal and ordered relations; use that
+    # authoritative 747-row document for the exact map-hash-only transition,
+    # rather than rebuilding state from graph-shaped intermediate rows.
+    source_state = saved_parent['state']
+    if old_state.get('state_sha256') != source_state.get('state_sha256'):
+        raise ValueError('Alias-chain replay state seal differs from complete saved state')
+    state_roots = _state_graph_rows(source_state)
+    _validate_state_graph_relation_projection(roots, state_roots, 'Replayed alias parent')
+    expected = _rebind_state_map_hash(source_state, identity_hash)
+    if (state != expected
+            or report.get('next_state_sha256') != state.get('state_sha256')
+            or len(state.get('rows', [])) != len(source_state.get('rows', []))):
+        raise ValueError('Alias-chain state changed complete assignments, metadata, relations, or map hash')
     report_file = Path(report.get('source_state_path', '')).resolve().parent / 'identity-map-rebinding-report.json'
     if (Path(report.get('source_state_path', '')).resolve() != Path(state_path).resolve()
             or graph_doc.get('source_state_sha256') != sha(Path(state_path).read_bytes())
@@ -810,3 +858,312 @@ def rebind_album_alias_child(*, parent_graph_path, parent_report_path,
             'accepted_root_count': child_report['accepted_root_count'],
             'recording_identity_verified': False, 'recording_edges_added': 0}
 
+
+
+ALBUM_CHAIN_CHILD_PRODUCER = 'opengenius-typed-album-alias-chain-growth-rebinding-v1'
+
+
+def _verify_album_delta_chain(*, track_snapshot, start_map_path, final_map_path,
+                              transitions):
+    """Replay an ordered series of separately reviewed album-only map deltas."""
+    if not isinstance(transitions, list) or len(transitions) < 1:
+        raise ValueError('Album delta chain requires at least one reviewed transition')
+    current = Path(start_map_path).resolve()
+    proof_rows = []
+    for descriptor in transitions:
+        if not isinstance(descriptor, dict) or set(descriptor) != {
+                'input_identity_map_path', 'output_identity_map_path',
+                'proposals_path', 'source_evidence_path', 'candidate_audit_path',
+                'review_decisions_path', 'receipt_path'}:
+            raise ValueError('Malformed album delta chain descriptor')
+        input_path = Path(descriptor['input_identity_map_path']).resolve()
+        output_path = Path(descriptor['output_identity_map_path']).resolve()
+        if input_path != current or output_path == current:
+            raise ValueError('Album delta chain is reordered, skipped, or cyclic')
+        proof = verify_reviewed_album_alias_map_delta(
+            track_snapshot=track_snapshot,
+            input_identity_map_path=input_path,
+            output_identity_map_path=output_path,
+            proposals_path=descriptor['proposals_path'],
+            source_evidence_path=descriptor['source_evidence_path'],
+            candidate_audit_path=descriptor['candidate_audit_path'],
+            review_decisions_path=descriptor['review_decisions_path'],
+            receipt_path=descriptor['receipt_path'])
+        if (proof.get('input_identity_map', {}).get('path') != str(input_path)
+                or proof.get('output_identity_map', {}).get('path') != str(output_path)
+                or proof.get('recording_identity_verified') is not False
+                or proof.get('recording_edges_added') != 0):
+            raise ValueError('Album delta proof does not bind its exact ordered maps')
+        proof_rows.append(proof)
+        current = output_path
+    if current != Path(final_map_path).resolve():
+        raise ValueError('Album delta chain does not terminate at its declared output map')
+    return proof_rows
+
+
+def rebind_album_alias_chain_child(*, parent_graph_path, parent_report_path,
+                                   parent_state_path, input_identity_map,
+                                   output_identity_map, track_snapshot,
+                                   transitions, output_dir):
+    """Rebind one frozen typed growth graph through ordered album-only deltas."""
+    output_dir = Path(output_dir).resolve()
+    if output_dir.exists():
+        raise FileExistsError('Output directory exists; choose a new directory')
+    graph_path, graph_bytes, graph = _read(parent_graph_path)
+    report_path, report_bytes, report = _read(parent_report_path)
+    state_path, state_bytes, state = _read(parent_state_path)
+    binding = report.get('identity_map_rebinding') or {}
+    parent_map = binding.get('new_identity_map') or {}
+    parent_map_path, parent_map_bytes, _ = _read(parent_map.get('path'))
+    start_path, start_bytes, _ = _read(input_identity_map)
+    final_path, final_bytes, final_map = _read(output_identity_map)
+    snapshot_path, snapshot_bytes, _ = _read(track_snapshot)
+    if (report.get('producer') != CHAIN_PRODUCER
+            or parent_map_path != start_path
+            or parent_map.get('sha256') != sha(start_map_bytes := start_bytes)
+            or graph.get('source_state_sha256') != sha(state_bytes)
+            or graph.get('source_identity_map_rebinding_report_sha256') != sha(report_bytes)):
+        raise ValueError('Album chain child does not continue the exact alias-chain parent')
+    inherited_source_policy = graph.get('source_policy')
+    if (inherited_source_policy not in (None, 'authenticated-watch-radio-only-v1')
+            or ('source_policy' in report) != (inherited_source_policy is not None)
+            or ('source_policy' in report
+                and report.get('source_policy') != inherited_source_policy)):
+        raise ValueError('Album chain parent source policy is missing or inconsistent')
+    parent_proof = verify_alias_chain_growth_rebinding_report(
+        graph_doc=graph, report=report, state=state,
+        library_hash=report.get('zero_id_library_sha256'),
+        identity_hash=sha(start_bytes), state_path=state_path)
+    tracks, library_hash, _ = load_library(track_snapshot=snapshot_path)
+    if library_hash != report.get('zero_id_library_sha256'):
+        raise ValueError('Album chain child snapshot belongs to a different Library')
+    delta_proofs = _verify_album_delta_chain(
+        track_snapshot=snapshot_path, start_map_path=start_path,
+        final_map_path=final_path, transitions=transitions)
+    parent_roots = graph.get('accepted_roots')
+    if not isinstance(parent_roots, list):
+        raise ValueError('Album chain parent graph has no ordered root rows')
+    parent_edges, _ = _validate_state_graph_relation_projection(
+        parent_roots, _state_graph_rows(state), 'Album chain parent')
+    child_state = _rebind_state_map_hash(state, sha(final_bytes))
+    output_matcher = IdentityMap(final_map, tracks, library_hash)
+    child_edges, _ = _validate_state_graph_relation_projection(
+        parent_roots, _state_graph_rows(child_state), 'Album chain child')
+    if (state['rows'] != child_state['rows']
+            or child_edges != parent_edges
+            or plan_genius_update(child_state, parent_roots, output_matcher,
+                                  library_hash, sha(final_bytes))['next_state']['state_sha256']
+            != child_state['state_sha256']):
+        raise ValueError('Album chain changed local metadata, assignments, or graph relations')
+
+    output_dir.mkdir(parents=True)
+    child_state_path = output_dir / 'state.json'
+    child_report_path = output_dir / 'identity-map-rebinding-report.json'
+    child_graph_path = output_dir / 'accepted-baseline-graphs.json'
+    write_json(child_state_path, child_state)
+    parent_binding = {
+        'graph_export': _receipt(graph_path), 'rebase_report': _receipt(report_path),
+        'state': _receipt(state_path),
+        'old_identity_map': _receipt(parent_map_path),
+        'new_identity_map': _receipt(start_path),
+    }
+    transition_inputs = []
+    for proof in delta_proofs:
+        transition_inputs.extend(proof[key] for key in (
+            'track_snapshot', 'input_identity_map', 'output_identity_map',
+            'application_receipt', 'proposals', 'source_evidence',
+            'candidate_audit', 'review_decisions'))
+    source_receipts = _proof_input_receipts(
+        parent_proof + transition_inputs + [
+            _receipt(graph_path), _receipt(report_path), _receipt(state_path),
+            _receipt(parent_map_path), _receipt(start_path),
+            _receipt(snapshot_path), _receipt(final_path), _receipt(child_state_path)])
+    child_binding = {
+        'schema_version': 1, 'parent_typed_growth': parent_binding,
+        **({'source_policy': inherited_source_policy}
+           if inherited_source_policy is not None else {}),
+        'track_snapshot': _receipt(snapshot_path),
+        'input_identity_map': _receipt(start_path),
+        'output_identity_map': _receipt(final_path),
+        'album_alias_transitions': delta_proofs,
+        'old_state_sha256': state.get('state_sha256'),
+        'new_state_sha256': child_state['state_sha256'],
+        'local_track_metadata_unchanged': True,
+        'local_equivalence_labels_unchanged': True,
+        'pid_gid_assignments_unchanged': True,
+        'metadata_bytes_unchanged': True,
+        'relation_bytes_unchanged': True,
+        'old_growth_replayed_with_parent_map': True,
+        'recording_identity_verified': False,
+        'recording_edges_added_by_rebinding': 0,
+        'proof_input_receipts': source_receipts,
+    }
+    child_report = {
+        'schema_version': 1, 'producer': ALBUM_CHAIN_CHILD_PRODUCER,
+        'zero_id_library_sha256': library_hash,
+        'identity_map_sha256': sha(final_bytes),
+        'next_state_sha256': child_state['state_sha256'],
+        'indexed_tracks': len(state_rows(child_state)[0]),
+        'source_state_path': str(child_state_path.resolve()),
+        'album_alias_chain_growth_rebinding': child_binding,
+        'relation_revalidation': deepcopy(report['relation_revalidation']),
+        'raw_input_provenance': deepcopy(report['raw_input_provenance']),
+        'accepted_root_count': report.get('accepted_root_count'),
+        'directed_edge_count': report.get('directed_edge_count'),
+        **({'source_policy': inherited_source_policy}
+           if inherited_source_policy is not None else {}),
+    }
+    write_json(child_report_path, child_report)
+    child_graph = {
+        'schema_version': 1, 'producer': GRAPH_PRODUCER,
+        'source_state_path': str(child_state_path.resolve()),
+        'source_state_sha256': sha(child_state_path.read_bytes()),
+        'source_identity_map_rebinding_report_sha256': sha(child_report_path.read_bytes()),
+        'accepted_roots': parent_roots,
+        'identity_status': 'unverified_metadata_candidate',
+    }
+    if inherited_source_policy is not None:
+        child_graph['source_policy'] = inherited_source_policy
+    write_json(child_graph_path, child_graph)
+    return {'output_dir': str(output_dir), 'report_path': str(child_report_path),
+            'graph_path': str(child_graph_path), 'state_path': str(child_state_path),
+            'identity_map_sha256': sha(final_bytes),
+            'state_sha256': child_state['state_sha256'],
+            'preserved_tracks': len(state_rows(child_state)[0]),
+            'preserved_directed_edges': child_report['directed_edge_count'],
+            'accepted_root_count': child_report['accepted_root_count'],
+            'recording_identity_verified': False, 'recording_edges_added': 0}
+
+
+def verify_album_alias_chain_growth_rebinding_report(*, graph_doc, report, state,
+                                                      library_hash, identity_hash,
+                                                      state_path):
+    """Replay parent alias chain and every ordered album delta in a map child."""
+    binding = report.get('album_alias_chain_growth_rebinding')
+    required_true = ('local_track_metadata_unchanged', 'local_equivalence_labels_unchanged',
+                     'pid_gid_assignments_unchanged', 'metadata_bytes_unchanged',
+                     'relation_bytes_unchanged', 'old_growth_replayed_with_parent_map')
+    if (report.get('producer') != ALBUM_CHAIN_CHILD_PRODUCER
+            or not isinstance(binding, dict) or binding.get('schema_version') != 1
+            or any(binding.get(key) is not True for key in required_true)
+            or binding.get('recording_identity_verified') is not False
+            or binding.get('recording_edges_added_by_rebinding') != 0
+            or report.get('identity_map_sha256') != identity_hash
+            or report.get('zero_id_library_sha256') != library_hash):
+        raise ValueError('Album alias chain child proof is incomplete')
+    parent = binding.get('parent_typed_growth')
+    expected_keys = {'graph_export', 'rebase_report', 'state', 'old_identity_map', 'new_identity_map'}
+    if not isinstance(parent, dict) or set(parent) != expected_keys:
+        raise ValueError('Album alias chain child omits parent source receipts')
+
+    def checked(ref, label):
+        if not isinstance(ref, dict) or set(ref) != {'path', 'sha256'}:
+            raise ValueError('Malformed ' + label + ' receipt')
+        path, data, doc = _read(ref['path'])
+        if sha(data) != ref['sha256']:
+            raise ValueError(label + ' changed')
+        return path, data, doc
+
+    pgraph_path, pgraph_bytes, pgraph = checked(parent['graph_export'], 'parent graph')
+    prep_path, prep_bytes, prep = checked(parent['rebase_report'], 'parent report')
+    pstate_path, pstate_bytes, pstate = checked(parent['state'], 'parent state')
+    old_path, old_bytes, _ = checked(parent['old_identity_map'], 'parent old map')
+    input_path, input_bytes, _ = checked(parent['new_identity_map'], 'parent output map')
+    inherited_source_policy = pgraph.get('source_policy')
+    if (inherited_source_policy not in (None, 'authenticated-watch-radio-only-v1')
+            or ('source_policy' in prep) != (inherited_source_policy is not None)
+            or ('source_policy' in prep
+                and prep.get('source_policy') != inherited_source_policy)
+            or ('source_policy' in pgraph) != ('source_policy' in prep)
+            or prep.get('producer') != CHAIN_PRODUCER
+            or (prep.get('identity_map_rebinding') or {}).get('new_identity_map') != parent['new_identity_map']
+            or pgraph.get('source_identity_map_rebinding_report_sha256') != sha(prep_bytes)
+            or pgraph.get('source_state_sha256') != sha(pstate_bytes)):
+        raise ValueError('Album chain child does not bind the exact parent rebind')
+    parent_receipts = verify_alias_chain_growth_rebinding_report(
+        graph_doc=pgraph, report=prep, state=pstate,
+        library_hash=library_hash,
+        identity_hash=sha(input_bytes), state_path=pstate_path)
+    if (input_path != Path(binding.get('input_identity_map', {}).get('path', '')).resolve()
+            or binding.get('input_identity_map') != parent['new_identity_map']):
+        raise ValueError('Album alias chain child starts from a different parent map')
+    if (('source_policy' in binding) != (inherited_source_policy is not None)
+            or ('source_policy' in report) != (inherited_source_policy is not None)
+            or ('source_policy' in graph_doc) != (inherited_source_policy is not None)
+            or (inherited_source_policy is not None
+                and (binding.get('source_policy') != inherited_source_policy
+                     or report.get('source_policy') != inherited_source_policy
+                     or graph_doc.get('source_policy') != inherited_source_policy))):
+        raise ValueError('Album alias child did not inherit exact parent source policy')
+    snapshot_path, snapshot_bytes, _ = checked(binding.get('track_snapshot'), 'track snapshot')
+    final_path, final_bytes, final_map = checked(binding.get('output_identity_map'), 'final map')
+    tracks, actual_library_hash, _ = load_library(track_snapshot=snapshot_path)
+    if (actual_library_hash != library_hash or sha(final_bytes) != identity_hash
+            or _resolve_source_state_path(report.get('source_state_path')) != Path(state_path).resolve()):
+        raise ValueError('Album alias chain child is bound to a different map, Library, or state')
+    start_path = input_path
+    transition_proofs = []
+    descriptors = binding.get('album_alias_transitions')
+    if not isinstance(descriptors, list) or len(descriptors) < 1:
+        raise ValueError('Album alias chain child requires at least one ordered delta proof')
+    current_path = start_path
+    for proof in descriptors:
+        if not isinstance(proof, dict):
+            raise ValueError('Malformed album alias transition proof')
+        if proof.get('input_identity_map', {}).get('path') != str(current_path):
+            raise ValueError('Album alias transition chain is reordered or skips an intermediate map')
+        reproduced = verify_reviewed_album_alias_map_delta(
+            track_snapshot=snapshot_path,
+            input_identity_map_path=current_path,
+            output_identity_map_path=proof.get('output_identity_map', {}).get('path'),
+            proposals_path=proof.get('proposals', {}).get('path'),
+            source_evidence_path=proof.get('source_evidence', {}).get('path'),
+            candidate_audit_path=proof.get('candidate_audit', {}).get('path'),
+            review_decisions_path=proof.get('review_decisions', {}).get('path'),
+            receipt_path=proof.get('application_receipt', {}).get('path'))
+        if reproduced != proof:
+            raise ValueError('Album alias transition differs from source-bound replay')
+        transition_proofs.append(reproduced)
+        current_path = Path(reproduced['output_identity_map']['path']).resolve()
+    if current_path != final_path:
+        raise ValueError('Album alias transition chain does not reach the final map')
+    expected_state = _rebind_state_map_hash(pstate, identity_hash)
+    if (state != expected_state or binding.get('old_state_sha256') != pstate.get('state_sha256')
+            or binding.get('new_state_sha256') != state.get('state_sha256')
+            or report.get('next_state_sha256') != state.get('state_sha256')
+            or Path(report.get('source_state_path', '')).resolve() != Path(state_path).resolve()):
+        raise ValueError('Album alias chain child changed state beyond the map hash')
+    parent_roots = pgraph.get('accepted_roots')
+    if graph_doc.get('accepted_roots') != parent_roots:
+        raise ValueError('Album alias chain child changed accepted roots or order')
+    _validate_state_graph_relation_projection(
+        parent_roots, _state_graph_rows(pstate), 'Verified album-chain parent')
+    _validate_state_graph_relation_projection(
+        parent_roots, _state_graph_rows(state), 'Verified album-chain child')
+    final_matcher = IdentityMap(final_map, tracks, library_hash)
+    if plan_genius_update(state, _state_graph_rows(state), final_matcher,
+                          library_hash, identity_hash)['next_state']['state_sha256'] != state['state_sha256']:
+        raise ValueError('Album alias chain child state does not reproduce under final map')
+    if report.get('relation_revalidation') != prep.get('relation_revalidation'):
+        raise ValueError('Album alias chain child changed source relation audit')
+    expected_inputs = list(parent_receipts) + [
+        _receipt(pgraph_path), _receipt(prep_path), _receipt(pstate_path),
+        _receipt(old_path), _receipt(input_path)]
+    for proof in transition_proofs:
+        expected_inputs.extend(proof[key] for key in (
+            'track_snapshot', 'input_identity_map', 'output_identity_map',
+            'application_receipt', 'proposals', 'source_evidence',
+            'candidate_audit', 'review_decisions'))
+    expected_inputs.extend([_receipt(snapshot_path), _receipt(final_path),
+                            _receipt(Path(state_path).resolve())])
+    expected = _proof_input_receipts(expected_inputs)
+    saved = _canonical_receipt_rows(binding.get('proof_input_receipts'))
+    if saved != expected:
+        raise ValueError('Album alias child omits or changes its transitive source closure')
+    return saved
+
+
+def _resolve_source_state_path(value):
+    if not isinstance(value, str) or not value:
+        raise ValueError('Typed report has no source state path')
+    return Path(value).resolve()
