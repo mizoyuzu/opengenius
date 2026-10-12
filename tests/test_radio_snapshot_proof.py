@@ -953,8 +953,9 @@ class RadioSnapshotProofTests(unittest.TestCase):
                    return_value=(self.tracks, LIBRARY, None)), \
                 patch('radio_snapshot_proof.select_seed_video_evidence',
                       return_value={ROOT: {'video_id': self.arguments['videoId']}}):
-            with self.assertRaisesRegex(ValueError, 'no_strict_unique_outgoing_targets'):
+            with self.assertRaisesRegex(ValueError, 'no_strict_unique_outgoing_targets') as caught:
                 self.create(output)
+        self.assertEqual(caught.exception.details, {})
 
     def test_rejects_album_version_and_forced_ambiguous_pid_targets(self):
         cases = (
@@ -1289,6 +1290,99 @@ class RadioSnapshotProofTests(unittest.TestCase):
         self.assertEqual(receipt['details']['seed_video_search_binding']['kind'],
                          'authenticated-search-resolver-seed-ineligible-v1')
         self.assertEqual(receipt['accepted_edges'], [])
+
+    def _configure_search_bound_seed_without_targets(self):
+        self.configure_search_derived_seed()
+        self.raw_tracks = copy.deepcopy(self.raw_tracks)
+        self.raw_tracks[1]['album']['name'] = 'Unmatched Album'
+        self.cache_path = self.write('no-target-radio-cache.json', {
+            'endpoint': 'get_watch_playlist', 'arguments': self.arguments,
+            'observed_at': self.observed_at, 'response': {'tracks': self.raw_tracks},
+        })
+        snapshot = json.loads(self.snapshot_path.read_text(encoding='utf-8'))
+        snapshot['observations'] = observe(
+            self.raw_tracks, 'radio', self.observed_at, self.tracks,
+            self.arguments['videoId'], candidate_matcher=self.matcher.match)
+        self.snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False),
+                                      encoding='utf-8')
+        summary = json.loads(self.summary_path.read_text(encoding='utf-8'))
+        summary['results'] = [{**collector_result_summary(snapshot), 'status': 'collected'}]
+        self.summary_path.write_text(json.dumps(summary, ensure_ascii=False),
+                                     encoding='utf-8')
+        shutil.rmtree(self.root / 'typed-radio-only-batch', ignore_errors=True)
+        return self._relocate_search_fixture_to_radio_only_batch(snapshot, summary)
+
+    def test_authenticated_strict_seed_with_zero_targets_is_typed_without_edges(self):
+        batch, manifest_path, summary_path, evidence_path, snapshot_paths = \
+            self._configure_search_bound_seed_without_targets()
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        seed = manifest['seeds'][0]
+        with patch('radio_snapshot_proof.load_library',
+                   return_value=(self.tracks, LIBRARY, None)), \
+                patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+            receipt = radio_growth_merge._collected_seed_ineligible_disposition(
+                seed, {}, source_policy='authenticated-watch-radio-only-v1',
+                collector_summary=json.loads(summary_path.read_text()),
+                collector_summary_path=summary_path, seed_manifest=manifest,
+                seed_manifest_path=manifest_path, seed_video_evidence_path=evidence_path,
+                snapshot_paths=snapshot_paths, track_snapshot_path=self.track_path,
+                identity_map_path=self.identity_path, library_hash=LIBRARY,
+                identity_hash=self.map_hash)
+        self.assertEqual(receipt['status'], 'collected_seed_no_strict_outgoing_targets')
+        self.assertEqual(receipt['reason'], 'no_strict_unique_outgoing_targets')
+        self.assertEqual(receipt['details']['accepted_edges'], [])
+        binding = receipt['details']['seed_video_search_binding']
+        self.assertEqual(binding['kind'], 'authenticated-search-strict-unique-seed-v1')
+        self.assertEqual(binding['persistent_id'], ROOT)
+        self.assertEqual(binding['strict_unique_video_ids'], [self.arguments['videoId']])
+        self.assertEqual(receipt['accepted_edges'], [])
+        self.assertEqual(sum(row['name'] == 'raw_radio_cache'
+                             for row in receipt['source_receipts']), 1)
+        self.assertEqual(sum(row['name'] == 'raw_search_cache'
+                             for row in receipt['source_receipts']), 1)
+
+    def test_zero_target_disposition_rejects_observation_or_raw_cache_tampering(self):
+        for index, tamper in enumerate(('observations', 'raw_cache')):
+            with self.subTest(tamper=tamper):
+                if index:
+                    self.tearDown()
+                    self.setUp()
+                batch, manifest_path, summary_path, evidence_path, snapshot_paths = \
+                    self._configure_search_bound_seed_without_targets()
+                manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+                collector_snapshot = manifest_path.parent / (ROOT + '.json')
+                snapshot = json.loads(collector_snapshot.read_text(encoding='utf-8'))
+                if tamper == 'observations':
+                    snapshot['observations'] = []
+                    collector_snapshot.write_text(json.dumps(snapshot, ensure_ascii=False),
+                                                  encoding='utf-8')
+                    summary = json.loads(summary_path.read_text(encoding='utf-8'))
+                    summary['results'] = [{**collector_result_summary(snapshot),
+                                           'status': 'collected'}]
+                    summary_path.write_text(json.dumps(summary, ensure_ascii=False),
+                                             encoding='utf-8')
+                else:
+                    cache_path = radio_proof._request_cache_path(
+                        collector_snapshot, 'get_watch_playlist', self.arguments)
+                    cache = json.loads(cache_path.read_text(encoding='utf-8'))
+                    cache['response']['tracks'][1]['album']['name'] = 'Forged Cache Album'
+                    cache_path.write_text(json.dumps(cache, ensure_ascii=False),
+                                          encoding='utf-8')
+                with patch('radio_snapshot_proof.load_library',
+                           return_value=(self.tracks, LIBRARY, None)), \
+                        patch('radio_snapshot_proof.select_seed_video_evidence', return_value={}):
+                    with self.assertRaisesRegex(ValueError, 'Raw radio response does not reproduce'):
+                        radio_growth_merge._collected_seed_ineligible_disposition(
+                            manifest['seeds'][0], {},
+                            source_policy='authenticated-watch-radio-only-v1',
+                            collector_summary=json.loads(summary_path.read_text()),
+                            collector_summary_path=summary_path, seed_manifest=manifest,
+                            seed_manifest_path=manifest_path,
+                            seed_video_evidence_path=evidence_path,
+                            snapshot_paths=snapshot_paths,
+                            track_snapshot_path=self.track_path,
+                            identity_map_path=self.identity_path, library_hash=LIBRARY,
+                            identity_hash=self.map_hash)
 
     def test_merge_refuses_to_type_a_fully_eligible_seed_as_ineligible(self):
         self.configure_search_derived_seed()

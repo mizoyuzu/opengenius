@@ -1354,11 +1354,25 @@ def _collected_seed_ineligible_disposition(seed, selected_hints, *, source_polic
             sealed_at_utc=radio_request.get('observed_at'))
     except RadioSnapshotIneligible as exc:
         binding = exc.details.get('seed_video_search_binding')
-        if (exc.persistent_id != pid or exc.reason != 'seed_not_strictly_matched'
-                or not isinstance(binding, dict)
-                or binding.get('kind') != 'authenticated-search-resolver-seed-ineligible-v1'
-                or binding.get('persistent_id') != pid
-                or binding.get('strict_unique') is not False):
+        seed_gate_failed = (
+            exc.reason == 'seed_not_strictly_matched'
+            and isinstance(binding, dict)
+            and binding.get('kind') == 'authenticated-search-resolver-seed-ineligible-v1'
+            and binding.get('persistent_id') == pid
+            and binding.get('strict_unique') is False)
+        no_targets = (
+            exc.reason == 'no_strict_unique_outgoing_targets'
+            and isinstance(binding, dict)
+            and binding.get('kind') == 'authenticated-search-strict-unique-seed-v1'
+            and binding.get('persistent_id') == pid
+            and isinstance(binding.get('resolver'), dict)
+            and binding['resolver'].get('video_id') == snapshot.get('selected_video_id')
+            and binding.get('strict_unique_video_ids') == [snapshot.get('selected_video_id')]
+            and exc.details.get('selected_video_id') == snapshot.get('selected_video_id')
+            and exc.details.get('strict_unique_target_video_count') == 0
+            and exc.details.get('outgoing_target_pids') == []
+            and exc.details.get('accepted_edges') == [])
+        if (exc.persistent_id != pid or not (seed_gate_failed or no_targets)):
             raise ValueError('Collector seed has an unsupported ineligible proof outcome') from None
         receipts = []
         for label, path in source_paths:
@@ -1382,7 +1396,8 @@ def _collected_seed_ineligible_disposition(seed, selected_hints, *, source_polic
             'schema_version': 1,
             'producer': 'opengenius-authenticated-search-strict-ineligible-seed-v1',
             'persistent_id': pid,
-            'status': 'collected_seed_strictly_ineligible',
+            'status': ('collected_seed_strictly_ineligible' if seed_gate_failed
+                       else 'collected_seed_no_strict_outgoing_targets'),
             'reason': exc.reason,
             'details': exc.details,
             'source_receipts': receipts,

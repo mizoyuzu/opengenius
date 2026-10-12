@@ -721,7 +721,20 @@ def _proof_from_inputs(*, track_snapshot_path, identity_map_path, snapshot_path,
             target_pids.append(target)
             seen.add(target)
     if not target_pids:
-        raise RadioSnapshotIneligible(pid)
+        # Keep the historic no-search exception payload unchanged. The extra
+        # receipt is only for the typed search-derived zero-edge disposition.
+        if seed_video_search_binding is None:
+            raise RadioSnapshotIneligible(pid)
+        details = {
+            'selected_video_id': selected_video_id,
+            'strict_unique_target_video_count': len(target_by_video),
+            'outgoing_target_pids': target_pids,
+            'accepted_edges': [],
+        }
+        if seed_video_search_binding is not None:
+            details['seed_video_search_binding'] = seed_video_search_binding
+        raise RadioSnapshotIneligible(
+            pid, 'no_strict_unique_outgoing_targets', details)
     eligible_positions = sorted({position for row in target_by_video.values()
                                  for position in row['positions']})
     strict_observations = [row for row in replayed
