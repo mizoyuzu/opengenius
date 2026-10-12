@@ -20,6 +20,25 @@ from probe_ytmusic import collect, local_candidates, normalize
 from seed_video_evidence import select_seed_video_evidence
 
 
+MAX_BATCH_SEEDS = 100
+MAX_BATCH_REQUEST_BUDGET = 450
+
+
+def validate_batch_limits(seeds, request_budget):
+    return (type(seeds) is int and 1 <= seeds <= MAX_BATCH_SEEDS
+            and type(request_budget) is int
+            and 1 <= request_budget <= MAX_BATCH_REQUEST_BUDGET)
+
+
+def validate_batch_profile(seeds, request_budget, collection_mode,
+                           seed_query_fallback):
+    if not validate_batch_limits(seeds, request_budget):
+        return False
+    scaled = seeds > 20 or request_budget > 100
+    return (not scaled or
+            (collection_mode == 'radio-only-v1' and not seed_query_fallback))
+
+
 SAFE_KEYS = {'videoId', 'title', 'artists', 'name', 'id', 'album', 'length',
              'duration_seconds', 'videoType', 'related', 'tracks', 'contents'}
 
@@ -341,10 +360,11 @@ def main():
         parser.error('Specify either bundle or --track-snapshot')
     if (args.bundle and output.is_relative_to(args.bundle.resolve())) or output == args.auth.resolve():
         parser.error('output must be outside the library and auth file')
-    if (not 1 <= args.seeds <= 20 or not 25 <= args.candidate_limit <= 100
-            or not math.isfinite(args.interval)
-            or args.interval < 2 or not 1 <= args.request_budget <= 100):
-        parser.error('seeds: 1..20; candidate-limit: 25..100; interval: finite and >=2; request-budget: 1..100')
+    if (not validate_batch_profile(args.seeds, args.request_budget,
+                                   args.collection_mode, args.seed_query_fallback)
+            or not 25 <= args.candidate_limit <= 100
+            or not math.isfinite(args.interval) or args.interval < 2):
+        parser.error('seeds: 1..100; candidate-limit: 25..100; interval: finite and >=2; request-budget: 1..450; scaled batches require radio-only collection and no seed-query fallback')
     try:
         deadline_at = parse_deadline(args.deadline)
     except ValueError:

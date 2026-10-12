@@ -13,9 +13,17 @@ class RecoveryUnsafe(ValueError):
 def runner_config_sha256(config):
     if (not isinstance(config, dict)
             or type(config.get('batch_request_budget')) is not int
-            or not 1 <= config['batch_request_budget'] <= 100
+            or not 1 <= config['batch_request_budget'] <= 450
             or 'deadline' not in config):
         raise RecoveryUnsafe('Runner config must bind batch request budget and deadline policy')
+    batch_size = config.get('batch_size')
+    if batch_size is not None and (type(batch_size) is not int or not 1 <= batch_size <= 100):
+        raise RecoveryUnsafe('Runner config has an invalid batch size')
+    scaled = ((type(batch_size) is int and batch_size > 20)
+              or config['batch_request_budget'] > 100)
+    if scaled and (config.get('source_policy') != 'authenticated-watch-radio-only-v1'
+                   or config.get('collector_collection_mode') != 'radio-only-v1'):
+        raise RecoveryUnsafe('Scaled runner config requires authenticated radio-only source and collector modes')
     deadline = config['deadline']
     if deadline is not None:
         try:
@@ -27,6 +35,14 @@ def runner_config_sha256(config):
     encoded = json.dumps(config, ensure_ascii=False, sort_keys=True,
                          separators=(',', ':')).encode('utf-8')
     return hashlib.sha256(encoded).hexdigest()
+
+
+def scaled_collection_manifest_compatible(planned_seed_count, request_budget, manifest):
+    scaled = planned_seed_count > 20 or request_budget > 100
+    return (not scaled or
+            (isinstance(manifest, dict)
+             and manifest.get('collector_collection_mode') == 'radio-only-v1'
+             and manifest.get('seed_query_fallback') is not True))
 
 
 def replay_growth_checkpoint(*, previous_growth, track_snapshot, identity_map_path,
@@ -352,6 +368,9 @@ def _recover_orphan_batch_with_radio_proof_cache(batch_dir, *, expected_config_s
                         'seed_count': len(planned)}
     manifest_pids = [row.get('persistent_id') for row in manifest.get('seeds', [])
                      if isinstance(row, dict)]
+    if not scaled_collection_manifest_compatible(
+            len(planned), intent.get('request_budget', 0), manifest):
+        raise RecoveryUnsafe('Scaled collector manifest must bind radio-only collection without title fallback')
     if (manifest.get('library_sha256') != library_sha256
             or manifest.get('identity_map_sha256') != identity_map_sha256
             or manifest.get('seed_plan_sha256') != intent['seed_plan']['sha256']

@@ -28,6 +28,26 @@ from genuine_root_recovery import (
 )
 
 
+MAX_BATCH_SIZE = 100
+MAX_BATCH_REQUEST_BUDGET = 450
+
+
+def validate_batch_limits(batch_size, batch_request_budget):
+    return (type(batch_size) is int and 1 <= batch_size <= MAX_BATCH_SIZE
+            and type(batch_request_budget) is int
+            and 1 <= batch_request_budget <= MAX_BATCH_REQUEST_BUDGET)
+
+
+def validate_batch_profile(batch_size, batch_request_budget, source_policy,
+                           collector_collection_mode):
+    if not validate_batch_limits(batch_size, batch_request_budget):
+        return False
+    scaled = batch_size > 20 or batch_request_budget > 100
+    return (not scaled or
+            (source_policy == 'authenticated-watch-radio-only-v1'
+             and collector_collection_mode == 'radio-only-v1'))
+
+
 def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -1281,6 +1301,12 @@ def _invoke(command):
 
 
 def _run_with_radio_proof_cache(args):
+    if not validate_batch_profile(
+            getattr(args, 'batch_size', 20),
+            getattr(args, 'batch_request_budget', 90),
+            getattr(args, 'source_policy', None),
+            getattr(args, 'collector_collection_mode', None)):
+        raise ValueError('Scaled batches require authenticated radio-only source and collector modes')
     output = args.output.resolve()
     diagnostics_path = getattr(args, 'proof_cache_diagnostics', None)
     if diagnostics_path is not None:
@@ -1467,7 +1493,7 @@ def _run_with_radio_proof_cache(args):
             progress['pause_reason'] = 'stop_after_batches'
             break
         used_attempt_slots = len(attempted) + (len(planned_only) if args.plan_only else 0)
-        count = min(args.batch_size, args.max_attempts - used_attempt_slots, 20)
+        count = min(args.batch_size, args.max_attempts - used_attempt_slots)
         # Hints only affect which PID is attempted; they never add a graph edge.
         snapshots = _growth_snapshot_receipts(active_growth)
         evidence = build_seed_video_evidence(snapshots, matcher, library_hash, identity_hash)
@@ -1663,14 +1689,16 @@ def main():
                         help='In plan-only mode, validate at most this many dynamic evidence batches')
     args = parser.parse_args()
     if (args.target_outgoing_roots < 1 or args.global_request_budget < 1
-            or args.max_attempts < 1 or not 1 <= args.batch_size <= 20
-            or not 1 <= args.batch_request_budget <= 100
+            or args.max_attempts < 1
+            or not validate_batch_profile(
+                args.batch_size, args.batch_request_budget, args.source_policy,
+                args.collector_collection_mode)
             or (args.stop_after_batches is not None and args.stop_after_batches < 0)
             or (args.plan_only_batches is not None and args.plan_only_batches < 1)
             or (args.plan_only_batches is not None and not args.plan_only)
             or not 25 <= args.candidate_limit <= 100
             or not math.isfinite(args.interval) or args.interval < 3):
-        parser.error('roots, request budget and attempts must be positive; batch size 1..20; batch request budget 1..100; interval >=3')
+        parser.error('roots, request budget and attempts must be positive; batch size 1..100; batch request budget 1..450; scaled batches require authenticated radio-only source and collector modes; interval >=3')
     if args.deadline is not None:
         from probe_ytmusic_batch import parse_deadline
         try:

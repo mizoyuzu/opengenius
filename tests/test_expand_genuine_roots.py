@@ -666,6 +666,9 @@ class GenuineRootRunnerTests(unittest.TestCase):
                 'seed_plan_sha256': runner._sha(plan_path.read_bytes()),
                 'seed_video_evidence_sha256': runner._sha(evidence_path.read_bytes()),
                 'seeds': seeds,
+                **({'collector_collection_mode': 'radio-only-v1'}
+                   if intent['runner_config'].get('collector_collection_mode') == 'radio-only-v1'
+                   else {}),
             }), encoding='utf-8')
             (collector_dir / 'summary-001.json').write_text(json.dumps({
                 'schema_version': 1, 'status': 'completed',
@@ -677,6 +680,30 @@ class GenuineRootRunnerTests(unittest.TestCase):
             return 0
 
         return args, tracks, collect
+
+    def test_hundred_seed_batch_promotes_every_attempt_and_exact_request_charge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args, _, collect = self._run_fixture(root)
+            tracks = [track(f'{number:016X}', artist=f'Artist {number}',
+                            album=f'Album {number}')
+                      for number in range(1, 101)]
+            args.batch_size = 100
+            args.batch_request_budget = 450
+            args.global_request_budget = 450
+            args.max_attempts = 100
+            args.source_policy = 'authenticated-watch-radio-only-v1'
+            args.collector_collection_mode = 'radio-only-v1'
+            with patch.object(runner, 'load_library', return_value=(tracks, LIBRARY, {})), \
+                    patch.object(runner, 'IdentityMap', return_value=Matcher()), \
+                    patch.object(runner, '_replay_checkpoint', return_value={'outgoing_root_count': 0}), \
+                    patch.object(runner, '_invoke', side_effect=collect):
+                progress = runner.run(args)
+            self.assertEqual(len(progress['batches']), 1)
+            self.assertEqual(len(progress['batches'][0]['seed_pids']), 100)
+            self.assertEqual(len(progress['attempted_pids']), 100)
+            self.assertEqual(progress['batches'][0]['request_budget'], 450)
+            self.assertEqual(progress['http_requests'], 1)
 
     def test_all_unresolved_batches_consume_attempts_and_terminate(self):
         with tempfile.TemporaryDirectory() as directory:
