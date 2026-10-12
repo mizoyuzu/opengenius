@@ -17,6 +17,7 @@ from music_identity_map import IdentityMap, load_library
 from plan_genius_update import _source as _identity_source, plan_genius_update
 from seed_video_evidence import select_seed_video_evidence
 from probe_ytmusic_batch import resolve_seed_search
+from radio_snapshot_proof import radio_snapshot_proof_validation_pass
 from update_genius_bundle import state_rows
 from genius_format import parse_similarities
 
@@ -537,7 +538,7 @@ def _append_graphs(old_roots, new_roots):
     return roots, old_edges
 
 
-def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
+def _validate_run_receipt_inner(run, tracks, matcher, library_hash, identity_hash):
     """Recheck one completed/authenticated collector run and its saved inputs."""
     summary_info = run.get('collector_summary')
     seed_info = run.get('seed_manifest')
@@ -751,6 +752,13 @@ def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
     if run.get('resulting_state_sha256'):
         normalized_run['resulting_state_sha256'] = run['resulting_state_sha256']
     return incoming_roots, normalized_run
+
+
+def _validate_run_receipt(run, tracks, matcher, library_hash, identity_hash):
+    """Replay one receipt and seal shared proof sources before returning it."""
+    with radio_snapshot_proof_validation_pass():
+        return _validate_run_receipt_inner(
+            run, tracks, matcher, library_hash, identity_hash)
 
 
 def _validate_source_policy_history(accepted_policy, policy_transition, runs):

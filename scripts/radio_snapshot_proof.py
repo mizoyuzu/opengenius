@@ -29,6 +29,7 @@ import seed_video_evidence as _seed_video_evidence
 PRODUCER = 'opengenius-authenticated-radio-snapshot-proof-v1'
 POLICY = 'authenticated-watch-radio-only-v1'
 _ACTIVE_VERIFICATION_CACHE = ContextVar('radio_snapshot_proof_verification_cache', default=None)
+_ACTIVE_VERIFICATION_PASS = ContextVar('radio_snapshot_proof_validation_pass', default=None)
 # A 1000-root campaign can verify hundreds of source receipts in one
 # chronological replay. Keep enough results for that replay while bounding
 # retained closure memory (representative serialized entry: about 194 KiB).
@@ -70,6 +71,10 @@ def radio_snapshot_proof_cache_scope():
         'verified_results': 0,
         'verified_outgoing_target_count_total': 0,
         'verified_outgoing_edge_count_total': 0,
+        'validation_passes': 0,
+        'pass_coalesced_hits': 0,
+        'pass_boundary_seal_seconds': 0.0,
+        'pass_boundary_entries': 0,
         'scope_wall_seconds': 0.0,
     }
     token = _ACTIVE_VERIFICATION_CACHE.set(cache)
@@ -79,6 +84,61 @@ def radio_snapshot_proof_cache_scope():
     finally:
         cache.stats['scope_wall_seconds'] += time.perf_counter() - started
         _ACTIVE_VERIFICATION_CACHE.reset(token)
+
+
+@contextmanager
+def radio_snapshot_proof_validation_pass():
+    """Deduplicate closure hashing within one read-only run receipt replay.
+
+    Cache entries touched during the pass are rehashed as one exact union
+    immediately before the pass returns. Callers must not commit output until
+    this context exits successfully. Nested passes share the owner boundary.
+    """
+    active = _ACTIVE_VERIFICATION_PASS.get()
+    if active is not None:
+        active['nested'] += 1
+        try:
+            yield active
+        finally:
+            active['nested'] -= 1
+        return
+    state = {'closures': {}, 'keys': set(), 'nested': 0}
+    token = _ACTIVE_VERIFICATION_PASS.set(state)
+    cache = _ACTIVE_VERIFICATION_CACHE.get()
+    if cache is not None:
+        cache.stats['validation_passes'] += 1
+    failed = False
+    try:
+        yield state
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        try:
+            seal_started = time.perf_counter()
+            if state['closures']:
+                _rehash_cached_closure(tuple(sorted(state['closures'].items())))
+            if cache is not None:
+                cache.stats['pass_boundary_seal_seconds'] += time.perf_counter() - seal_started
+                cache.stats['pass_boundary_entries'] += len(state['closures'])
+        except BaseException:
+            if not failed:
+                raise
+        finally:
+            _ACTIVE_VERIFICATION_PASS.reset(token)
+
+
+def _add_to_validation_pass(cache_key, receipts):
+    state = _ACTIVE_VERIFICATION_PASS.get()
+    if state is None:
+        return False
+    for path, digest in receipts:
+        previous = state['closures'].get(path)
+        if previous is not None and previous != digest:
+            raise ValueError('Conflicting radio-proof receipts within validation pass: ' + path)
+        state['closures'][path] = digest
+    state['keys'].add(cache_key)
+    return True
 
 
 def _verified_source_closure(proof):
@@ -904,9 +964,18 @@ def verify_radio_snapshot_proof(proof_path):
         cache.stats['verify_calls'] += 1
     if cache is not None and cache_key in cache:
         cached = cache[cache_key]
-        started = time.perf_counter()
-        _rehash_cached_closure(cached['source_closure'])
-        cache.stats['cache_hit_rehash_seconds'] += time.perf_counter() - started
+        pass_state = _ACTIVE_VERIFICATION_PASS.get()
+        if pass_state is None or cache_key not in pass_state['keys']:
+            if pass_state is None:
+                started = time.perf_counter()
+                _rehash_cached_closure(cached['source_closure'])
+                cache.stats['cache_hit_rehash_seconds'] += time.perf_counter() - started
+            else:
+                _add_to_validation_pass(cache_key, cached['source_closure'])
+                cache.stats['pass_coalesced_hits'] += 1
+        else:
+            _add_to_validation_pass(cache_key, cached['source_closure'])
+            cache.stats['pass_coalesced_hits'] += 1
         cache.stats['cache_hits'] += 1
         cache.stats['verified_results'] += 1
         cache.stats['verified_outgoing_target_count_total'] += cached['result']['outgoing_target_count']
@@ -968,6 +1037,7 @@ def verify_radio_snapshot_proof(proof_path):
             if path.startswith('@directory:')))
         if directory_state_before != closure_directory_state:
             raise ValueError('A cached-search source directory changed while sealing proof memo')
+        _add_to_validation_pass(cache_key, source_closure)
         cache[cache_key] = {'source_closure': source_closure,
                             'result': deepcopy(result)}
         cache.move_to_end(cache_key)

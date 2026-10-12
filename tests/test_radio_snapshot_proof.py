@@ -20,6 +20,7 @@ from radio_snapshot_proof import (create_radio_snapshot_proof,
                                   RadioSnapshotIneligible,
                                   radio_only_snapshot_from_proof,
                                   radio_snapshot_proof_cache_scope,
+                                  radio_snapshot_proof_validation_pass,
                                   verify_radio_snapshot_proof)
 import radio_snapshot_proof as radio_proof
 from radio_source_integration import prepare_radio_only_snapshots
@@ -567,6 +568,51 @@ class RadioSnapshotProofTests(unittest.TestCase):
         self.assertEqual(outer_stats['cache_misses'], 1)
         self.assertEqual(outer_stats['cache_hits'], 1)
         self.assertIsNone(radio_proof._ACTIVE_VERIFICATION_CACHE.get())
+
+    def test_validation_pass_coalesces_rehashes_and_seals_once_before_return(self):
+        output = self.root / 'proof-validation-pass.json'
+        self.create(output)
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        with load_patch, selector_patch, patch(
+                'radio_snapshot_proof._rehash_cached_closure',
+                wraps=radio_proof._rehash_cached_closure) as rehash:
+            with radio_snapshot_proof_cache_scope() as stats:
+                self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+                with radio_snapshot_proof_validation_pass() as replay_pass:
+                    self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+                    self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+                    self.assertEqual(rehash.call_count, 0)
+                    self.assertEqual(len(replay_pass['keys']), 1)
+                self.assertEqual(rehash.call_count, 1)
+                self.assertEqual(stats['validation_passes'], 1)
+                self.assertEqual(stats['pass_coalesced_hits'], 2)
+                self.assertGreater(stats['pass_boundary_entries'], 0)
+                self.assertEqual(stats['cache_hit_rehash_seconds'], 0.0)
+            self.assertIsNone(radio_proof._ACTIVE_VERIFICATION_PASS.get())
+
+    def test_validation_pass_rejects_changed_source_before_return_and_cleans_scope(self):
+        output = self.root / 'proof-validation-pass-tamper.json'
+        self.create(output)
+        load_patch, selector_patch = self.verify_with_fixture_patches(output)
+        original = self.cache_path.read_bytes()
+        with load_patch, selector_patch, radio_snapshot_proof_cache_scope():
+            self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+            with self.assertRaisesRegex(ValueError, 'cached radio-proof source receipt changed'):
+                with radio_snapshot_proof_validation_pass():
+                    self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+                    self.cache_path.write_text('{"tampered":true}', encoding='utf-8')
+            self.assertIsNone(radio_proof._ACTIVE_VERIFICATION_PASS.get())
+            self.cache_path.write_bytes(original)
+            self.assertTrue(verify_radio_snapshot_proof(output)['verified'])
+
+    def test_validation_pass_rejects_conflicting_closure_for_reused_key(self):
+        with patch('radio_snapshot_proof._rehash_cached_closure'), \
+                radio_snapshot_proof_validation_pass():
+            radio_proof._add_to_validation_pass(
+                ('same-key',), (('/tmp/source.json', 'a' * 64),))
+            with self.assertRaisesRegex(ValueError, 'Conflicting radio-proof receipts'):
+                radio_proof._add_to_validation_pass(
+                    ('same-key',), (('/tmp/source.json', 'b' * 64),))
 
     def test_top_level_proof_scopes_are_independent_and_exception_safe(self):
         output = self.root / 'independent-proof-scopes.json'
