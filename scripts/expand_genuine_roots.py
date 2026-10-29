@@ -1663,8 +1663,6 @@ def _validate_growth_receipts(growth_dir):
     if growth_dir is None:
         return
     doc = _read_json(growth_dir / 'accepted-graphs.json')
-    if doc.get('producer') != 'opengenius-ytmusic-recommendation-growth-rebased-merge-v1':
-        raise ValueError('Previous growth is not a typed rebased YT Music merge')
 
     def check(receipt):
         if (not isinstance(receipt, dict) or not isinstance(receipt.get('path'), str)
@@ -1674,7 +1672,51 @@ def _validate_growth_receipts(growth_dir):
         if _sha(path.read_bytes()) != receipt['sha256']:
             raise ValueError('A source bound by previous growth changed')
 
+    if doc.get('producer') == 'opengenius-radio-native-alias-projection-checkpoint-v1':
+        runs = doc.get('growth_runs')
+        if (not isinstance(runs, list) or len(runs) != 1
+                or runs[0].get('producer') != 'opengenius-radio-native-alias-projection-run-v1'
+                or runs[0].get('source_policy') != 'authenticated-watch-radio-only-v1'
+                or runs[0].get('http_requests') != 0
+                or runs[0].get('attempted_pid_delta') != 0):
+            raise ValueError('Native alias projection checkpoint lacks its typed zero-call run')
+
+        run = runs[0]
+        for receipt in run.get('proof_input_receipts', []):
+            check(receipt)
+        transition = run.get('source_policy_transition')
+        if (not isinstance(transition, dict)
+                or transition.get('producer') != 'opengenius-radio-native-alias-projection-v1'):
+            raise ValueError('Native alias projection has no typed boundary receipt')
+        for section in ('native_baseline', 'typed_native_alias_child'):
+            group = transition.get(section)
+            if not isinstance(group, dict) or set(group) != {'graph_export', 'rebase_report', 'state'}:
+                raise ValueError('Native alias projection has incomplete typed source receipts')
+            for receipt in group.values():
+                check(receipt)
+        return
+    if doc.get('producer') != 'opengenius-ytmusic-recommendation-growth-rebased-merge-v1':
+        raise ValueError('Previous growth is not a typed rebased YT Music merge')
+
     for run in doc.get('growth_runs', []):
+        if isinstance(run, dict) and run.get('producer') == 'opengenius-radio-native-alias-projection-run-v1':
+            if (run.get('source_policy') != 'authenticated-watch-radio-only-v1'
+                    or run.get('http_requests') != 0
+                    or run.get('attempted_pid_delta') != 0):
+                raise ValueError('Previous native alias projection run has an invalid zero-call receipt')
+            for receipt in run.get('proof_input_receipts', []):
+                check(receipt)
+            transition = run.get('source_policy_transition')
+            if (not isinstance(transition, dict)
+                    or transition.get('producer') != 'opengenius-radio-native-alias-projection-v1'):
+                raise ValueError('Previous native alias projection run lacks its typed boundary')
+            for section in ('native_baseline', 'typed_native_alias_child'):
+                group = transition.get(section)
+                if not isinstance(group, dict) or set(group) != {'graph_export', 'rebase_report', 'state'}:
+                    raise ValueError('Previous native alias projection has incomplete source receipts')
+                for receipt in group.values():
+                    check(receipt)
+            continue
         for key in ('collector_summary', 'seed_manifest'):
             check(run.get(key))
         evidence = run.get('seed_manifest', {}).get('seed_video_evidence')

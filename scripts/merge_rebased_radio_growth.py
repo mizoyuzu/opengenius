@@ -557,6 +557,219 @@ def _state_graph_rows(state):
     return roots
 
 
+def _relation_map_digest(rows):
+    mapping = _relation_map(rows, 'Native alias projection rows')
+    payload = json.dumps(mapping, ensure_ascii=False, sort_keys=True,
+                         separators=(',', ':')).encode('utf-8')
+    return sha(payload)
+
+
+def _native_alias_projection_receipt(*, child_dir, baseline_state, baseline_roots,
+                                    baseline_provenance, matcher, library_hash,
+                                    identity_hash):
+    """Verify the reviewed v13 alias child and project its PID graph to native IDs.
+
+    The alias child is a metadata-only rebind of an already accepted graph. Its
+    assignment lineage differs from this campaign's native baseline, so only
+    its fully verified PID relations may be used. The ordinary update planner
+    rebuilds state from the exact native baseline and current identity map.
+    """
+    child_dir = Path(child_dir).resolve()
+    graph_path = child_dir / 'accepted-baseline-graphs.json'
+    report_path = child_dir / 'identity-map-rebinding-report.json'
+    state_path = child_dir / 'state.json'
+    graph_doc, report, child_state, child_provenance = _verify_rebase_receipt(
+        graph_path, report_path, state_path, library_hash, identity_hash)
+    if (graph_doc.get('producer') != 'verified-identity-map-rebound-state-graph-export'
+            or report.get('producer') != 'opengenius-typed-native-genius-baseline-alias-child-v1'
+            or report.get('recording_identity_verified') is not False
+            or report.get('recording_edges_added') != 0
+            or graph_doc.get('source_policy') != 'authenticated-watch-radio-only-v1'
+            or report.get('source_policy') != 'authenticated-watch-radio-only-v1'):
+        raise ValueError('Native alias projection input has the wrong typed producer or policy')
+    child_proof_inputs = child_provenance.get('proof_input_receipts')
+    if not isinstance(child_proof_inputs, list):
+        raise ValueError('Native alias child verifier returned no proof-input closure')
+
+    def state_pid_rows(state):
+        rows = state.get('rows')
+        if not isinstance(rows, list):
+            raise ValueError('Native alias projection state has no rows')
+        output = {}
+        for row in rows:
+            if (not isinstance(row, dict)
+                    or not isinstance(row.get('persistent_id'), str)
+                    or row['persistent_id'] in output):
+                raise ValueError('Native alias projection state has malformed PID rows')
+            output[row['persistent_id']] = {
+                key: row.get(key) for key in
+                ('genius_id', 'metadata_hex', 'equivalence_labels')}
+        return output
+
+    native_rows = state_pid_rows(baseline_state)
+    child_rows = state_pid_rows(child_state)
+    if set(native_rows) - set(child_rows):
+        raise ValueError('Native alias child dropped a native PID assignment')
+    if any(child_rows[pid] != row for pid, row in native_rows.items()):
+        raise ValueError('Native alias child changed a native PID/GID/metadata row')
+
+    native_relations = _relation_map(baseline_roots, 'Native alias baseline graph')
+    child_relations = _relation_map(graph_doc.get('accepted_roots'), 'Native alias child graph')
+    for pid, edges in native_relations.items():
+        if pid not in child_relations or child_relations[pid][:len(edges)] != edges:
+            raise ValueError('Native alias child changed a native ordered relation prefix')
+
+    rebuilt = plan_genius_update(
+        baseline_state, graph_doc['accepted_roots'], matcher,
+        library_hash, identity_hash)['next_state']
+    projected_rows = _state_graph_rows(rebuilt)
+    projected_relations = _relation_map(projected_rows, 'Native alias projected state')
+    if any(projected_relations.get(pid) != edges for pid, edges in child_relations.items()):
+        raise ValueError('Native baseline projection changed a verified alias-child PID relation')
+    missing_rows = set(projected_relations) - set(child_relations)
+    if any(projected_relations[pid] for pid in missing_rows):
+        raise ValueError('Native baseline projection added an unverified nonempty relation row')
+    if set(child_relations) - set(projected_relations):
+        raise ValueError('Native baseline projection lost an alias-child relation row')
+
+    def file_ref(path):
+        path = Path(path).resolve()
+        return {'path': str(path), 'sha256': sha(path.read_bytes())}
+
+    def normalized_receipts(rows):
+        unique = {}
+        for row in rows:
+            if (not isinstance(row, dict) or set(row) != {'path', 'sha256'}
+                    or not isinstance(row.get('path'), str)
+                    or not isinstance(row.get('sha256'), str)):
+                raise ValueError('Native alias projection has a malformed proof input')
+            path = Path(row['path']).resolve()
+            receipt = {'path': str(path), 'sha256': row['sha256']}
+            if sha(path.read_bytes()) != receipt['sha256']:
+                raise ValueError('Native alias projection proof input changed')
+            prior = unique.get(str(path))
+            if prior is not None and prior != receipt:
+                raise ValueError('Native alias projection has conflicting source receipts')
+            unique[str(path)] = receipt
+        return [unique[key] for key in sorted(unique)]
+
+    proof_inputs = normalized_receipts(
+        child_proof_inputs + baseline_provenance.get('proof_input_receipts', []))
+    baseline_receipts = {
+        'graph_export': file_ref(baseline_provenance['graph_export_path']),
+        'rebase_report': file_ref(baseline_provenance['rebase_report_path']),
+        'state': file_ref(baseline_provenance['state_path']),
+    }
+    child_receipts = {
+        'graph_export': file_ref(graph_path),
+        'rebase_report': file_ref(report_path),
+        'state': file_ref(state_path),
+    }
+    transition = {
+        'schema_version': 1,
+        'producer': 'opengenius-radio-native-alias-projection-v1',
+        'source_policy': 'authenticated-watch-radio-only-v1',
+        'native_baseline': baseline_receipts,
+        'typed_native_alias_child': child_receipts,
+        'baseline_state_sha256': baseline_state.get('state_sha256'),
+        'child_state_sha256': child_state.get('state_sha256'),
+        'baseline_pid_rows_sha256': _relation_map_digest(baseline_roots),
+        'child_pid_rows_sha256': _relation_map_digest(projected_rows),
+        'http_requests_added': 0,
+        'attempted_pid_delta': 0,
+        'added_nonempty_roots': 0,
+        'added_edges': 0,
+    }
+    run = {
+        'schema_version': 1,
+        'producer': 'opengenius-radio-native-alias-projection-run-v1',
+        'source_policy': 'authenticated-watch-radio-only-v1',
+        'source_policy_transition': transition,
+        'typed_native_alias_child': child_receipts,
+        'proof_input_receipts': proof_inputs,
+        'http_requests': 0,
+        'attempted_pid_delta': 0,
+        'resulting_state_sha256': rebuilt['state_sha256'],
+    }
+    return rebuilt, projected_rows, transition, run, proof_inputs
+
+
+def _native_alias_projection_documents(*, child_dir, baseline_state,
+                                       baseline_roots, baseline_provenance,
+                                       matcher, library_hash, identity_hash):
+    rebuilt, roots, transition, run, proof_inputs = _native_alias_projection_receipt(
+        child_dir=child_dir, baseline_state=baseline_state,
+        baseline_roots=baseline_roots, baseline_provenance=baseline_provenance,
+        matcher=matcher, library_hash=library_hash, identity_hash=identity_hash)
+    accepted = {
+        'schema_version': 1,
+        'producer': 'opengenius-radio-native-alias-projection-checkpoint-v1',
+        'library_sha256': library_hash,
+        'identity_map_sha256': identity_hash,
+        'source_policy': 'authenticated-watch-radio-only-v1',
+        'baseline_state_sha256': baseline_state['state_sha256'],
+        'baseline_accepted_roots': baseline_roots,
+        'baseline_rebase_provenance': baseline_provenance,
+        'accepted_roots': roots,
+        'source_policy_transition': transition,
+        'growth_runs': [run],
+    }
+    relations = {
+        'schema_version': 1,
+        'producer': 'opengenius-radio-native-alias-projection-relations-v1',
+        'relation_rows': roots,
+    }
+    evaluation = {
+        'schema_version': 1,
+        'producer': 'opengenius-radio-native-alias-projection-evaluation-v1',
+        'virtual_state_sha256': rebuilt['state_sha256'],
+        'relation_rows': roots,
+        'http_requests_added': 0,
+        'attempted_pid_delta': 0,
+        'proof_input_receipts': proof_inputs,
+    }
+    return accepted, rebuilt, relations, evaluation
+
+
+def create_native_alias_projection_checkpoint(*, track_snapshot,
+        identity_map_path, baseline_state_path, baseline_graph_export_path,
+        rebase_report_path, child_dir, output_dir):
+    """Create a typed zero-call checkpoint from an already verified alias child."""
+    output_dir = Path(output_dir).resolve()
+    if output_dir.exists():
+        raise FileExistsError('Projection checkpoint output directory already exists')
+    from radio_snapshot_proof import radio_snapshot_proof_cache_scope, radio_snapshot_proof_validation_pass
+    from seed_video_evidence import seed_video_selector_cache_scope
+    with radio_snapshot_proof_cache_scope(), seed_video_selector_cache_scope(), \
+            radio_snapshot_proof_validation_pass():
+        tracks, library_hash, _ = load_library(track_snapshot=Path(track_snapshot))
+        map_bytes = Path(identity_map_path).read_bytes()
+        identity_hash = sha(map_bytes)
+        matcher = IdentityMap(json.loads(map_bytes), tracks, library_hash)
+        baseline_doc, _, baseline_state, baseline_provenance = _verify_rebase_receipt(
+            baseline_graph_export_path, rebase_report_path, baseline_state_path,
+            library_hash, identity_hash)
+        baseline_roots = baseline_doc.get('accepted_roots')
+        if _relation_map(_state_graph_rows(baseline_state), 'Native baseline state') != _relation_map(
+                baseline_roots, 'Native baseline graph'):
+            raise ValueError('Native alias projection baseline differs from its verified state')
+        accepted, state, relations, evaluation = _native_alias_projection_documents(
+            child_dir=child_dir, baseline_state=baseline_state,
+            baseline_roots=baseline_roots, baseline_provenance=baseline_provenance,
+            matcher=matcher, library_hash=library_hash, identity_hash=identity_hash)
+        output_dir.mkdir(parents=True)
+        write_json(output_dir / 'accepted-graphs.json', accepted)
+        write_json(output_dir / 'state.json', state)
+        write_json(output_dir / 'relations.json', relations)
+        write_json(output_dir / 'accepted-evaluation.json', evaluation)
+        return {'producer': accepted['producer'],
+                'accepted_graphs_sha256': sha((output_dir / 'accepted-graphs.json').read_bytes()),
+                'state_sha256': state['state_sha256'],
+                'outgoing_root_count': sum(bool(row['ordered_target_pids']) for row in relations['relation_rows']),
+                'edge_count': sum(len(row['ordered_target_pids']) for row in relations['relation_rows']),
+                'http_requests_added': 0, 'attempted_pid_delta': 0}
+
+
 def _append_graphs(old_roots, new_roots):
     by_root = {row['root_pid']: {
         'root_pid': row['root_pid'],
@@ -810,6 +1023,36 @@ def _validate_source_policy_history(accepted_policy, policy_transition, runs):
         if policy_transition is not None or any(run.get('source_policy') is not None for run in runs):
             raise ValueError('Legacy growth output contains an unreviewed policy transition')
         return None
+    if (isinstance(policy_transition, dict)
+            and policy_transition.get('producer') == 'opengenius-radio-native-alias-projection-v1'):
+        required_native = {
+            'schema_version', 'producer', 'source_policy', 'native_baseline',
+            'typed_native_alias_child', 'baseline_state_sha256',
+            'child_state_sha256', 'baseline_pid_rows_sha256',
+            'child_pid_rows_sha256', 'http_requests_added',
+            'attempted_pid_delta', 'added_nonempty_roots', 'added_edges',
+        }
+        if (set(policy_transition) != required_native
+                or type(policy_transition.get('schema_version')) is not int
+                or policy_transition.get('schema_version') != 1
+                or policy_transition.get('source_policy') != radio_policy
+                or type(policy_transition.get('http_requests_added')) is not int
+                or policy_transition.get('http_requests_added') != 0
+                or type(policy_transition.get('attempted_pid_delta')) is not int
+                or policy_transition.get('attempted_pid_delta') != 0
+                or policy_transition.get('added_nonempty_roots') != 0
+                or policy_transition.get('added_edges') != 0
+                or not isinstance(policy_transition.get('native_baseline'), dict)
+                or not isinstance(policy_transition.get('typed_native_alias_child'), dict)):
+            raise ValueError('Native alias projection lacks its exact zero-call typed boundary')
+        if (not runs
+                or runs[0].get('source_policy') != radio_policy
+                or runs[0].get('source_policy_transition') != policy_transition
+                or runs[0].get('producer') != 'opengenius-radio-native-alias-projection-run-v1'
+                or any(run.get('source_policy') != radio_policy for run in runs)
+                or any('source_policy_transition' in run for run in runs[1:])):
+            raise ValueError('Native alias projection must bind the first source-policy run exactly once')
+        return 0
     required = {
         'schema_version', 'producer', 'from_policy', 'to_policy',
         'legacy_parent_growth', 'legacy_run_count',
@@ -1496,12 +1739,119 @@ def _batch_number_from_path(batch_dir):
     return int(match.group(1))
 
 
+def _verify_native_alias_projection_run(run, *, baseline_state, baseline_roots,
+                                       baseline_provenance, matcher,
+                                       library_hash, identity_hash):
+    if (not isinstance(run, dict)
+            or run.get('producer') != 'opengenius-radio-native-alias-projection-run-v1'
+            or run.get('schema_version') != 1
+            or run.get('source_policy') != 'authenticated-watch-radio-only-v1'
+            or run.get('http_requests') != 0
+            or run.get('attempted_pid_delta') != 0):
+        raise ValueError('Native alias projection run is malformed')
+    child = run.get('typed_native_alias_child')
+    if (not isinstance(child, dict)
+            or set(child) != {'graph_export', 'rebase_report', 'state'}):
+        raise ValueError('Native alias projection run lacks exact typed child receipts')
+    paths = {}
+    for name, receipt in child.items():
+        if (not isinstance(receipt, dict) or set(receipt) != {'path', 'sha256'}
+                or not isinstance(receipt.get('path'), str)
+                or not isinstance(receipt.get('sha256'), str)):
+            raise ValueError('Native alias projection child receipt is malformed')
+        path = Path(receipt['path']).resolve()
+        if sha(path.read_bytes()) != receipt['sha256']:
+            raise ValueError('Native alias projection child changed: ' + name)
+        paths[name] = path
+    if (paths['graph_export'].parent != paths['rebase_report'].parent
+            or paths['graph_export'].parent != paths['state'].parent
+            or paths['graph_export'].name != 'accepted-baseline-graphs.json'
+            or paths['rebase_report'].name != 'identity-map-rebinding-report.json'
+            or paths['state'].name != 'state.json'):
+        raise ValueError('Native alias projection receipts do not name one exact typed child')
+    accepted, state, relations, evaluation = _native_alias_projection_documents(
+        child_dir=paths['graph_export'].parent,
+        baseline_state=baseline_state, baseline_roots=baseline_roots,
+        baseline_provenance=baseline_provenance, matcher=matcher,
+        library_hash=library_hash, identity_hash=identity_hash)
+    expected_run = accepted['growth_runs'][0]
+    if run != expected_run:
+        raise ValueError('Native alias projection run differs from the current fully replayed receipt')
+    return state, accepted['accepted_roots'], expected_run
+
+
+def _replay_native_alias_projection_checkpoint(*, previous_dir, accepted,
+                                               accepted_bytes, baseline_state,
+                                               baseline_roots, baseline_provenance,
+                                               matcher, library_hash,
+                                               identity_hash):
+    previous_dir = Path(previous_dir).resolve()
+    if (accepted.get('producer') != 'opengenius-radio-native-alias-projection-checkpoint-v1'
+            or accepted.get('schema_version') != 1
+            or accepted.get('library_sha256') != library_hash
+            or accepted.get('identity_map_sha256') != identity_hash
+            or accepted.get('source_policy') != 'authenticated-watch-radio-only-v1'
+            or accepted.get('baseline_state_sha256') != baseline_state.get('state_sha256')
+            or accepted.get('baseline_accepted_roots') != baseline_roots
+            or accepted.get('baseline_rebase_provenance') != baseline_provenance):
+        raise ValueError('Native alias projection checkpoint is not bound to this exact baseline')
+    runs = accepted.get('growth_runs')
+    if not isinstance(runs, list) or len(runs) != 1:
+        raise ValueError('Native alias projection checkpoint must contain one projection run')
+    state, roots, normalized_run = _verify_native_alias_projection_run(
+        runs[0], baseline_state=baseline_state, baseline_roots=baseline_roots,
+        baseline_provenance=baseline_provenance, matcher=matcher,
+        library_hash=library_hash, identity_hash=identity_hash)
+    if accepted.get('source_policy_transition') != normalized_run['source_policy_transition']:
+        raise ValueError('Native alias projection checkpoint boundary differs from its run')
+    expected_accepted = {
+        'schema_version': 1,
+        'producer': 'opengenius-radio-native-alias-projection-checkpoint-v1',
+        'library_sha256': library_hash,
+        'identity_map_sha256': identity_hash,
+        'source_policy': 'authenticated-watch-radio-only-v1',
+        'baseline_state_sha256': baseline_state['state_sha256'],
+        'baseline_accepted_roots': baseline_roots,
+        'baseline_rebase_provenance': baseline_provenance,
+        'accepted_roots': roots,
+        'source_policy_transition': normalized_run['source_policy_transition'],
+        'growth_runs': [normalized_run],
+    }
+    relations = {
+        'schema_version': 1,
+        'producer': 'opengenius-radio-native-alias-projection-relations-v1',
+        'relation_rows': roots,
+    }
+    evaluation = {
+        'schema_version': 1,
+        'producer': 'opengenius-radio-native-alias-projection-evaluation-v1',
+        'virtual_state_sha256': state['state_sha256'],
+        'relation_rows': roots,
+        'http_requests_added': 0,
+        'attempted_pid_delta': 0,
+        'proof_input_receipts': normalized_run['proof_input_receipts'],
+    }
+    if (accepted != expected_accepted
+            or json.loads((previous_dir / 'state.json').read_bytes()) != state
+            or json.loads((previous_dir / 'relations.json').read_bytes()) != relations
+            or json.loads((previous_dir / 'accepted-evaluation.json').read_bytes()) != evaluation):
+        raise ValueError('Native alias projection checkpoint outputs cannot be reproduced exactly')
+    return state, roots, [normalized_run], sha(accepted_bytes)
+
+
 def _replay_previous_growth(previous_dir, baseline_state, baseline_roots,
                             baseline_provenance, matcher, library_hash, identity_hash):
     previous_dir = Path(previous_dir).resolve()
     accepted_path = previous_dir / 'accepted-graphs.json'
     accepted_bytes = accepted_path.read_bytes()
     accepted = json.loads(accepted_bytes)
+    if accepted.get('producer') == 'opengenius-radio-native-alias-projection-checkpoint-v1':
+        return _replay_native_alias_projection_checkpoint(
+            previous_dir=previous_dir, accepted=accepted,
+            accepted_bytes=accepted_bytes, baseline_state=baseline_state,
+            baseline_roots=baseline_roots,
+            baseline_provenance=baseline_provenance, matcher=matcher,
+            library_hash=library_hash, identity_hash=identity_hash)
     recorded_provenance = accepted.get('baseline_rebase_provenance')
     # `proof_input_receipts` was added after some accepted growth outputs had
     # already been written. The current verifier reconstructs those receipts
@@ -1550,30 +1900,39 @@ def _replay_previous_growth(previous_dir, baseline_state, baseline_roots,
     first_radio_run = _validate_source_policy_history(
         accepted_policy, policy_transition, runs)
     if accepted_policy is not None:
-        transition_parent = policy_transition.get('legacy_parent_growth')
-        transition_path = Path(transition_parent['path']).resolve()
-        transition_bytes = transition_path.read_bytes()
-        transition_graph = json.loads(transition_bytes)
-        if (sha(transition_bytes) != transition_parent['sha256']
-                or transition_graph.get('source_policy') is not None
-                or transition_graph.get('producer') != 'opengenius-ytmusic-recommendation-growth-rebased-merge-v1'):
-            raise ValueError('Radio-only policy transition parent is not the exact legacy growth graph')
+        if policy_transition.get('producer') != 'opengenius-radio-native-alias-projection-v1':
+            transition_parent = policy_transition.get('legacy_parent_growth')
+            transition_path = Path(transition_parent['path']).resolve()
+            transition_bytes = transition_path.read_bytes()
+            transition_graph = json.loads(transition_bytes)
+            if (sha(transition_bytes) != transition_parent['sha256']
+                    or transition_graph.get('source_policy') is not None
+                    or transition_graph.get('producer') != 'opengenius-ytmusic-recommendation-growth-rebased-merge-v1'):
+                raise ValueError('Radio-only policy transition parent is not the exact legacy growth graph')
     state = baseline_state
     roots = baseline_roots
     normalized_runs = []
     for run_index, run in enumerate(runs):
         if accepted_policy is not None and run_index == first_radio_run:
-            transition_parent = policy_transition['legacy_parent_growth']
-            transition_path = Path(transition_parent['path']).resolve()
-            transition_graph = json.loads(transition_path.read_bytes())
-            transition_state_path = transition_path.parent / 'state.json'
-            transition_state = json.loads(transition_state_path.read_bytes())
-            if (state.get('state_sha256') != transition_state.get('state_sha256')
-                    or _relation_map(roots, 'Replayed legacy transition roots')
-                       != _relation_map(transition_graph.get('accepted_roots'),
-                                        'Legacy transition parent roots')
-                    or run.get('source_policy_transition') != policy_transition):
-                raise ValueError('Radio-only policy boundary does not extend the exact replayed legacy graph/state')
+            if policy_transition.get('producer') != 'opengenius-radio-native-alias-projection-v1':
+                transition_parent = policy_transition['legacy_parent_growth']
+                transition_path = Path(transition_parent['path']).resolve()
+                transition_graph = json.loads(transition_path.read_bytes())
+                transition_state_path = transition_path.parent / 'state.json'
+                transition_state = json.loads(transition_state_path.read_bytes())
+                if (state.get('state_sha256') != transition_state.get('state_sha256')
+                        or _relation_map(roots, 'Replayed legacy transition roots')
+                           != _relation_map(transition_graph.get('accepted_roots'),
+                                            'Legacy transition parent roots')
+                        or run.get('source_policy_transition') != policy_transition):
+                    raise ValueError('Radio-only policy boundary does not extend the exact replayed legacy graph/state')
+        if run.get('producer') == 'opengenius-radio-native-alias-projection-run-v1':
+            state, roots, normalized = _verify_native_alias_projection_run(
+                run, baseline_state=state, baseline_roots=roots,
+                baseline_provenance=baseline_provenance, matcher=matcher,
+                library_hash=library_hash, identity_hash=identity_hash)
+            normalized_runs.append(normalized)
+            continue
         new_roots, normalized = _validate_run_receipt(
             run, matcher.tracks, matcher, library_hash, identity_hash)
         roots, _ = _append_graphs(roots, new_roots)
@@ -1694,10 +2053,10 @@ def _merge_radio_growth_with_radio_proof_cache(*, track_snapshot, identity_map_p
     graph_roots = graph_doc.get('accepted_roots')
     root_map = _relation_map(graph_roots, 'Rebased graph export')
     state_map = _relation_map(_state_graph_rows(state), 'Rebased state')
-    if root_map != state_map:
-        raise ValueError('Rebased graph export differs from the recommendation edges in its state')
+    from baseline_graph_projection_v01 import validate_projection
+    validate_projection(root_map, state_map)
     baseline_track_count = len(state_rows(state)[0])
-    if (len(root_map) != baseline_track_count
+    if (len(state_map) != baseline_track_count
             or baseline_track_count != report.get('indexed_tracks')
             or sum(map(len, root_map.values())) !=
             report['relation_revalidation']['output_directed_edge_count']):
