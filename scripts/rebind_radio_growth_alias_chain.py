@@ -255,6 +255,17 @@ def verify_v04_v11_identity_map_alias_chain(*, track_snapshot,
     predates the approved v05 receipt. Here the v05 candidate audit itself is
     validated as the proposal's source report, including every cached input.
     """
+    if (isinstance(transitions, list) and transitions
+            and all(isinstance(row, dict) and row.get('operation') ==
+                    'apply_reviewed_exact_title_spelling_aliases' for row in transitions)):
+        # Later title-only additions have their own fully replayed source,
+        # proposal, review and applier receipts. The historical credit stage
+        # below retains its special legacy audit checks unchanged.
+        return verify_reviewed_identity_map_alias_chain(
+            track_snapshot=track_snapshot,
+            input_identity_map_path=input_identity_map_path,
+            output_identity_map_path=output_identity_map_path,
+            transitions=transitions)
     if len(transitions) != 6:
         raise ValueError('Expected one reviewed credit stage and five title stages')
     snapshot_path, snapshot_bytes, _ = _read(track_snapshot)
