@@ -1171,6 +1171,14 @@ def _validate_catalog_seed_row(row, sidecar_dir, tracks, matcher,
         raise ValueError('Album-catalog row lacks saved radio album-ID provenance')
     seen_sources = set()
     for source in source_inputs:
+        if isinstance(source, dict) and source.get('source_kind') == 'observed_authenticated_album_first_page_v1':
+            from observed_album_search_origin_v01 import validate
+            validate(source, row['album_id'], album_response['title'])
+            key = (source['response_path'], source['result_position'])
+            if key in seen_sources:
+                raise ValueError('Duplicate observed album discovery source')
+            seen_sources.add(key)
+            continue
         if isinstance(source, dict) and source.get('source_kind') == 'search_album':
             required = {'source_kind', 'evidence_path', 'evidence_sha256',
                         'response_path', 'response_sha256', 'source_key',

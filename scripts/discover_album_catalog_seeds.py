@@ -248,6 +248,10 @@ def validate_album_plan(plan, library_hash, identity_map_hash):
         for source in row['source_inputs']:
             if not isinstance(source, dict):
                 raise ValueError('Album plan source provenance is malformed')
+            if source.get('source_kind') == 'observed_authenticated_album_first_page_v1':
+                from observed_album_search_origin_v01 import validate
+                validate(source, album_id, row['album_name'])
+                continue
             if source.get('source_kind') == 'search_album':
                 required = {'source_kind', 'evidence_path', 'evidence_sha256',
                             'response_path', 'response_sha256', 'source_key',
