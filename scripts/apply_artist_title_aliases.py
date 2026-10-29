@@ -46,6 +46,52 @@ def _duration_seconds(track):
     return result
 
 
+def _cached_candidate_track(example, cached, alias):
+    """Resolve one cache-bound example without manufacturing an observation.
+
+    The legacy source is a collector observation document. A saved search result
+    is instead selected by its exact response position and immutable envelope
+    receipt; only the selected raw result is adapted from ``videoId`` to the
+    field name used by the existing identity matcher.
+    """
+    source_kind = example.get('source_kind')
+    if source_kind is None:
+        row = next((row for row in cached.get('observations', [])
+                    if (row.get('track') or {}).get('video_id') == example.get('video_id')
+                    and (row.get('track') or {}).get('title') == alias), None)
+        return (row['track'] if row is not None else None)
+    if source_kind != 'saved_search_result':
+        raise ValueError('Title example uses an unsupported cached source kind')
+
+    position = example.get('result_position')
+    if type(position) is not int or position < 0:
+        raise ValueError('Saved search example has invalid result_position')
+    if cached.get('endpoint') != 'search':
+        raise ValueError('Saved search example is not from a search response')
+    arguments = cached.get('arguments')
+    if (not isinstance(arguments, dict) or arguments.get('filter') != 'songs'
+            or not isinstance(arguments.get('query'), str)
+            or not arguments['query'].strip()):
+        raise ValueError('Saved search example has invalid search arguments')
+    response = cached.get('response')
+    if not isinstance(response, list) or position >= len(response):
+        raise ValueError('Saved search result_position is outside its response')
+    row = response[position]
+    if not isinstance(row, dict):
+        raise ValueError('Saved search selected result is malformed')
+    expected_video_id = example.get('video_id')
+    expected_title = example.get('remote_title')
+    if (not isinstance(expected_video_id, str) or not expected_video_id
+            or row.get('videoId') != expected_video_id):
+        raise ValueError('Saved search selected videoId differs from its example')
+    if (not isinstance(expected_title, str) or expected_title != alias
+            or row.get('title') != expected_title):
+        raise ValueError('Saved search selected title differs from its exact alias')
+    # Pass the exact selected YT Music result through the ordinary album,
+    # version, duration, full-credit and unique-PID gates below.
+    return {**row, 'video_id': row['videoId']}
+
+
 def apply_reviewed_title_aliases(*, track_snapshot, identity_map_path,
                                  proposals_path, review_decisions_path,
                                  output_path, receipt_path, _write_outputs=True):
@@ -158,13 +204,13 @@ def apply_reviewed_title_aliases(*, track_snapshot, identity_map_path,
             if str(source_path) not in input_hashes or str(source_path) not in {
                     str(_resolve(path)) for path in source_paths}:
                 raise ValueError('Title example is not bound to a hashed cache input')
-            cached = json.loads(source_path.read_bytes())
-            row = next((row for row in cached.get('observations', [])
-                        if (row.get('track') or {}).get('video_id') == example.get('video_id')
-                        and (row.get('track') or {}).get('title') == alias), None)
-            if row is None:
+            cache_bytes = source_path.read_bytes()
+            if _sha(cache_bytes) != input_hashes[str(source_path)]:
+                raise ValueError('A cached observation used by title review changed')
+            cached = json.loads(cache_bytes)
+            remote = _cached_candidate_track(example, cached, alias)
+            if remote is None:
                 raise ValueError('Title example is absent from its bound cached response')
-            remote = row['track']
             duration = _duration_seconds(remote)
             if (normalize((remote.get('album') or {}).get('name') or '') != normalize(local.get('album') or '')
                     or version_signature(remote.get('title') or '') != version_signature(local_title)
