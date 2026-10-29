@@ -136,6 +136,28 @@ def _verify_rebase_receipt(graph_path, report_path, state_path,
                 graph_doc=graph_doc, report=report, state=state,
                 library_hash=library_hash, identity_hash=identity_hash,
                 state_path=Path(state_path).resolve())
+        elif report.get('producer') == 'opengenius-typed-native-genius-baseline-alias-child-v1':
+            from rebind_native_baseline_alias_chain import verify_native_alias_child_report
+            native_proof = verify_native_alias_child_report(
+                graph_doc=graph_doc, report=report, state=state,
+                library_hash=library_hash, identity_hash=identity_hash,
+                graph_path=Path(graph_path).resolve(),
+                report_path=Path(report_path).resolve(),
+                state_path=Path(state_path).resolve(),
+                repo_root=Path(__file__).resolve().parents[1])
+            if (not isinstance(native_proof, dict)
+                    or native_proof.get('producer') != report.get('producer')
+                    or native_proof.get('verified') is not True
+                    or native_proof.get('library_sha256') != library_hash
+                    or native_proof.get('identity_map_sha256') != identity_hash
+                    or native_proof.get('track_count') != 3004
+                    or native_proof.get('assignment_count') != 515
+                    or native_proof.get('directed_edge_count') != 3341
+                    or native_proof.get('recording_identity_verified') is not False
+                    or native_proof.get('recording_edges_added') != 0
+                    or not isinstance(native_proof.get('proof_input_receipts'), list)):
+                raise ValueError('Native baseline alias child verifier returned an invalid proof')
+            proof_inputs = native_proof['proof_input_receipts']
         else:
             raise ValueError('Unsupported typed identity-map rebind report producer')
     else:
