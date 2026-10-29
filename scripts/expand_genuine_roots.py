@@ -77,6 +77,35 @@ def _file_receipt(path):
     return {'path': str(path), 'sha256': _sha(path.read_bytes())}
 
 
+def _diagnostic_attempts_disjoint(seed_pids, *previous_pid_sets):
+    """Keep diagnostic requests from re-billing any earlier attempted PID."""
+    return all(not (set(seed_pids) & set(previous)) for previous in previous_pid_sets)
+
+
+def _diagnostic_library_matches(summary, manifest, library_hash):
+    return (summary.get('library_sha256') == library_hash
+            and manifest.get('library_sha256') == library_hash)
+
+
+def _diagnostic_start_completion_order(events, launch_event, completion_event):
+    if launch_event is None or completion_event is None:
+        return False
+    try:
+        return events.index(completion_event) == events.index(launch_event) + 1
+    except ValueError:
+        return False
+
+
+def _diagnostic_journal_prefix_sha256(journal, through_event_index):
+    prefix = dict(journal)
+    prefix_events = journal.get('events', [])[:through_event_index + 1]
+    prefix['events'] = prefix_events
+    prefix['event_count'] = len(prefix_events)
+    prefix['head_event_sha256'] = prefix_events[-1]['event_sha256']
+    serialized = json.dumps(prefix, ensure_ascii=False, indent=2).encode('utf-8') + b'\n'
+    return _sha(serialized)
+
+
 def _growth_receipt(growth_dir):
     if growth_dir is None:
         return None
@@ -504,10 +533,14 @@ def _validate_prior_attempt_ledger(path, library_hash, track_snapshot_sha256,
     elif ledger_version == 3:
         required = required | {'request_only_failure_incidents'}
         expected_producer = 'opengenius-genuine-root-attempt-ledger-v3'
+    elif ledger_version == 4:
+        required = required | {'request_only_failure_incidents',
+                               'diagnostic_capture_receipts'}
+        expected_producer = 'opengenius-genuine-root-attempt-ledger-v4'
     else:
         expected_producer = 'opengenius-genuine-root-attempt-ledger-v1'
     if (not isinstance(ledger, dict) or set(ledger) != required
-            or ledger_version not in (1, 2, 3)
+            or ledger_version not in (1, 2, 3, 4)
             or ledger.get('producer') != expected_producer
             or type(ledger.get('http_requests_total')) is not int
             or ledger['http_requests_total'] < 0
@@ -873,9 +906,470 @@ def _validate_prior_attempt_ledger(path, library_hash, track_snapshot_sha256,
             raise RecoveryUnsafe('Pre-auth failure unexpectedly has seed snapshots or request caches')
         request_only_incident_requests += starts
 
+    diagnostic_paths = set()
+    diagnostic_attempts = set()
+    diagnostic_requests = 0
+    diagnostic_receipts = ledger.get('diagnostic_capture_receipts', [])
+    if not isinstance(diagnostic_receipts, list):
+        raise RecoveryUnsafe('Diagnostic capture receipts must be a list')
+    for receipt in diagnostic_receipts:
+        if (not isinstance(receipt, dict)
+                or set(receipt) != {'trial_plan', 'trial_config', 'journal', 'result_report'}):
+            raise RecoveryUnsafe('Diagnostic capture receipt is malformed')
+
+        def checked_capture_receipt(name):
+            source = checked_receipt(receipt.get(name), 'diagnostic ' + name)
+            if source in diagnostic_paths:
+                raise RecoveryUnsafe('Diagnostic ledger repeats a capture receipt')
+            diagnostic_paths.add(source)
+            return source
+
+        plan_path = checked_capture_receipt('trial_plan')
+        config_path = checked_capture_receipt('trial_config')
+        journal_path = checked_capture_receipt('journal')
+        report_path = checked_capture_receipt('result_report')
+        plan, trial_config = _read_json(plan_path), _read_json(config_path)
+        journal, report = _read_json(journal_path), _read_json(report_path)
+        if (not isinstance(plan, dict) or plan.get('schema_version') != 1
+                or plan.get('producer') != 'opengenius-ja-locale-standalone-trial-plan-v2'
+                or plan.get('diagnostic_only') is not True
+                or plan.get('root_or_edge_credit_allowed') is not False
+                or plan.get('status') != 'prepared_after_reviewed_bootstrap_fix'
+                or not isinstance(trial_config, dict)
+                or trial_config.get('schema_version') != 1
+                or trial_config.get('producer') != 'opengenius-ja-locale-standalone-trial-config-v2'
+                or trial_config.get('diagnostic_only') is not True
+                or trial_config.get('root_or_edge_credit_allowed') is not False
+                or trial_config.get('request_budget') != 450
+                or trial_config.get('interval_seconds') != 3
+                or trial_config.get('candidate_limit') != 100
+                or trial_config.get('seed_count') != 20
+                or trial_config.get('plan') != receipt['trial_plan']
+                or trial_config.get('output_dir') != plan.get('output_dir')
+                or plan.get('trial_id') != trial_config.get('trial_id')):
+            raise RecoveryUnsafe('Diagnostic trial plan/config is not a bound zero-credit trial')
+        outer_journal_receipt = receipt.get('journal')
+        if (not isinstance(report, dict)
+                or set(report) != {'schema_version', 'producer', 'trial_plan', 'trial_config',
+                                   'prior_journal', 'journal', 'summary', 'manifest',
+                                   'receipts', 'collector_result', 'accounting_delta',
+                                   'cumulative_after', 'no_graph_or_root_credit'}
+                or report.get('schema_version') != 1
+                or report.get('producer') != 'opengenius-ja-locale-diagnostic-result-v1'
+                or report.get('trial_plan') != receipt['trial_plan']
+                or report.get('trial_config') != receipt['trial_config']
+                or not isinstance(report.get('journal'), dict)
+                or report['journal'].get('path') != str(journal_path)
+                or not isinstance(outer_journal_receipt, dict)
+                or not isinstance(report['journal'].get('sha256'), str)
+                or not re.fullmatch(r'[0-9a-f]{64}', report['journal']['sha256'])
+                or not isinstance(report['journal'].get('head_event_sha256'), str)
+                or not re.fullmatch(r'[0-9a-f]{64}',
+                                    report['journal']['head_event_sha256'])
+                or report.get('no_graph_or_root_credit') is not True):
+            raise RecoveryUnsafe('Diagnostic result report does not bind its frozen inputs')
+
+        # Authenticate the standalone start/completion journal. Event hashes use
+        # canonical compact JSON and chain to the prior journal's frozen head.
+        prior_journal = journal.get('prior_journal')
+        if (not isinstance(journal, dict)
+                or journal.get('schema_version') != 1
+                or journal.get('producer') != 'opengenius-ja-locale-diagnostic-journal-v2'
+                or journal.get('hash_algorithm') != 'sha256 over canonical UTF-8 JSON event excluding event_sha256; chained to prior journal head'
+                or not isinstance(journal.get('events'), list)
+                or journal.get('event_count') != len(journal['events'])
+                or not isinstance(report.get('prior_journal'), dict)
+                or {key: report['prior_journal'].get(key) for key in ('path', 'sha256')}
+                != {key: prior_journal.get(key) for key in ('path', 'sha256')}
+                or not isinstance(prior_journal, dict)
+                or set(prior_journal) != {'path', 'sha256', 'head_event_sha256'}):
+            raise RecoveryUnsafe('Diagnostic journal header or parent is malformed')
+        predecessor_path = checked_receipt(
+            {'path': prior_journal.get('path'), 'sha256': prior_journal.get('sha256')},
+            'diagnostic prior journal')
+        predecessor = _read_json(predecessor_path)
+        if predecessor.get('head_event_sha256') != prior_journal.get('head_event_sha256'):
+            raise RecoveryUnsafe('Diagnostic journal parent head differs from its receipt')
+        previous = prior_journal['head_event_sha256']
+        for index, event in enumerate(journal['events']):
+            if not isinstance(event, dict) or event.get('sequence') != index:
+                raise RecoveryUnsafe('Diagnostic journal event order is malformed')
+            event_body = {key: value for key, value in event.items()
+                          if key != 'event_sha256'}
+            event_hash = hashlib.sha256(json.dumps(
+                event_body, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+            if (event.get('previous_event_sha256') != previous
+                    or event.get('event_sha256') != event_hash):
+                raise RecoveryUnsafe('Diagnostic journal hash chain is invalid')
+            previous = event_hash
+        if (not journal['events'] or journal.get('head_event_sha256') != previous):
+            raise RecoveryUnsafe('Diagnostic journal head is not its final event')
+        events = journal['events']
+        launch_events = [event for event in events
+                         if event.get('event') == 'diagnostic_trial_v02_launch_authorized']
+        completion_events = [event for event in events
+                             if event.get('event') == 'diagnostic_trial_v02_completed']
+        launch_event = launch_events[0] if len(launch_events) == 1 else None
+        completion = completion_events[0] if len(completion_events) == 1 else None
+        invocation = (None if launch_event is None
+                      else launch_event.get('collector_invocation'))
+        if (launch_event is None or completion is None
+                or not _diagnostic_start_completion_order(events, launch_event, completion)
+                or launch_event.get('plan') != receipt['trial_plan']
+                or launch_event.get('config') != receipt['trial_config']
+                or launch_event.get('collector_patch_sha256')
+                != plan.get('collector_code', {}).get('patch_sha256')
+                or launch_event.get('collector_sources')
+                != plan.get('collector_code', {}).get('source_files')
+                or launch_event.get('accounting_before') != {
+                    'http_requests': prior_requests,
+                    'attempted_pids': len(prior_attempted),
+                    'roots': prior_roots}
+                or not isinstance(invocation, dict)
+                or invocation.get('track_snapshot') != plan.get('track_snapshot')
+                or invocation.get('identity_map') != plan.get('identity_map')
+                or invocation.get('seed_plan') != plan.get('seed_plan')
+                or invocation.get('seeds') != 20
+                or invocation.get('request_budget') != trial_config.get('request_budget')
+                or invocation.get('interval_seconds') != trial_config.get('interval_seconds')
+                or invocation.get('candidate_limit') != trial_config.get('candidate_limit')
+                or invocation.get('language') != 'ja'
+                or invocation.get('source_policy')
+                != 'authenticated-watch-radio-only-ja-locale-v1'
+                or completion.get('accounting_delta') != report.get('accounting_delta')
+                or completion.get('receipts') != ([report.get('summary'),
+                                                   report.get('manifest')]
+                                                  + report.get('receipts', []))
+                or completion.get('output_dir') != plan.get('output_dir')
+                or completion.get('cumulative_after') != report.get('cumulative_after')
+                or completion.get('collector_result') != report.get('collector_result')):
+            raise RecoveryUnsafe('Diagnostic journal lacks exact authorized start/completion')
+        completion_index = events.index(completion)
+        if (report.get('journal', {}).get('head_event_sha256')
+                != completion.get('event_sha256')):
+            raise RecoveryUnsafe('Diagnostic result report does not pin its completion event')
+        report_journal_sha = report.get('journal', {}).get('sha256')
+        if (report_journal_sha != outer_journal_receipt.get('sha256')
+                and report_journal_sha != _diagnostic_journal_prefix_sha256(
+                    journal, completion_index)):
+            raise RecoveryUnsafe('Diagnostic result report journal hash differs from its frozen completion prefix')
+        allowed_suffix = {'offline_result_type_and_stratum_analysis',
+                          'offline_v04_v13_strict_seed_gate_comparison'}
+        for event in events[completion_index + 1:]:
+            if (event.get('event') not in allowed_suffix
+                    or event.get('accounting_delta') != {
+                        'http_requests': 0, 'attempted_pids': 0,
+                        'accepted_roots': 0, 'accepted_edges': 0}):
+                raise RecoveryUnsafe('Diagnostic journal has nonzero or unknown post-capture events')
+
+        output_dir = Path(plan.get('output_dir', '')).resolve()
+        if (Path(trial_config.get('output_dir', '')).resolve() != output_dir
+                or output_dir.name != 'collector'
+                or Path(receipt['trial_plan']['path']).resolve().parent
+                != Path(receipt['trial_config']['path']).resolve().parent):
+            raise RecoveryUnsafe('Diagnostic output and frozen plan directory disagree')
+        for source in (plan.get('auth_receipt'), plan.get('track_snapshot'),
+                       plan.get('identity_map'), plan.get('parent_campaign_progress'),
+                       plan.get('parent_ledger'), plan.get('seed_plan')):
+            if source is None:
+                continue
+            sources = source if isinstance(source, list) else [source]
+            for item in sources:
+                if not isinstance(item, dict):
+                    raise RecoveryUnsafe('Diagnostic plan has a malformed source receipt')
+                path_value = item.get('path')
+                digest = item.get('sha256')
+                if isinstance(path_value, str) and isinstance(digest, str):
+                    checked_receipt({'path': path_value, 'sha256': digest},
+                                    'diagnostic frozen source')
+        collector_code = plan.get('collector_code')
+        if (not isinstance(collector_code, dict)
+                or not isinstance(collector_code.get('patch_path'), str)
+                or not isinstance(collector_code.get('patch_sha256'), str)
+                or not isinstance(collector_code.get('source_files'), list)):
+            raise RecoveryUnsafe('Diagnostic plan lacks its frozen collector source bundle')
+        checked_receipt({'path': collector_code['patch_path'],
+                          'sha256': collector_code['patch_sha256']},
+                        'diagnostic collector patch')
+        for source in collector_code['source_files']:
+            checked_receipt(source, 'diagnostic collector source')
+        plan_parent = plan.get('parent_campaign_progress')
+        plan_parent_ledger = plan.get('parent_ledger')
+        limits = plan.get('cumulative_limits')
+        configured_parent_ledger = prior_config.get('prior_attempt_ledger')
+        if configured_parent_ledger is None:
+            parent_ledger_matches = plan_parent_ledger is None
+        else:
+            parent_ledger_matches = (
+                isinstance(plan_parent_ledger, dict)
+                and plan_parent_ledger.get('path') == configured_parent_ledger.get('path')
+                and plan_parent_ledger.get('sha256') == configured_parent_ledger.get('sha256'))
+        if (not isinstance(plan_parent, dict)
+                or {key: plan_parent.get(key) for key in ('path', 'sha256')}
+                != ledger.get('prior_progress')
+                or not parent_ledger_matches
+                or (plan_parent_ledger is not None and
+                    (not isinstance(parent_ledger_receipt, dict)
+                     or plan_parent_ledger.get('path') != parent_ledger_receipt.get('path')
+                     or plan_parent_ledger.get('sha256') != parent_ledger_receipt.get('sha256')))
+                or not isinstance(limits, dict)
+                or limits.get('requests_already_charged') != prior_requests
+                or limits.get('attempts_already_charged') != len(prior_attempted)
+                or limits.get('outgoing_roots_before_trial') != prior_roots
+                or limits.get('max_trial_request_charge') != 450
+                or limits.get('max_trial_attempt_charge') != 20):
+            raise RecoveryUnsafe('Diagnostic trial does not start from ledger prior progress')
+        if (prior_config.get('identity_map', {}).get('sha256')
+                != plan.get('identity_map', {}).get('sha256')
+                or prior_config.get('track_snapshot', {}).get('sha256')
+                != plan.get('track_snapshot', {}).get('sha256')
+                or plan.get('collection') != {
+                    'mode': 'radio-only-ja-locale-v1',
+                    'source_policy': 'authenticated-watch-radio-only-ja-locale-v1',
+                    'client_context': {'hl': 'ja', 'gl': 'JP'},
+                    'search_filter': None, 'seed_query_fallback': False,
+                    'interval_seconds': 3, 'seed_count_cap': 20,
+                    'request_budget_cap': 450,
+                    'auth_receipt': 'reuse the existing explicitly authorized Firefox auth input; do not record secret bytes or path in this plan'}
+                or trial_config.get('mode') != plan.get('collection')
+                or trial_config.get('auth_receipt') != plan.get('auth_receipt')):
+            raise RecoveryUnsafe('Diagnostic trial changes the frozen map or track snapshot')
+
+        summary_receipt = report.get('summary')
+        manifest_receipt = report.get('manifest')
+        if (not isinstance(summary_receipt, dict)
+                or set(summary_receipt) != {'name', 'path', 'sha256'}
+                or summary_receipt.get('name') != 'collector_summary'
+                or not isinstance(manifest_receipt, dict)
+                or set(manifest_receipt) != {'name', 'path', 'sha256'}
+                or manifest_receipt.get('name') != 'seed_manifest'):
+            raise RecoveryUnsafe('Diagnostic summary or manifest receipt is malformed')
+        summary_path = checked_receipt(
+            {key: summary_receipt[key] for key in ('path', 'sha256')},
+            'diagnostic collector summary')
+        manifest_path = checked_receipt(
+            {key: manifest_receipt[key] for key in ('path', 'sha256')},
+            'diagnostic seed manifest')
+        summary, manifest = _read_json(summary_path), _read_json(manifest_path)
+        if (summary_path.parent != output_dir or manifest_path.parent != output_dir
+                or summary.get('status') != 'completed'
+                or summary.get('account_authentication_verified') is not True
+                or summary.get('identity_status') != 'unverified'
+                or summary.get('source_policy') != 'authenticated-watch-radio-only-ja-locale-v1'
+                or summary.get('collector_collection_mode') != 'radio-only-ja-locale-v1'
+                or summary.get('client_context') != {
+                    'language': 'ja', 'location': 'JP', 'search_filter': None,
+                    'search_result_type': 'song',
+                    'request_client_context': {'hl': 'ja', 'gl': 'JP'}}
+                or manifest.get('source_policy') != summary.get('source_policy')
+                or manifest.get('collector_collection_mode') != summary.get('collector_collection_mode')
+                or manifest.get('client_context') != summary.get('client_context')
+                or not _diagnostic_library_matches(summary, manifest, library_hash)
+                or summary.get('library_sha256') != manifest.get('library_sha256')
+                or manifest.get('library_input', {}).get('snapshot_sha256')
+                != plan.get('track_snapshot', {}).get('sha256')
+                or manifest.get('identity_map_sha256') != plan.get('identity_map', {}).get('sha256')
+                or manifest.get('seed_plan_sha256')
+                != plan.get('seed_plan', {}).get('sha256')
+                or summary.get('cache_hits') != 0
+                or summary.get('http_requests') != 28
+                or summary.get('http_request_categories') != {
+                    'account_preflight': 1, 'radio_continuation': 4,
+                    'radio_page': 2, 'search_page': 20, 'visitor_bootstrap': 1}
+                or summary.get('http_request_categories_match_total') is not True):
+            raise RecoveryUnsafe('Diagnostic collector summary is not the exact authenticated trial')
+        seeds = manifest.get('seeds')
+        summary_results = summary.get('results')
+        seed_pids = [row.get('persistent_id') for row in seeds] if isinstance(seeds, list) else None
+        result_pids = ([row.get('persistent_id') for row in summary_results]
+                       if isinstance(summary_results, list) else None)
+        if (not isinstance(seed_pids, list) or len(seed_pids) != 20
+                or len(set(seed_pids)) != 20
+                or any(not isinstance(pid, str) or not re.fullmatch(r'[0-9A-F]{16}', pid)
+                       for pid in seed_pids)
+                or result_pids != seed_pids
+                or not _diagnostic_attempts_disjoint(
+                    seed_pids, prior_attempted, historical_attempts,
+                    incident_pids, diagnostic_attempts)):
+            raise RecoveryUnsafe('Diagnostic trial PID order, uniqueness, or exclusions differ')
+        seed_plan_receipt = plan.get('seed_plan')
+        if (not isinstance(seed_plan_receipt, dict)
+                or seed_plan_receipt.get('seeds') != 20):
+            raise RecoveryUnsafe('Diagnostic trial plan does not bind its exact 20-seed plan')
+        seed_plan_path = checked_receipt(
+            {'path': seed_plan_receipt.get('path'), 'sha256': seed_plan_receipt.get('sha256')},
+            'diagnostic seed plan')
+        seed_plan_doc = _read_json(seed_plan_path)
+        seed_plan_pids = [row.get('persistent_id') for row in seed_plan_doc.get('seeds', [])
+                          if isinstance(row, dict)]
+        if seed_plan_pids != seed_pids:
+            raise RecoveryUnsafe('Diagnostic manifest differs from its frozen source seed plan')
+        result_counts = Counter(row.get('status') for row in summary_results)
+        if result_counts != Counter({'search_unresolved': 18, 'collected': 2}):
+            raise RecoveryUnsafe('Diagnostic trial result dispositions differ')
+
+        report_receipts = report.get('receipts')
+        if not isinstance(report_receipts, list):
+            raise RecoveryUnsafe('Diagnostic result report has no exact source receipt list')
+        by_kind = {'raw_snapshot': [], 'request_cache': []}
+        for source in report_receipts:
+            if (not isinstance(source, dict)
+                    or set(source) != {'name', 'path', 'sha256'}
+                    or source.get('name') not in by_kind):
+                raise RecoveryUnsafe('Diagnostic result contains an unexpected receipt type')
+            source_path = checked_receipt({'path': source['path'], 'sha256': source['sha256']},
+                                          'diagnostic ' + source['name'])
+            if source_path.parent != output_dir and source_path.parent != output_dir / 'requests':
+                raise RecoveryUnsafe('Diagnostic source receipt is outside its collector directory')
+            by_kind[source['name']].append((source_path, _read_json(source_path)))
+        if (len(by_kind['raw_snapshot']) != 2 or len(by_kind['request_cache']) != 22
+                or len({path for path, _ in by_kind['raw_snapshot']}) != 2
+                or len({path for path, _ in by_kind['request_cache']}) != 22
+                or {path.resolve() for path, _ in by_kind['raw_snapshot']}
+                != {path.resolve() for path in output_dir.glob('[0-9A-F]' * 16 + '.json')}
+                or {path.resolve() for path, _ in by_kind['request_cache']}
+                != {path.resolve() for path in (output_dir / 'requests').glob('*.json')}):
+            raise RecoveryUnsafe('Diagnostic raw snapshot/cache receipt set is incomplete or duplicated')
+        snapshot_pids = set()
+        snapshots_by_pid = {}
+        for snapshot_path, snapshot in by_kind['raw_snapshot']:
+            pid = snapshot.get('local_seed', {}).get('persistent_id')
+            manifest_seed = next((row for row in seeds
+                                  if row.get('persistent_id') == pid), None)
+            if (pid not in seed_pids or pid in snapshot_pids
+                    or manifest_seed is None
+                    or snapshot.get('local_seed') != manifest_seed
+                    or snapshot.get('account_authentication_verified') is not True
+                    or snapshot.get('seed_identity_status') != 'unique_metadata_candidate_unverified'
+                    or snapshot.get('collector_collection_mode') != summary['collector_collection_mode']
+                    or snapshot.get('source_policy') != summary['source_policy']
+                    or snapshot.get('client_context') != summary['client_context']
+                    or snapshot.get('identity_map_sha256') != manifest.get('identity_map_sha256')
+                    or not isinstance(snapshot.get('selected_video_id'), str)
+                    or snapshot.get('request_evidence') is None):
+                raise RecoveryUnsafe('Diagnostic raw snapshot is not bound to its captured seed')
+            snapshot_pids.add(pid)
+            snapshots_by_pid[pid] = snapshot
+        if snapshot_pids != {row['persistent_id'] for row in summary_results
+                             if row.get('status') == 'collected'}:
+            raise RecoveryUnsafe('Diagnostic snapshots differ from collected result rows')
+        cache_endpoints = Counter()
+        search_cache_by_query = {}
+        radio_cache_by_video = {}
+        for cache_path, cache in by_kind['request_cache']:
+            endpoint = cache.get('endpoint')
+            context = cache.get('client_context')
+            if (endpoint not in ('search', 'get_watch_playlist')
+                    or context != summary['client_context']
+                    or not isinstance(cache.get('request_client_contexts'), list)
+                    or not cache['request_client_contexts']
+                    or any(value != {'hl': 'ja', 'gl': 'JP'}
+                           for value in cache['request_client_contexts'])
+                    or not isinstance(cache.get('response'), (dict, list))):
+                raise RecoveryUnsafe('Diagnostic request cache context or endpoint is invalid')
+            args = cache.get('arguments')
+            if endpoint == 'search' and (
+                    not isinstance(args, dict) or args.get('filter') is not None
+                    or args.get('limit') != 5 or not isinstance(args.get('query'), str)):
+                raise RecoveryUnsafe('Diagnostic search cache parameters are invalid')
+            if endpoint == 'search':
+                if args['query'] in search_cache_by_query:
+                    raise RecoveryUnsafe('Diagnostic trial duplicates a search request cache')
+                search_cache_by_query[args['query']] = cache
+            if endpoint == 'get_watch_playlist' and (
+                    not isinstance(args, dict) or args.get('radio') is not True
+                    or args.get('limit') != 100 or not isinstance(args.get('videoId'), str)):
+                raise RecoveryUnsafe('Diagnostic radio cache parameters are invalid')
+            if endpoint == 'get_watch_playlist':
+                if args['videoId'] in radio_cache_by_video:
+                    raise RecoveryUnsafe('Diagnostic trial duplicates a radio request cache')
+                radio_cache_by_video[args['videoId']] = cache
+            cache_endpoints[endpoint] += 1
+        if cache_endpoints != Counter({'search': 20, 'get_watch_playlist': 2}):
+            raise RecoveryUnsafe('Diagnostic request cache endpoint counts differ')
+        expected_queries = {
+            str(seed.get('title', '')).strip() + ' ' + str(seed.get('artist', '')).strip(): seed
+            for seed in seeds}
+        if set(search_cache_by_query) != set(expected_queries):
+            raise RecoveryUnsafe('Diagnostic search cache queries differ from ordered seed metadata')
+        if set(radio_cache_by_video) != {
+                snapshot.get('selected_video_id') for snapshot in snapshots_by_pid.values()}:
+            raise RecoveryUnsafe('Diagnostic radio cache videos differ from captured seed selections')
+        for pid, snapshot in snapshots_by_pid.items():
+            evidence = snapshot.get('request_evidence')
+            seed = expected_queries.get(
+                str(snapshot['local_seed'].get('title', '')).strip() + ' '
+                + str(snapshot['local_seed'].get('artist', '')).strip())
+            if (seed is None or not isinstance(evidence, list) or len(evidence) != 2):
+                raise RecoveryUnsafe('Diagnostic snapshot lacks exact search/radio request evidence')
+            by_endpoint = {row.get('endpoint'): row for row in evidence
+                           if isinstance(row, dict)}
+            if set(by_endpoint) != {'search', 'get_watch_playlist'}:
+                raise RecoveryUnsafe('Diagnostic snapshot request evidence endpoints are invalid')
+            for endpoint, cache_doc in (
+                    ('search', search_cache_by_query[
+                        str(seed.get('title', '')).strip() + ' '
+                        + str(seed.get('artist', '')).strip()]),
+                    ('get_watch_playlist', radio_cache_by_video[snapshot['selected_video_id']])):
+                request = by_endpoint[endpoint]
+                if (request.get('arguments') != cache_doc.get('arguments')
+                        or request.get('observed_at') != cache_doc.get('observed_at')
+                        or request.get('client_context') != cache_doc.get('client_context')
+                        or request.get('request_client_contexts')
+                        != cache_doc.get('request_client_contexts')
+                        or request.get('cache_hit') is not False):
+                    raise RecoveryUnsafe('Diagnostic snapshot request evidence differs from exact raw cache')
+        parent_growth_receipt = (prior.get('batches', [])[-1].get('growth_receipt')
+                                 if prior.get('batches') else None)
+        if not isinstance(parent_growth_receipt, dict):
+            raise RecoveryUnsafe('Diagnostic trial prior progress has no typed growth parent')
+        parent_graph_path = Path(parent_growth_receipt.get('path', '')).resolve()
+        if parent_graph_path.is_dir():
+            parent_graph_path /= 'accepted-graphs.json'
+        parent_graph = _read_json(parent_graph_path)
+        if _sha(parent_graph_path.read_bytes()) != parent_growth_receipt.get('sha256'):
+            raise RecoveryUnsafe('Diagnostic trial growth parent changed')
+        parent_edge_count = sum(len(row.get('ordered_target_pids', []))
+                                for row in parent_graph.get('accepted_roots', [])
+                                if isinstance(row, dict)
+                                and isinstance(row.get('ordered_target_pids'), list))
+        delta = {'http_requests': 28, 'attempted_pids': 20,
+                 'attempted_pid_count': 20, 'accepted_roots': 0, 'accepted_edges': 0}
+        after = {'http_requests': prior_requests + 28,
+                 'attempted_pids': len(prior_attempted | set(seed_pids)),
+                 'outgoing_roots': prior_roots, 'accepted_edges':
+                 report.get('cumulative_after', {}).get('accepted_edges')}
+        if (report.get('accounting_delta') != delta
+                or report.get('cumulative_after', {}).get('http_requests') != after['http_requests']
+                or report.get('cumulative_after', {}).get('attempted_pids') != after['attempted_pids']
+                or report.get('cumulative_after', {}).get('outgoing_roots') != prior_roots
+                or report.get('cumulative_after', {}).get('accepted_edges') != parent_edge_count
+                or report.get('collector_result', {}).get('status') != 'completed'
+                or report.get('collector_result', {}).get('account_authentication_verified') is not True
+                or report.get('collector_result', {}).get('http_requests') != 28
+                or report.get('collector_result', {}).get('result_count') != 20
+                or report.get('collector_result', {}).get('raw_snapshot_count') != 2
+                or report.get('collector_result', {}).get('request_cache_count') != 22
+                or report.get('collector_result', {}).get('request_categories')
+                != summary['http_request_categories']
+                or report.get('collector_result', {}).get('result_status_counts')
+                != {'search_unresolved': 18, 'collected': 2}
+                or report.get('cumulative_after') != {
+                    'http_requests': after['http_requests'],
+                    'attempted_pids': after['attempted_pids'],
+                    'outgoing_roots': prior_roots,
+                    'accepted_edges': parent_edge_count}):
+            raise RecoveryUnsafe('Diagnostic trial report accounting does not match its source receipts')
+        diagnostic_attempts.update(seed_pids)
+        if (current_identity_map_sha256 is not None
+                and plan.get('identity_map', {}).get('sha256') == current_identity_map_sha256):
+            same_map_attempts.update(seed_pids)
+        diagnostic_requests += 28
+
     if prior_attempted & incident_pids:
         raise RecoveryUnsafe('Prior interruption incident duplicates an attempted PID')
-    expected_excluded = sorted(prior_attempted | incident_pids | historical_attempts)
+    expected_excluded = sorted(prior_attempted | incident_pids | historical_attempts |
+                               diagnostic_attempts)
     if ledger.get('excluded_persistent_ids') != expected_excluded:
         raise RecoveryUnsafe('Prior-attempt PID exclusions differ from hash-verified receipts')
     promoted_roots = None
@@ -1065,13 +1559,15 @@ def _validate_prior_attempt_ledger(path, library_hash, track_snapshot_sha256,
             raise RecoveryUnsafe('Promoted radio-only graph root count or replay receipt differs')
         promoted_roots = replay['outgoing_root_count']
     if (ledger['http_requests_total'] != prior_requests + incident_requests
-            + request_only_incident_requests
+            + request_only_incident_requests + diagnostic_requests
             or ledger['base_outgoing_roots'] !=
                (promoted_roots if promoted_roots is not None else prior_roots)):
         raise RecoveryUnsafe('Prior-attempt request or root total differs from verified receipts')
     return {'attempted_pids': set(expected_excluded),
             'same_map_attempted_pids': same_map_attempts,
             'http_requests': ledger['http_requests_total'],
+            'diagnostic_attempted_pids': diagnostic_attempts,
+            'diagnostic_http_requests': diagnostic_requests,
             'outgoing_roots': promoted_roots if promoted_roots is not None else prior_roots}
 
 
